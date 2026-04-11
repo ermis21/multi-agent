@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend — Agent Role Configuration
+#
+# Defines permissions and behaviour for each agent role.
+# Roles: worker, supervisor, soul_updater, config_agent, improvement_agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Worker ────────────────────────────────────────────────────────────────────
+# The primary responder. Handles user requests, may use tools.
+worker:
+  # MCP tools this role may call. Tool docs are injected into its prompt
+  # dynamically — it never sees docs for tools it cannot use.
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+    - shell_exec
+
+  # Maximum tool call iterations per completion (prevents runaway loops).
+  max_tool_iterations: 10
+
+
+# ── Supervisor ────────────────────────────────────────────────────────────────
+# Grades the worker's response. Returns JSON with pass/score/feedback.
+# Never calls tools — it only reads the conversation and responds with JSON.
+supervisor:
+  allowed_tools: []
+
+  # Whether to include the full conversation history when grading.
+  # true = can check coherence across turns; false = only grades final answer.
+  include_conversation_history: true
+
+
+# ── Soul Updater ──────────────────────────────────────────────────────────────
+# Runs at 5 AM via cron. Reads workspace files, rewrites SOUL.md.
+# Needs file_read + file_write only.
+soul_updater:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+  max_tool_iterations: 8
+
+
+# ── Config Agent ──────────────────────────────────────────────────────────────
+# Runs on POST /config/agent. Guides the user through configuration questions.
+# Tightly restricted: can only read and write config files, nothing else.
+config_agent:
+  # These tools are handled locally inside mab-api (not via sandbox).
+  allowed_tools:
+    - read_config
+    - write_config
+
+  # Strategic questions the config agent walks through in order.
+  # The agentic_config.md prompt expands on each of these.
+  guided_questions:
+    - "What prompt mode should be used? ('full' for capable models, 'concise' for small/fast ones)"
+    - "Should the supervisor grading loop be enabled? (adds one extra LLM call per turn)"
+    - "If supervisor enabled: what pass threshold? (0.0–1.0, recommended: 0.7)"
+    - "How many retries if supervisor fails? (recommended: 2–3)"
+    - "Should the daily SOUL.md auto-update be enabled?"
+
+
+# ── Improvement Agent ─────────────────────────────────────────────────────────
+# Has access to the full project repo, git tools, and Docker test stack.
+# Use this role to self-improve the service code:
+#   1. Edit files in /project via file_read / file_write
+#   2. git_commit to save changes
+#   3. docker_test_up → docker_test_health to verify
+#   4. If broken: git_rollback + docker_test_down
+improvement_agent:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+    - shell_exec
+    - git_status
+    - git_commit
+    - git_rollback
+    - git_log
+    - docker_test_up
+    - docker_test_down
+    - docker_test_health
+
+  # Higher iteration limit for multi-step improvement workflows.
+  max_tool_iterations: 20

@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend — Main Configuration
+#
+# This file is live-reloaded on every request — no container restart needed.
+# Edit and save; the API picks up changes automatically.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── LLM Inference ─────────────────────────────────────────────────────────────
+llm:
+  # URL of the llama.cpp server. Uses host.docker.internal to reach the host's
+  # llama-api running on port 8080.
+  base_url: "http://host.docker.internal:8080"
+
+  # Model name sent in OpenAI-compatible requests.
+  # The llama-api ignores this; it serves whatever model is loaded.
+  model: "local-model"
+
+  # Sampling parameters
+  temperature: 0.7     # 0.0 = deterministic, 1.0 = creative
+  max_tokens: 2048     # max tokens the model generates per call
+  top_p: 0.95          # nucleus sampling cutoff
+
+
+# ── Prompt Mode ───────────────────────────────────────────────────────────────
+prompts:
+  # "full"    — comprehensive OpenClaw-inspired prompt (~4000 tokens).
+  #             Best for capable models (13B+) that can follow complex instructions.
+  # "concise" — stripped-down prompt (<2000 tokens).
+  #             Better for smaller/faster models (7B and below).
+  mode: "full"
+
+  # Max characters injected per workspace file (SOUL.md, USER.md, etc.).
+  # Prevents large files from blowing out the context window.
+  # Roughly: 4000 chars ≈ 1000 tokens.
+  workspace_file_max_chars: 4000
+
+
+# ── Supervisor / Worker Loop ──────────────────────────────────────────────────
+agent:
+  # Set to false to skip supervisor grading entirely (worker-only mode).
+  # Faster and cheaper; useful for low-latency tasks or weak models.
+  supervisor_enabled: true
+
+  # Maximum retries when supervisor fails a response.
+  # Total LLM calls = 2 × (1 + max_retries) when supervisor is enabled.
+  # (worker call + supervisor call, repeated on failure)
+  max_retries: 2
+
+  # Supervisor score threshold (0.0–1.0) to pass a response.
+  # Responses scoring below this are retried with the supervisor's feedback.
+  supervisor_pass_threshold: 0.7
+
+
+# ── Soul System ───────────────────────────────────────────────────────────────
+soul:
+  # Enable or disable the daily SOUL.md auto-update cron job.
+  enabled: true
+
+  # Cron schedule — default: 5:00 AM every day.
+  # Format: "minute hour day month weekday"
+  schedule: "0 5 * * *"
+
+  # Hard character limit for SOUL.md.
+  # The soul_update agent is instructed to condense to stay within this limit.
+  # A post-write trim is applied as a fallback if the model ignores it.
+  max_chars: 6000
+
+
+# ── Session Logging ───────────────────────────────────────────────────────────
+logging:
+  # Directory where JSONL session logs are written (inside the container).
+  sessions_dir: "/sessions"
+
+  # Include supervisor grading results in session logs.
+  # Useful for debugging the loop; set to false to reduce log verbosity.
+  log_supervisor_turns: true

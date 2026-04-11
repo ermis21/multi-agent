@@ -1,0 +1,10 @@
+prompts/generated/*
+!prompts/generated/.gitkeep
+sessions/
+workspace/memory/*
+!workspace/memory/.gitkeep
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

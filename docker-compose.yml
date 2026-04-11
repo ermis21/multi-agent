@@ -1,0 +1,113 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend (mab) — Production Stack
+#
+# Services:
+#   mab-api      Public API on port 8090. Orchestrates supervisor/worker loop.
+#                Calls llama-api on host port 8080 for LLM inference.
+#                Calls mab-sandbox for tool execution.
+#   mab-sandbox  Isolated MCP tool server (internal only, not exposed).
+#                Has Docker socket and full project mount for self-improvement.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+
+  # ── Isolated MCP Tool Sandbox ──────────────────────────────────────────────
+  # Start sandbox first; mab-api depends on it being healthy.
+  mab-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-sandbox
+    command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      WORKSPACE_DIR: "/workspace"
+      PROJECT_DIR: "/project"
+    volumes:
+      # Shared workspace (soul, memory, user files)
+      - ./workspace:/workspace
+      # Full project repo so agents can self-improve and run test stacks
+      - .:/project
+      # Docker socket for docker_test_up / docker_test_down tools
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Live-reload: code changes take effect on next request without rebuild
+      - ./sandbox:/app/sandbox
+      - ./prompts:/app/prompts
+    networks:
+      - mab-net
+    # No ports: section — not exposed to host, internal network only
+    mem_limit: 1g
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Orchestration API ──────────────────────────────────────────────────────
+  mab-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      # LLM inference endpoint (existing llama-api on host)
+      LLAMA_URL: "http://host.docker.internal:8080"
+      # MCP sandbox endpoint (internal Docker network)
+      SANDBOX_URL: "http://mab-sandbox:9000"
+      # Path overrides (these paths are inside the container)
+      CONFIG_PATH: "/app/config/config.yaml"
+      AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
+      SESSIONS_DIR: "/sessions"
+      WORKSPACE_DIR: "/workspace"
+      PROMPTS_DIR: "/app/prompts"
+    volumes:
+      # Shared workspace
+      - ./workspace:/workspace
+      # Session logs (JSONL, API only)
+      - ./sessions:/sessions
+      # Live-editable: config, prompts, and app code all reload without restart
+      - ./config:/app/config
+      - ./prompts:/app/prompts
+      - ./app:/app/app
+    ports:
+      - "8090:8090"
+    extra_hosts:
+      # Allows http://host.docker.internal:8080 to reach the host's llama-api
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mab-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      mab-sandbox:
+        condition: service_healthy
+
+networks:
+  mab-net:
+    # Not fully internal: mab-api needs host.docker.internal for llama-api.
+    # mab-sandbox has no extra_hosts and no exposed ports, so it's
+    # effectively isolated from the internet.
+    driver: bridge
