@@ -120,6 +120,107 @@ Update configuration values. Provide only the keys you want to change.
 ```json
 {"tool": "write_config", "params": {"prompts": {"mode": "concise"}, "agent": {"max_retries": 3}}}
 ```""",
+
+    "web_search": """\
+### web_search
+Search the web via Exa. Returns titles, URLs, and highlight snippets.
+```json
+{"tool": "web_search", "params": {"query": "latest news about X", "n": 5, "type": "auto"}}
+```""",
+
+    "web_fetch": """\
+### web_fetch
+Fetch and extract the readable text from a URL. Returns up to 8000 chars.
+```json
+{"tool": "web_fetch", "params": {"url": "https://example.com/article"}}
+```""",
+
+    "memory_add": """\
+### memory_add
+Store a piece of information in long-term memory with optional tags.
+```json
+{"tool": "memory_add", "params": {"content": "User prefers concise answers.", "tags": ["preference"]}}
+```""",
+
+    "memory_search": """\
+### memory_search
+Semantic search over stored memories. Returns top-k matches with scores.
+```json
+{"tool": "memory_search", "params": {"query": "user preferences", "n": 5}}
+```""",
+
+    "memory_list": """\
+### memory_list
+List the most recent stored memories.
+```json
+{"tool": "memory_list", "params": {"n": 20}}
+```""",
+
+    "notion_search": """\
+### notion_search
+Search across the connected Notion workspace.
+```json
+{"tool": "notion_search", "params": {"query": "project roadmap"}}
+```""",
+
+    "notion_get_page": """\
+### notion_get_page
+Retrieve a Notion page by its ID.
+```json
+{"tool": "notion_get_page", "params": {"page_id": "abc123"}}
+```""",
+
+    "notion_create_page": """\
+### notion_create_page
+Create a new page in Notion under a parent page or database.
+```json
+{"tool": "notion_create_page", "params": {"parent": {"page_id": "abc123"}, "properties": {"title": {"title": [{"text": {"content": "New Page"}}]}}}}
+```""",
+
+    "notion_update_page": """\
+### notion_update_page
+Update the content of an existing Notion page.
+```json
+{"tool": "notion_update_page", "params": {"page_id": "abc123", "properties": {"title": {"title": [{"text": {"content": "Updated Title"}}]}}}}
+```""",
+
+    "discord_send": """\
+### discord_send
+Send a message to a Discord channel.
+```json
+{"tool": "discord_send", "params": {"channel_id": 123456789, "content": "Hello!", "bot": "worker"}}
+```""",
+
+    "discord_read": """\
+### discord_read
+Read recent messages from a Discord channel.
+```json
+{"tool": "discord_read", "params": {"channel_id": 123456789, "limit": 20, "bot": "worker"}}
+```""",
+
+    "discord_set_nickname": """\
+### discord_set_nickname
+Set a nickname for a guild member.
+```json
+{"tool": "discord_set_nickname", "params": {"guild_id": 123, "user_id": 456, "nickname": "NewName", "bot": "worker"}}
+```""",
+
+    "discord_edit_channel": """\
+### discord_edit_channel
+Edit a Discord channel's name or topic.
+```json
+{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "name": "new-name", "topic": "New topic", "bot": "worker"}}
+```""",
+
+    "diagnostic_check": """\
+### diagnostic_check
+Run a deterministic health check of all system components (filesystem, ChromaDB,
+git, LLM, Notion, Discord, API keys, config files, prompt templates).
+Returns JSON with pass/warn/fail per component and an overall status.
+No LLM involvement — fully deterministic.
+```json
+{"tool": "diagnostic_check", "params": {}}
+```""",
 }
 
 
@@ -212,6 +313,7 @@ def generate(
         "{{THRESHOLD}}":     str(cfg["agent"]["supervisor_pass_threshold"]),
         "{{SOUL_MAX_CHARS}}": str(soul_max),
         "{{MODE}}":          mode,
+        "{{AGENT_MODE}}":    "",   # overridden via extra= when a mode is active
         **(extra or {}),
     }
 

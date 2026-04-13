@@ -22,6 +22,24 @@ x-logging: &logging
 
 services:
 
+  mab-notion-test:
+    build:
+      context: ./notion
+      dockerfile: Dockerfile
+    container_name: mab-notion-test
+    environment:
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+    networks:
+      - mab-net-test
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').createConnection(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: "no"
+    logging: *logging
+
   mab-sandbox-test:
     build:
       context: .
@@ -32,12 +50,17 @@ services:
     environment:
       WORKSPACE_DIR: "/workspace"
       PROJECT_DIR: "/project"
+      MEMPALACE_HOME: "/mempalace"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      NOTION_URL: "http://mab-notion-test:3000"
+      DISCORD_URL: ""
     volumes:
       - ./workspace:/workspace
       - .:/project
       - /var/run/docker.sock:/var/run/docker.sock
       - ./sandbox:/app/sandbox
       - ./prompts:/app/prompts
+      - ./mempalace:/mempalace
     networks:
       - mab-net-test
     mem_limit: 1g

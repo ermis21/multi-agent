@@ -21,6 +21,56 @@ x-logging: &logging
 
 services:
 
+  # ── Notion MCP Server ─────────────────────────────────────────────────────
+  mab-notion:
+    build:
+      context: ./notion
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-notion
+    environment:
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+    networks:
+      - mab-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').createConnection(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Discord Bots ──────────────────────────────────────────────────────────
+  mab-discord:
+    build:
+      context: ./discord
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-discord
+    environment:
+      DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
+      DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+      DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
+      DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
+      DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
+      DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
+      DISCORD_MAX_MESSAGE_LENGTH: "1900"
+      MAB_API_URL: "http://mab-api:8090"
+    networks:
+      - mab-net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      mab-api:
+        condition: service_healthy
+
   # ── Isolated MCP Tool Sandbox ──────────────────────────────────────────────
   # Start sandbox first; mab-api depends on it being healthy.
   mab-sandbox:
@@ -33,6 +83,15 @@ services:
     environment:
       WORKSPACE_DIR: "/workspace"
       PROJECT_DIR: "/project"
+      MEMPALACE_HOME: "/mempalace"
+      PROMPTS_DIR: "/app/prompts"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      NOTION_URL: "http://mab-notion:3000"
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+      DISCORD_URL: "http://mab-discord:4000"
+      DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
+      DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+      LLAMA_URL: "http://host.docker.internal:8080"
     volumes:
       # Shared workspace (soul, memory, user files)
       - ./workspace:/workspace
@@ -43,8 +102,12 @@ services:
       # Live-reload: code changes take effect on next request without rebuild
       - ./sandbox:/app/sandbox
       - ./prompts:/app/prompts
+      # MemPalace persistent ChromaDB storage
+      - ./mempalace:/mempalace
     networks:
       - mab-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # No ports: section — not exposed to host, internal network only
     mem_limit: 1g
     security_opt:
@@ -65,7 +128,7 @@ services:
       dockerfile: Dockerfile
       network: host
     container_name: mab-api
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--reload"]
     environment:
       # LLM inference endpoint (existing llama-api on host)
       LLAMA_URL: "http://host.docker.internal:8080"

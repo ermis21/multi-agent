@@ -1,5 +1,7 @@
 # Context
 
+{{AGENT_MODE}}
+
 {{SOUL}}
 
 {{MEMORY}}

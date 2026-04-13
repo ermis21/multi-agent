@@ -1,0 +1,27 @@
+[
+  {
+    "question": "What is the capital of France?",
+    "expected_topics": ["paris"],
+    "min_score": 0.7
+  },
+  {
+    "question": "Explain what a REST API is in simple terms.",
+    "expected_topics": ["http", "endpoint", "request", "response"],
+    "min_score": 0.6
+  },
+  {
+    "question": "What is 15 multiplied by 7?",
+    "expected_topics": ["105"],
+    "min_score": 0.8
+  },
+  {
+    "question": "List three benefits of using Docker containers.",
+    "expected_topics": ["isolat", "portab", "deploy"],
+    "min_score": 0.6
+  },
+  {
+    "question": "What does CPU stand for?",
+    "expected_topics": ["central processing unit"],
+    "min_score": 0.8
+  }
+]

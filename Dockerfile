@@ -32,4 +32,8 @@ RUN mkdir -p /workspace /sessions /app/prompts/generated
 # Ensure app is importable as a package
 RUN touch /app/app/__init__.py /app/sandbox/__init__.py
 
+# Pre-download the ChromaDB ONNX embedding model so it's baked into the image
+# and containers don't need internet access at runtime.
+RUN python3 -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()(['warmup'])"
+
 EXPOSE 8090 9000

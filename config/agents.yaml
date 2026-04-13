@@ -16,6 +16,19 @@ worker:
     - file_write
     - file_list
     - shell_exec
+    - web_search
+    - web_fetch
+    - memory_add
+    - memory_search
+    - memory_list
+    - notion_search
+    - notion_get_page
+    - notion_create_page
+    - notion_update_page
+    - discord_send
+    - discord_read
+    - discord_set_nickname
+    - discord_edit_channel
 
   # Maximum tool call iterations per completion (prevents runaway loops).
   max_tool_iterations: 10
@@ -47,19 +60,14 @@ soul_updater:
 # Runs on POST /config/agent. Guides the user through configuration questions.
 # Tightly restricted: can only read and write config files, nothing else.
 config_agent:
-  # These tools are handled locally inside mab-api (not via sandbox).
   allowed_tools:
     - read_config
     - write_config
+    - web_search
+    - web_fetch
 
   # Strategic questions the config agent walks through in order.
   # The agentic_config.md prompt expands on each of these.
-  guided_questions:
-    - "What prompt mode should be used? ('full' for capable models, 'concise' for small/fast ones)"
-    - "Should the supervisor grading loop be enabled? (adds one extra LLM call per turn)"
-    - "If supervisor enabled: what pass threshold? (0.0–1.0, recommended: 0.7)"
-    - "How many retries if supervisor fails? (recommended: 2–3)"
-    - "Should the daily SOUL.md auto-update be enabled?"
 
 
 # ── Improvement Agent ─────────────────────────────────────────────────────────
@@ -85,3 +93,39 @@ improvement_agent:
 
   # Higher iteration limit for multi-step improvement workflows.
   max_tool_iterations: 20
+
+
+# ── Discord Agent ─────────────────────────────────────────────────────────────
+# Handles Discord-specific tasks: sending messages, reading channels,
+# managing nicknames and channel metadata.
+discord_agent:
+  allowed_tools:
+    - discord_send
+    - discord_read
+    - discord_set_nickname
+    - discord_edit_channel
+    - memory_search
+    - memory_add
+
+  max_tool_iterations: 10
+
+
+# ── Testing Agent ─────────────────────────────────────────────────────────────
+# Deterministic + LLM-driven auditor.
+# Call via POST /v1/agents/testing_agent.
+# Runs diagnostic_check first (no LLM), then does workspace/memory round-trips
+# and produces a structured markdown audit report.
+# Invoke after improvement_agent changes to verify system integrity.
+testing_agent:
+  allowed_tools:
+    - diagnostic_check
+    - file_read
+    - file_write
+    - file_list
+    - shell_exec
+    - read_config
+    - memory_add
+    - memory_search
+    - web_search
+
+  max_tool_iterations: 15

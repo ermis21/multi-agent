@@ -7,47 +7,65 @@ without restarting the container.
 
 import os
 from pathlib import Path
+from typing import Callable
 
 import yaml
 
-CONFIG_PATH  = Path(os.environ.get("CONFIG_PATH",        "/app/config/config.yaml"))
-AGENTS_PATH  = Path(os.environ.get("AGENTS_CONFIG_PATH", "/app/config/agents.yaml"))
-
-# Module-level cache: (mtime, parsed_dict)
-_config_cache: tuple[float, dict] = (0.0, {})
-_agents_cache: tuple[float, dict] = (0.0, {})
+CONFIG_PATH = Path(os.environ.get("CONFIG_PATH",        "/app/config/config.yaml"))
+AGENTS_PATH = Path(os.environ.get("AGENTS_CONFIG_PATH", "/app/config/agents.yaml"))
 
 
-def get_config() -> dict:
-    """Return parsed config.yaml, re-reading only when the file changes."""
-    global _config_cache
-    mtime = CONFIG_PATH.stat().st_mtime
-    if mtime != _config_cache[0]:
-        _config_cache = (mtime, yaml.safe_load(CONFIG_PATH.read_text()))
-    return _config_cache[1]
+def _make_yaml_loader(path: Path) -> Callable[[], dict]:
+    """Return a getter that re-reads path only when its mtime changes."""
+    cache: list = [0.0, {}]  # [mtime, parsed_dict] — list so closure can mutate
+
+    def getter() -> dict:
+        mtime = path.stat().st_mtime
+        if mtime != cache[0]:
+            cache[0] = mtime
+            cache[1] = yaml.safe_load(path.read_text())
+        return cache[1]
+
+    getter._cache = cache  # expose for patch_config to invalidate
+    return getter
 
 
-def get_agents_config() -> dict:
-    """Return parsed agents.yaml, re-reading only when the file changes."""
-    global _agents_cache
-    mtime = AGENTS_PATH.stat().st_mtime
-    if mtime != _agents_cache[0]:
-        _agents_cache = (mtime, yaml.safe_load(AGENTS_PATH.read_text()))
-    return _agents_cache[1]
+get_config       = _make_yaml_loader(CONFIG_PATH)
+get_agents_config = _make_yaml_loader(AGENTS_PATH)
 
 
 def patch_config(patch: dict) -> dict:
     """
     Deep-merge patch into config.yaml and write it back.
     Returns the updated config dict.
+
+    Accepts both nested dicts and dotted-key notation:
+      {"tools": {"discord": {"default_channel_id": "x"}}}
+      {"tools.discord.default_channel_id": "x"}   ← expanded automatically
     """
     cfg = yaml.safe_load(CONFIG_PATH.read_text())
-    _deep_merge(cfg, patch)
+    _deep_merge(cfg, _expand_dotted_keys(patch))
     CONFIG_PATH.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False, allow_unicode=True))
-    # Invalidate cache
-    global _config_cache
-    _config_cache = (0.0, {})
+    get_config._cache[0] = 0.0  # invalidate cache
     return get_config()
+
+
+def _expand_dotted_keys(patch: dict) -> dict:
+    """
+    Expand any top-level dotted keys into nested dicts.
+    {"a.b.c": 1, "x": {"y": 2}} → {"a": {"b": {"c": 1}}, "x": {"y": 2}}
+    """
+    expanded: dict = {}
+    for key, value in patch.items():
+        if "." in key:
+            parts = key.split(".")
+            node = expanded
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = value
+        else:
+            expanded[key] = value
+    return expanded
 
 
 def _deep_merge(base: dict, override: dict) -> None:

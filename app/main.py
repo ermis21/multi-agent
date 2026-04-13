@@ -5,6 +5,7 @@ Endpoints:
   POST  /v1/chat/completions     Main supervisor/worker loop
   POST  /config/agent            Guided configuration UI agent
   POST  /internal/soul-update    Manual trigger for soul update (testing)
+  GET   /internal/diagnostics    Deterministic subsystem health check
   GET   /health                  Health + LLM reachability check
   GET   /sessions                List all sessions
   GET   /sessions/{session_id}   Get full session history
@@ -13,6 +14,7 @@ Endpoints:
   GET   /models                  List tools / model info
 """
 
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -22,8 +24,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from app.agents import run_agent_loop, run_config_agent, run_soul_update
+from app.agents import run_agent_loop, run_agent_role, run_config_agent, run_soul_update
 from app.config_loader import get_config, patch_config
+from app.mcp_client import call_tool
 from app.prompt_generator import cleanup_all_generated
 from app.session_logger import get_session, list_sessions
 
@@ -93,6 +96,32 @@ async def chat_completions(request: Request):
     return JSONResponse(result)
 
 
+# ── Direct role endpoint ───────────────────────────────────────────────────────
+
+@app.post("/v1/agents/{role}")
+async def agents_role(role: str, request: Request):
+    """
+    Call any agent role directly by name.
+
+    Body: {"messages": [...], "session_id": "optional"}
+
+    Special routes: 'soul_updater' → run_soul_update, 'config_agent' → run_config_agent.
+    All other roles run the worker loop with that role's config from agents.yaml.
+    """
+    body = await request.json()
+    session_id = body.pop("session_id", None) or (
+        datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
+    )
+    if role == "soul_updater":
+        # Soul update can take minutes — dispatch as background task and return immediately
+        asyncio.create_task(run_soul_update())
+        return JSONResponse({"status": "accepted", "role": role})
+    if role == "config_agent":
+        body["session_id"] = session_id
+        return JSONResponse(await run_config_agent(body))
+    return JSONResponse(await run_agent_role(role, body, session_id))
+
+
 # ── Config agent ───────────────────────────────────────────────────────────────
 
 @app.post("/config/agent")
@@ -118,6 +147,46 @@ async def trigger_soul_update():
     """
     await run_soul_update()
     return {"status": "ok", "message": "Soul update completed. Check workspace/SOUL.md."}
+
+
+@app.get("/internal/diagnostics")
+async def diagnostics():
+    """
+    Deterministic health check of all system components.
+    Calls the sandbox diagnostic_check tool and probes the LLM in parallel.
+    No LLM inference involved — safe to call at any time.
+    """
+    cfg = get_config()
+
+    sandbox_result, llm_status = await asyncio.gather(
+        call_tool("diagnostic_check", {}, ["diagnostic_check"]),
+        _probe_llm(cfg),
+    )
+
+    fail_count = sandbox_result.get("fail_count", 0) + (1 if llm_status["status"] == "fail" else 0)
+    warn_count = sandbox_result.get("warn_count", 0) + (1 if llm_status["status"] == "warn" else 0)
+    pass_count = sandbox_result.get("pass_count", 0) + (1 if llm_status["status"] == "pass" else 0)
+    overall    = "fail" if fail_count else ("warn" if warn_count else "pass")
+
+    return {
+        "source":         "mab-api",
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+        "sandbox_checks": sandbox_result,
+        "api_checks":     {"llm_api_from_api": llm_status},
+        "overall":        overall,
+        "summary":        f"{pass_count} pass, {warn_count} warn, {fail_count} fail",
+    }
+
+
+async def _probe_llm(cfg: dict) -> dict:
+    base_url = cfg["llm"]["base_url"]
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{base_url}/health")
+        status = "pass" if r.status_code == 200 else "warn"
+        return {"status": status, "detail": f"HTTP {r.status_code} from {base_url}"}
+    except Exception as e:
+        return {"status": "fail", "detail": str(e)}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

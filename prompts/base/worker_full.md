@@ -33,6 +33,10 @@
 
 ---
 
+{{AGENT_MODE}}
+
+---
+
 # Tools
 
 {{ALLOWED_TOOLS}}
