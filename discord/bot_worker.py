@@ -121,10 +121,11 @@ def _stop_thinking(session_id: str) -> None:
 
 
 def _format_tool_trace(traces: list[dict]) -> str:
-    """Format tool call telemetry as a Discord ANSI code block.
+    """Format tool call telemetry as Discord subtext (small, muted lines).
 
-    Success entries render dim; failures render in red — both at the same size.
-    Format per entry: • tool_name (Xs, N lines)  or  • tool_name (Xs) ERROR: msg
+    Each line is prefixed with -# so Discord renders it in small grey text,
+    keeping tool reports visually subordinate to the actual response.
+    Errors get a ⚠ prefix to stay visible despite the small size.
     """
     lines = []
     for t in traces:
@@ -132,11 +133,11 @@ def _format_tool_trace(traces: list[dict]) -> str:
         duration = t.get("duration_s", 0)
         error    = t.get("error")
         if error:
-            lines.append(f"\u001b[31m\u2022 {name} ({duration:.2f}s) ERROR: {error}\u001b[0m")
+            lines.append(f"-# ⚠ {name} ({duration:.2f}s) {error}")
         else:
             n = t.get("lines", 0)
-            lines.append(f"\u001b[2m\u2022 {name} ({duration:.2f}s, {n} lines)\u001b[0m")
-    return "```ansi\n" + "\n".join(lines) + "\n```"
+            lines.append(f"-# {name} ({duration:.2f}s, {n} lines)")
+    return "\n".join(lines)
 
 
 # ── State persistence — survives container restarts ───────────────────────────
