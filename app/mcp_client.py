@@ -25,7 +25,8 @@ LOCAL_TOOLS: frozenset[str] = frozenset({"read_config", "write_config"})
 FAST_TIMEOUT_S = 10
 SLOW_TIMEOUT_S = 130
 SLOW_TOOLS: frozenset[str] = frozenset({
-    "shell_exec", "git_status", "git_commit", "git_rollback", "git_log",
+    "shell_exec", "execute_command",
+    "git_status", "git_commit", "git_rollback", "git_log",
     "docker_test_up", "docker_test_down", "docker_test_health",
     "web_search", "web_fetch",
     "memory_add", "memory_search", "memory_list",
@@ -39,16 +40,52 @@ SLOW_TOOLS: frozenset[str] = frozenset({
 _client = httpx.AsyncClient(timeout=SLOW_TIMEOUT_S)
 
 
-async def call_tool(method: str, params: dict, allowed: list[str]) -> dict:
+def _path_is_auto_allowed(method: str, params: dict, auto_allow_paths: list[str]) -> bool:
+    """
+    Return True if the tool's target path starts with any auto_allow path prefix.
+    Used to exempt plan-file writes from ask_user in plan mode.
+    """
+    if not auto_allow_paths:
+        return False
+    path = params.get("path") or params.get("destination") or params.get("source", "")
+    return any(path.startswith(prefix) for prefix in auto_allow_paths)
+
+
+async def call_tool(
+    method: str,
+    params: dict,
+    allowed: list[str],
+    mode: str = "converse",
+    approved_tools: list[str] | None = None,
+) -> dict:
     """
     Execute a tool call.
 
     Returns a result dict on success.
     Returns {"error": "..."} on permission denial or execution failure.
-    Never raises — errors are returned as data so the agent can handle them.
+    Returns {"pending_approval": True, "tool": ..., "params": ...} when the tool
+      is in ask_user and the caller has not pre-approved it.
+    Never raises — results are always returned as data.
     """
     if method not in allowed:
         return {"error": f"Tool '{method}' is not permitted for this agent role. Allowed: {allowed}"}
+
+    cfg = get_config()
+    mode_approval    = cfg.get("approval", {}).get(mode, {})
+    auto_fail        = set(mode_approval.get("auto_fail", []))
+    ask_user         = set(mode_approval.get("ask_user", []))
+    auto_allow_paths = mode_approval.get("auto_allow", {}).get("paths", [])
+    pre_approved     = set(approved_tools or [])
+
+    # Hard-block — no LLM or user approval can bypass this
+    if method in auto_fail:
+        return {"error": f"Tool '{method}' is permanently blocked in {mode!r} mode by system policy."}
+
+    # Ask-user gate — skip if pre-approved or if path is auto-allowed
+    if (method in ask_user
+            and method not in pre_approved
+            and not _path_is_auto_allowed(method, params, auto_allow_paths)):
+        return {"pending_approval": True, "tool": method, "params": params}
 
     if method == "read_config":
         return {"config": get_config()}
@@ -75,8 +112,9 @@ async def call_tool(method: str, params: dict, allowed: list[str]) -> dict:
     except Exception as e:
         return {"error": f"Sandbox unreachable: {e}"}
 
-    if data.get("error"):
-        return {"error": data["error"]}
+    error = data.get("error")
+    if error is not None:
+        return {"error": error or "Tool failed with no error detail"}
     return data.get("result", {})
 
 

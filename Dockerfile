@@ -36,4 +36,9 @@ RUN touch /app/app/__init__.py /app/sandbox/__init__.py
 # and containers don't need internet access at runtime.
 RUN python3 -c "from chromadb.utils.embedding_functions import DefaultEmbeddingFunction; DefaultEmbeddingFunction()(['warmup'])"
 
+# Venv init script — creates /workspace/venv on first container start
+COPY sandbox/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+
 EXPOSE 8090 9000

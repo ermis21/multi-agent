@@ -5,8 +5,9 @@ Exposes tools over HTTP JSON-RPC (POST /mcp).
 NOT exposed publicly — internal Docker network only.
 
 Tools:
-  Workspace:   file_read, file_write, file_list
-  Shell:       shell_exec  (resource-limited, cwd=/workspace)
+  Workspace:   file_read, file_write, file_list, file_search, directory_tree,
+               file_move, create_dir, file_info
+  Shell:       shell_exec, execute_command  (resource-limited, cwd=/workspace)
   Git:         git_status, git_commit, git_rollback, git_log
   Docker:      docker_test_up, docker_test_down, docker_test_health
   Web:         web_search, web_fetch
@@ -14,12 +15,17 @@ Tools:
   Notion:      notion_search, notion_get_page, notion_create_page, notion_update_page
   Discord:     discord_send, discord_read, discord_set_nickname, discord_edit_channel
   Diagnostics: diagnostic_check
+
+File path prefixes:
+  (default)  → /workspace  (read + write)
+  project/   → /project    (read-only; .env blocked)
 """
 
 import os
 import resource
 import stat as _stat
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uuid
@@ -77,6 +83,23 @@ def _safe_path(rel: str, root: Path) -> Path:
     return target
 
 
+_BLOCKED_FILES = {".env", ".env.local", ".env.production", ".env.staging"}
+
+def _resolve_read_path(rel: str) -> Path:
+    """
+    Resolve a path for reading — supports both workspace and project (read-only).
+    Prefix with 'project/' to access the system source code.
+    Secrets files (.env etc.) in /project are blocked.
+    """
+    if rel.startswith("project/") or rel == "project" or rel.startswith("/project"):
+        inner = rel.removeprefix("/project").removeprefix("project").lstrip("/")
+        p = _safe_path(inner or ".", PROJECT)
+        if p.name in _BLOCKED_FILES:
+            raise HTTPException(status_code=403, detail=f"Access to {p.name!r} is not permitted")
+        return p
+    return _safe_path(rel, WORKSPACE)
+
+
 def _set_limits():
     """Called as preexec_fn for shell subprocesses."""
     resource.setrlimit(resource.RLIMIT_AS,    (SHELL_MEM_LIMIT, SHELL_MEM_LIMIT))
@@ -93,7 +116,7 @@ class MCPRequest(BaseModel):
 # ── Tool implementations ───────────────────────────────────────────────────
 
 def _file_read(params: dict) -> dict:
-    path = _safe_path(params["path"], WORKSPACE)
+    path = _resolve_read_path(params["path"])
     return {"content": path.read_text(encoding="utf-8")}
 
 
@@ -105,15 +128,84 @@ def _file_write(params: dict) -> dict:
 
 
 def _file_list(params: dict) -> dict:
-    path = _safe_path(params.get("path", "."), WORKSPACE)
+    path = _resolve_read_path(params.get("path", "."))
     try:
         entries = []
         for e in sorted(path.iterdir()):
             st = e.stat()
             entries.append({"name": e.name, "is_dir": _stat.S_ISDIR(st.st_mode), "size": st.st_size})
-        return {"entries": entries, "path": str(path.relative_to(WORKSPACE))}
+        root = PROJECT if str(path).startswith(str(PROJECT)) else WORKSPACE
+        return {"entries": entries, "path": str(path.relative_to(root))}
     except (FileNotFoundError, NotADirectoryError):
         return {"entries": [], "error": f"Path not found: {params.get('path', '.')}"}
+
+
+def _file_search(params: dict) -> dict:
+    """Recursive glob search under workspace or project/."""
+    root_rel = params.get("path", ".")
+    pattern  = params["pattern"]
+    root     = _resolve_read_path(root_rel)
+    if not root.is_dir():
+        return {"matches": [], "count": 0, "error": f"Not a directory: {root_rel}"}
+    matches = [str(p.relative_to(root)) for p in sorted(root.rglob(pattern))][:200]
+    return {"matches": matches, "count": len(matches)}
+
+
+def _directory_tree(params: dict) -> dict:
+    """Recursive directory tree up to depth N (max 6)."""
+    root  = _resolve_read_path(params.get("path", "."))
+    depth = min(int(params.get("depth", 3)), 6)
+
+    def _tree(p: Path, d: int) -> dict:
+        node: dict = {"name": p.name, "type": "dir" if p.is_dir() else "file"}
+        if p.is_dir() and d > 0:
+            try:
+                node["children"] = [
+                    _tree(c, d - 1)
+                    for c in sorted(p.iterdir())
+                    if not c.name.startswith(".")
+                ]
+            except PermissionError:
+                node["children"] = []
+        return node
+
+    return _tree(root, depth)
+
+
+def _file_move(params: dict) -> dict:
+    """Move or rename a file within workspace."""
+    src  = _safe_path(params["source"],      WORKSPACE)
+    dest = _safe_path(params["destination"], WORKSPACE)
+    if not src.exists():
+        return {
+            "error": (
+                f"Source not found in workspace: '{params['source']}'. "
+                "file_move only operates within /workspace. "
+                "To move project files, use shell_exec with 'mv' — but note /project is read-only inside the container."
+            )
+        }
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dest)
+    return {"ok": True, "destination": str(dest.relative_to(WORKSPACE))}
+
+
+def _create_dir(params: dict) -> dict:
+    """Create a directory (and parents) in workspace."""
+    path = _safe_path(params["path"], WORKSPACE)
+    path.mkdir(parents=True, exist_ok=True)
+    return {"ok": True, "path": params["path"]}
+
+
+def _file_info(params: dict) -> dict:
+    """Return stat metadata for a file or directory."""
+    p = _resolve_read_path(params["path"])
+    s = p.stat()
+    return {
+        "path":     params["path"],
+        "size":     s.st_size,
+        "is_dir":   p.is_dir(),
+        "modified": datetime.fromtimestamp(s.st_mtime, tz=timezone.utc).isoformat(),
+    }
 
 
 def _shell_exec(params: dict) -> dict:
@@ -377,6 +469,23 @@ def _discord_set_nickname(params: dict) -> dict:
 def _discord_edit_channel(params: dict) -> dict:
     return _discord_proxy("edit_channel", params)
 
+def _discord_create_channel(params: dict) -> dict:
+    return _discord_proxy("create_channel", params)
+
+def _discord_delete_channel(params: dict) -> dict:
+    return _discord_proxy("delete_channel", params)
+
+def _discord_list_channels(params: dict) -> dict:
+    try:
+        r = httpx.get(f"{DISCORD_URL}/discord/list_channels", params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"error": f"Discord proxy failed: {e}"}
+
+def _discord_create_category(params: dict) -> dict:
+    return _discord_proxy("create_category", params)
+
 
 # ── Diagnostics ────────────────────────────────────────────────────────────
 
@@ -530,8 +639,14 @@ HANDLERS = {
     "file_read":              _file_read,
     "file_write":             _file_write,
     "file_list":              _file_list,
+    "file_search":            _file_search,
+    "directory_tree":         _directory_tree,
+    "file_move":              _file_move,
+    "create_dir":             _create_dir,
+    "file_info":              _file_info,
     # Shell
     "shell_exec":             _shell_exec,
+    "execute_command":        _shell_exec,   # alias — same impl, clearer name
     # Git
     "git_status":             _git_status,
     "git_commit":             _git_commit,
@@ -554,10 +669,14 @@ HANDLERS = {
     "notion_create_page":     lambda p: _notion_call("notion_create_page", p),
     "notion_update_page":     lambda p: _notion_call("notion_update_page", p),
     # Discord
-    "discord_send":           _discord_send,
-    "discord_read":           _discord_read,
-    "discord_set_nickname":   _discord_set_nickname,
-    "discord_edit_channel":   _discord_edit_channel,
+    "discord_send":            _discord_send,
+    "discord_read":            _discord_read,
+    "discord_set_nickname":    _discord_set_nickname,
+    "discord_edit_channel":    _discord_edit_channel,
+    "discord_create_channel":  _discord_create_channel,
+    "discord_delete_channel":  _discord_delete_channel,
+    "discord_list_channels":   _discord_list_channels,
+    "discord_create_category": _discord_create_category,
     # Diagnostics
     "diagnostic_check":       _diagnostic_check,
 }

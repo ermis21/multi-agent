@@ -31,16 +31,6 @@ tree   = app_commands.CommandTree(client)
 _http  = httpx.AsyncClient(timeout=120)
 
 
-# ── Channel auto-create ───────────────────────────────────────────────────────
-
-async def _ensure_channel(guild: discord.Guild, name: str, topic: str = "") -> discord.TextChannel:
-    ch = discord.utils.get(guild.text_channels, name=name)
-    if ch is None:
-        ch = await guild.create_text_channel(name, topic=topic)
-        print(f"[config-bot] created #{name} ({ch.id})", flush=True)
-    return ch
-
-
 # ── Slash commands ────────────────────────────────────────────────────────────
 
 @tree.command(name="status", description="Show system configuration status")
@@ -89,11 +79,15 @@ async def on_ready():
     if GUILD_ID:
         try:
             guild = client.get_guild(GUILD_ID) or await client.fetch_guild(GUILD_ID)
-            ch = await _ensure_channel(guild, "mab-config", "Multi-agent config assistant")
-            CONFIG_CHANNEL_IDS.add(ch.id)
-            print(f"[config-bot] listening on #{ch.name} ({ch.id})", flush=True)
+            # Channel creation is handled by mod-bot; just find the existing channel.
+            ch = discord.utils.get(guild.text_channels, name="mab-config")
+            if ch:
+                CONFIG_CHANNEL_IDS.add(ch.id)
+                print(f"[config-bot] listening on #{ch.name} ({ch.id})", flush=True)
+            else:
+                print("[config-bot] #mab-config not found yet — mod-bot will create it", flush=True)
         except Exception as e:
-            print(f"[config-bot] channel setup failed: {e}", flush=True)
+            print(f"[config-bot] channel lookup failed: {e}", flush=True)
         try:
             guild_obj = discord.Object(id=GUILD_ID)
             tree.copy_global_to(guild=guild_obj)

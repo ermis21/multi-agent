@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -35,21 +36,6 @@ from app.session_logger import get_session, list_sessions
 scheduler = AsyncIOScheduler()
 
 
-def _parse_cron(schedule: str) -> dict:
-    """Parse '0 5 * * *' into APScheduler kwargs."""
-    parts = schedule.strip().split()
-    if len(parts) != 5:
-        return {"hour": 5, "minute": 0}
-    minute, hour, day, month, weekday = parts
-    kwargs: dict = {}
-    if minute  != "*": kwargs["minute"]      = int(minute)
-    if hour    != "*": kwargs["hour"]        = int(hour)
-    if day     != "*": kwargs["day"]         = int(day)
-    if month   != "*": kwargs["month"]       = int(month)
-    if weekday != "*": kwargs["day_of_week"] = int(weekday)
-    return kwargs
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Clean up stale generated prompt files from previous runs
@@ -57,20 +43,43 @@ async def lifespan(app: FastAPI):
 
     cfg = get_config()
     if cfg["soul"]["enabled"]:
-        cron_kwargs = _parse_cron(cfg["soul"]["schedule"])
         scheduler.add_job(
             run_soul_update,
-            "cron",
+            CronTrigger.from_crontab(cfg["soul"]["schedule"]),
             id="soul_update",
             replace_existing=True,
-            **cron_kwargs,
         )
+
+    dm_cfg = cfg.get("discord_moderator", {})
+    if dm_cfg.get("enabled", False):
+        scheduler.add_job(
+            _run_discord_moderation,
+            CronTrigger.from_crontab(dm_cfg["schedule"]),
+            id="discord_moderation",
+            replace_existing=True,
+        )
+
+    if scheduler.get_jobs():
         scheduler.start()
 
     yield
 
     if scheduler.running:
         scheduler.shutdown(wait=False)
+
+
+async def _run_discord_moderation() -> None:
+    """Cron wrapper: invoke the discord_moderator agent role."""
+    session_id = datetime.now(timezone.utc).strftime("discord_mod_%Y%m%d_%H%M%S")
+    body = {
+        "messages": [{"role": "user", "content": "Run your scheduled Discord moderation task."}],
+        "mode": "build",
+    }
+    try:
+        await run_agent_role("discord_moderator", body, session_id)
+        print(f"[mab-api] discord moderation completed: {session_id}", flush=True)
+    except Exception as e:
+        print(f"[mab-api] discord moderation failed: {e}", flush=True)
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -139,6 +148,18 @@ async def config_agent(request: Request):
 
 
 # ── Internal triggers ──────────────────────────────────────────────────────────
+
+@app.post("/internal/discord-moderation")
+async def trigger_discord_moderation():
+    """Manually trigger the Discord moderation job."""
+    session_id = datetime.now(timezone.utc).strftime("discord_mod_%Y%m%d_%H%M%S")
+    body = {
+        "messages": [{"role": "user", "content": "Run Discord moderation: organize channels, delete empty ones, archive inactive ones."}],
+        "mode": "build",
+    }
+    result = await run_agent_role("discord_moderator", body, session_id)
+    return {"status": "ok", "session_id": session_id, "result": result}
+
 
 @app.post("/internal/soul-update")
 async def trigger_soul_update():

@@ -51,6 +51,7 @@ services:
     environment:
       DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+      DISCORD_TOKEN_MOD: "${DISCORD_TOKEN_MOD:-}"
       DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
       DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
       DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
@@ -65,6 +66,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+    volumes:
+      # Persistent bot state — session IDs and user modes survive container restarts
+      - ./discord_state:/app/state
     restart: unless-stopped
     logging: *logging
     depends_on:
@@ -95,8 +99,8 @@ services:
     volumes:
       # Shared workspace (soul, memory, user files)
       - ./workspace:/workspace
-      # Full project repo so agents can self-improve and run test stacks
-      - .:/project
+      # Full project repo for agent self-inspection — read-only (not a clone)
+      - .:/project:ro
       # Docker socket for docker_test_up / docker_test_down tools
       - /var/run/docker.sock:/var/run/docker.sock
       # Live-reload: code changes take effect on next request without rebuild
@@ -132,6 +136,7 @@ services:
     environment:
       # LLM inference endpoint (existing llama-api on host)
       LLAMA_URL: "http://host.docker.internal:8080"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       # MCP sandbox endpoint (internal Docker network)
       SANDBOX_URL: "http://mab-sandbox:9000"
       # Path overrides (these paths are inside the container)
@@ -149,6 +154,8 @@ services:
       - ./config:/app/config
       - ./prompts:/app/prompts
       - ./app:/app/app
+      # Claude Code OAuth credentials — read-only, for Anthropic provider auth
+      - /home/homelab/.claude/.credentials.json:/app/.claude_credentials.json:ro
     ports:
       - "8090:8090"
     extra_hosts:

@@ -15,6 +15,12 @@ worker:
     - file_read
     - file_write
     - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
     - shell_exec
     - web_search
     - web_fetch
@@ -29,6 +35,8 @@ worker:
     - discord_read
     - discord_set_nickname
     - discord_edit_channel
+    - read_config
+    - write_config
 
   # Maximum tool call iterations per completion (prevents runaway loops).
   max_tool_iterations: 10
@@ -82,6 +90,12 @@ improvement_agent:
     - file_read
     - file_write
     - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
     - shell_exec
     - git_status
     - git_commit
@@ -122,6 +136,10 @@ testing_agent:
     - file_read
     - file_write
     - file_list
+    - file_search
+    - directory_tree
+    - file_info
+    - execute_command
     - shell_exec
     - read_config
     - memory_add
@@ -129,3 +147,116 @@ testing_agent:
     - web_search
 
   max_tool_iterations: 15
+
+
+# ── Discord Moderator ─────────────────────────────────────────────────────────
+# Cron-based channel organizer. Runs every 3 days.
+# Lists all channels, deletes empty ones, archives inactive, organizes into themed categories.
+discord_moderator:
+  allowed_tools:
+    - discord_list_channels
+    - discord_create_channel
+    - discord_delete_channel
+    - discord_create_category
+    - discord_edit_channel
+    - discord_read
+    - discord_send
+    - memory_add
+    - memory_search
+  max_tool_iterations: 30
+
+
+# ── Agent Spawner ─────────────────────────────────────────────────────────────
+# Writes self-contained briefs for sub-agents. Read-only context gathering.
+agent_spawner:
+  allowed_tools:
+    - memory_search
+    - file_read
+  max_tool_iterations: 5
+
+
+# ── Session Compactor ─────────────────────────────────────────────────────────
+# Pure text transformation — compresses long sessions into resumable summaries.
+session_compactor:
+  allowed_tools: []
+  max_tool_iterations: 1
+
+
+# ── Cron Creator ──────────────────────────────────────────────────────────────
+# Translates natural-language schedules into cron + prompt pairs.
+cron_creator:
+  allowed_tools:
+    - read_config
+    - write_config
+  max_tool_iterations: 5
+
+
+# ── Research Agent ────────────────────────────────────────────────────────────
+# Read-only investigation across code, web, and memory.
+research_agent:
+  allowed_tools:
+    - web_search
+    - web_fetch
+    - file_read
+    - file_search
+    - file_list
+    - directory_tree
+    - memory_search
+  max_tool_iterations: 15
+
+
+# ── Coding Agent ──────────────────────────────────────────────────────────────
+# Implements code changes and self-verifies via tests/lint/type-check.
+coding_agent:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
+    - shell_exec
+    - git_status
+    - git_commit
+    - git_rollback
+    - git_log
+  max_tool_iterations: 20
+
+
+# ── Tool Builder ──────────────────────────────────────────────────────────────
+# Scaffolds new tools (TOOL_DOCS entry + handler stub).
+tool_builder:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_search
+    - directory_tree
+  max_tool_iterations: 10
+
+
+# ── Skill Builder ─────────────────────────────────────────────────────────────
+# Authors SKILL.md files with frontmatter + trigger conditions.
+skill_builder:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+  max_tool_iterations: 8
+
+
+# ── WebFetch Summarizer ───────────────────────────────────────────────────────
+# Compresses fetched URL content to relevant facts with verbatim quotes.
+webfetch_summarizer:
+  allowed_tools:
+    - web_fetch
+  max_tool_iterations: 5
+
+
+# ── Prompt Suggester ──────────────────────────────────────────────────────────
+# Generates 3–5 likely follow-up prompts for the user.
+prompt_suggester:
+  allowed_tools: []
+  max_tool_iterations: 1

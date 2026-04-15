@@ -31,9 +31,10 @@ GENERATED    = PROMPTS_DIR / "generated"
 TOOL_DOCS: dict[str, str] = {
     "file_read": """\
 ### file_read
-Read a file from the workspace.
+Read a file. Prefix path with `project/` to read the system source code (read-only).
 ```json
-{"tool": "file_read", "params": {"path": "relative/path/to/file"}}
+{"tool": "file_read", "params": {"path": "notes.txt"}}
+{"tool": "file_read", "params": {"path": "project/app/agents.py"}}
 ```""",
 
     "file_write": """\
@@ -45,16 +46,63 @@ Write content to a file in the workspace. Creates parent directories if needed.
 
     "file_list": """\
 ### file_list
-List files and directories in a workspace path.
+List files and directories. Prefix with `project/` to list source code.
 ```json
 {"tool": "file_list", "params": {"path": "."}}
+{"tool": "file_list", "params": {"path": "project/app"}}
+```""",
+
+    "file_search": """\
+### file_search
+Recursive glob search for files. Prefix path with `project/` to search source code.
+```json
+{"tool": "file_search", "params": {"path": ".", "pattern": "*.py"}}
+{"tool": "file_search", "params": {"path": "project/", "pattern": "*.md"}}
+```""",
+
+    "directory_tree": """\
+### directory_tree
+Recursive directory tree (default depth 3, max 6). Prefix with `project/` for source code.
+```json
+{"tool": "directory_tree", "params": {"path": ".", "depth": 3}}
+{"tool": "directory_tree", "params": {"path": "project/", "depth": 2}}
+```""",
+
+    "file_move": """\
+### file_move
+Move or rename a file within the workspace.
+```json
+{"tool": "file_move", "params": {"source": "old/path.txt", "destination": "new/path.txt"}}
+```""",
+
+    "create_dir": """\
+### create_dir
+Create a directory (and parents) in the workspace.
+```json
+{"tool": "create_dir", "params": {"path": "my/new/folder"}}
+```""",
+
+    "file_info": """\
+### file_info
+Get size, type, and modification time for a file or directory. Supports `project/` prefix.
+```json
+{"tool": "file_info", "params": {"path": "project/app/agents.py"}}
 ```""",
 
     "shell_exec": """\
 ### shell_exec
 Execute a bash command in the workspace. Timeout max 120s.
+A Python venv is pre-created at `venv/` — use `venv/bin/python` or `venv/bin/pip install`.
 ```json
-{"tool": "shell_exec", "params": {"command": "ls -la", "timeout_ms": 10000, "cwd": "."}}
+{"tool": "shell_exec", "params": {"command": "venv/bin/python script.py", "timeout_ms": 10000, "cwd": "."}}
+```""",
+
+    "execute_command": """\
+### execute_command
+Execute a shell command in the workspace (alias for shell_exec). Timeout max 120s.
+A Python venv is pre-created at `venv/` — use `venv/bin/python` or `venv/bin/pip install`.
+```json
+{"tool": "execute_command", "params": {"command": "venv/bin/pip install requests", "timeout_ms": 30000}}
 ```""",
 
     "git_status": """\
@@ -207,9 +255,42 @@ Set a nickname for a guild member.
 
     "discord_edit_channel": """\
 ### discord_edit_channel
-Edit a Discord channel's name or topic.
+Edit a Discord channel's name, topic, or category.
 ```json
-{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "name": "new-name", "topic": "New topic", "bot": "worker"}}
+{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "name": "new-name", "topic": "New topic"}}
+{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "category_id": 987654321}}
+```
+Use `category_id` to move a channel to a different category.""",
+
+    "discord_create_channel": """\
+### discord_create_channel
+Create a new text channel in the Discord guild.
+```json
+{"tool": "discord_create_channel", "params": {"name": "my-channel", "topic": "Optional topic", "category_id": 123456789}}
+```
+`category_id` is optional. Discover category IDs with `discord_list_channels` first.""",
+
+    "discord_delete_channel": """\
+### discord_delete_channel
+Permanently delete a Discord channel. Cannot be undone.
+```json
+{"tool": "discord_delete_channel", "params": {"channel_id": 123456789}}
+```""",
+
+    "discord_list_channels": """\
+### discord_list_channels
+List all channels in the Discord guild with metadata.
+Returns: id, name, type, category_id, category_name, topic, position, last_message_ts.
+`last_message_ts` is null if the channel has never had a message.
+```json
+{"tool": "discord_list_channels", "params": {}}
+```""",
+
+    "discord_create_category": """\
+### discord_create_category
+Create a new category channel in the Discord guild.
+```json
+{"tool": "discord_create_category", "params": {"name": "🛠️ System Work"}}
 ```""",
 
     "diagnostic_check": """\
@@ -236,6 +317,35 @@ def _read_workspace(name: str, max_chars: int) -> str:
     return text
 
 
+def _build_approval_context(cfg: dict, allowed_tools: list[str], mode: str = "converse") -> str:
+    """
+    Build the approval context block injected as {{APPROVAL_CONTEXT}}.
+    Lists only ask_user tools that are actually available to this agent in this mode.
+    Returns empty string if no ask_user tools are available.
+    """
+    mode_approval  = cfg.get("approval", {}).get(mode, {})
+    ask_user       = mode_approval.get("ask_user", [])
+    auto_allow_paths = mode_approval.get("auto_allow", {}).get("paths", [])
+    relevant = [t for t in ask_user if t in allowed_tools]
+    if not relevant:
+        return ""
+    tool_list = "\n".join(f"- `{t}`" for t in relevant)
+    path_note = ""
+    if auto_allow_paths:
+        prefixes = "`, `".join(auto_allow_paths)
+        path_note = (
+            f"\n\n**Exception:** writing to `{prefixes}` does **not** require confirmation — "
+            "use these paths freely for session plans and notes."
+        )
+    return (
+        "## Approval Required\n\n"
+        "Before calling any of the tools listed below, **describe exactly what you are "
+        "about to do and ask the user for explicit confirmation**. "
+        f"Wait for a clear 'yes' before proceeding. On 'no', stop and explain.\n\n"
+        f"{tool_list}{path_note}"
+    )
+
+
 def _build_tool_block(allowed_tools: list[str]) -> str:
     if not allowed_tools:
         return "_No tools available for this agent role._"
@@ -256,7 +366,10 @@ def _load_base_template(role: str, mode: str) -> str:
     Falls back to the full template if the concise one doesn't exist.
     """
     # soul_updater and config_agent have their own dedicated templates
-    if role in ("soul_updater", "config_agent", "improvement_agent"):
+    if role in ("soul_updater", "config_agent", "improvement_agent", "discord_moderator",
+                "agent_spawner", "session_compactor", "cron_creator", "research_agent",
+                "coding_agent", "tool_builder", "skill_builder",
+                "webfetch_summarizer", "prompt_suggester"):
         filename = f"{role}.md"
     else:
         filename = f"{role}_{mode}.md"
@@ -279,6 +392,7 @@ def generate(
     session_id: str = "",
     attempt: int = 0,
     extra: dict | None = None,
+    agent_mode: str = "converse",
 ) -> tuple[str, str]:
     """
     Generate a prompt for the given agent role.
@@ -313,9 +427,19 @@ def generate(
         "{{THRESHOLD}}":     str(cfg["agent"]["supervisor_pass_threshold"]),
         "{{SOUL_MAX_CHARS}}": str(soul_max),
         "{{MODE}}":          mode,
-        "{{AGENT_MODE}}":    "",   # overridden via extra= when a mode is active
+        "{{AGENT_MODE}}":       "",   # overridden via extra= when a mode is active
+        "{{APPROVAL_CONTEXT}}": _build_approval_context(cfg, allowed_tools, agent_mode),
         **(extra or {}),
     }
+
+    # Discord moderator — inject config-driven placeholders
+    if role == "discord_moderator":
+        dm_cfg = cfg.get("discord_moderator", {})
+        subs["{{INACTIVE_DAYS}}"]           = str(dm_cfg.get("inactive_days", 7))
+        subs["{{ARCHIVE_CATEGORY}}"]        = dm_cfg.get("archive_category", "📦 Archive")
+        subs["{{CONVERSATIONS_CATEGORY}}"]  = dm_cfg.get("conversations_category", "Conversations")
+        themed = dm_cfg.get("themed_categories", [])
+        subs["{{THEMED_CATEGORIES}}"]       = ", ".join(f'"{c}"' for c in themed)
 
     prompt = template
     for key, value in subs.items():

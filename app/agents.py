@@ -15,8 +15,10 @@ Tool calls:
 
 import json
 import os
+import time
 from pathlib import Path
 
+import anthropic as _anthropic_sdk
 import httpx
 
 from app.config_loader import get_config, get_agents_config
@@ -29,23 +31,147 @@ WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 
 _llm_client = httpx.AsyncClient(timeout=180)
 
+# Anthropic client cache: (token_used, client_instance)
+# Re-created whenever the active token changes (e.g. after OAuth refresh).
+_anthropic_client: tuple[str, _anthropic_sdk.AsyncAnthropic] | None = None
+
+# Mounted read-only from the host's ~/.claude/.credentials.json
+_CLAUDE_CREDS = Path("/app/.claude_credentials.json")
+
+
+def _read_oauth_token() -> str | None:
+    """
+    Read the Claude Code OAuth access token from the mounted credentials file.
+    Returns None if the file is missing, unreadable, or the token has expired.
+    """
+    if not _CLAUDE_CREDS.exists():
+        return None
+    try:
+        creds  = json.loads(_CLAUDE_CREDS.read_text())
+        oauth  = creds.get("claudeAiOauth", {})
+        token  = oauth.get("accessToken", "")
+        # expiresAt is milliseconds; skip if expiring within 5 minutes
+        if token and oauth.get("expiresAt", 0) > time.time() * 1000 + 300_000:
+            return token
+    except Exception:
+        pass
+    return None
+
+
+def _get_anthropic_client() -> _anthropic_sdk.AsyncAnthropic:
+    global _anthropic_client
+
+    oauth_token = _read_oauth_token()
+    if oauth_token:
+        # Re-create if this is the first call or the token was refreshed
+        if _anthropic_client is None or _anthropic_client[0] != oauth_token:
+            _anthropic_client = (oauth_token, _anthropic_sdk.AsyncAnthropic(auth_token=oauth_token))
+        return _anthropic_client[1]
+
+    # Fall back to ANTHROPIC_API_KEY env var
+    if _anthropic_client is None:
+        _anthropic_client = ("", _anthropic_sdk.AsyncAnthropic())
+    return _anthropic_client[1]
+
+
+async def _auto_store_memory(
+    raw_input: list[dict],
+    response: str,
+    session_id: str,
+    mode: str,
+    allowed_tools: list[str],
+) -> None:
+    """
+    Fire-and-forget: store a brief turn summary in MemPalace so the agent can
+    search conversation history across sessions via memory_search.
+    Only runs when memory_add is in the agent's allowed tool list.
+    """
+    if "memory_add" not in allowed_tools:
+        return
+    try:
+        user_text = " ".join(
+            m.get("content", "") for m in raw_input if m.get("role") == "user"
+        )[:300]
+        summary = (
+            f"Session turn [{session_id}]:\n"
+            f"User: {user_text}\n"
+            f"Agent: {response[:500]}"
+        )
+        await call_tool(
+            "memory_add",
+            {"content": summary, "tags": ["session_history", session_id, mode]},
+            ["memory_add"],
+            mode="converse",
+            approved_tools=["memory_add"],
+        )
+    except Exception:
+        pass  # non-fatal; never block the response
+
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
-async def _llm_call(messages: list[dict], cfg: dict, temperature: float | None = None) -> dict:
-    """Single call to llama.cpp via its OpenAI-compatible endpoint."""
-    r = await _llm_client.post(
-        f"{LLAMA_URL}/v1/chat/completions",
-        json={
-            "model":       cfg["llm"]["model"],
-            "messages":    messages,
-            "temperature": temperature if temperature is not None else cfg["llm"]["temperature"],
-            "max_tokens":  cfg["llm"]["max_tokens"],
-            "top_p":       cfg["llm"]["top_p"],
-        },
-    )
+async def _llm_call_local(messages: list[dict], llm: dict, temperature: float) -> dict:
+    """llama.cpp path via OpenAI-compatible endpoint."""
+    payload: dict = {
+        "model":       llm["model"],
+        "messages":    messages,
+        "temperature": temperature,
+        "max_tokens":  llm["max_tokens"],
+        "top_p":       llm["top_p"],
+        "top_k":       llm.get("top_k", 40),
+    }
+    if llm.get("enable_thinking", False):
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+    r = await _llm_client.post(f"{LLAMA_URL}/v1/chat/completions", json=payload)
     r.raise_for_status()
     return r.json()
+
+
+async def _llm_call_anthropic(messages: list[dict], llm: dict, temperature: float) -> dict:
+    """Anthropic SDK path — returns an OpenAI-compatible dict."""
+    client = _get_anthropic_client()
+
+    # Anthropic requires system as a separate param, not a message role
+    system = " ".join(m["content"] for m in messages if m["role"] == "system")
+    conv   = [m for m in messages if m["role"] != "system"]
+
+    thinking = llm.get("enable_thinking", False)
+    # Anthropic output token caps: 8192 normally, 16000 with extended thinking
+    max_tok = min(llm["max_tokens"], 16000 if thinking else 8192)
+
+    kwargs: dict = {
+        "model":      llm["model"],
+        "messages":   conv,
+        "max_tokens": max_tok,
+        "temperature": temperature,
+    }
+    if system:
+        kwargs["system"] = system
+    if thinking:
+        budget = llm.get("thinking_budget_tokens", 8000)
+        kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        kwargs.pop("temperature", None)  # temperature is rejected when thinking is enabled
+
+    resp = await client.messages.create(**kwargs)
+
+    # Normalise to OpenAI-compatible shape so the rest of agents.py is unchanged
+    text = next((b.text for b in resp.content if b.type == "text"), "")
+    return {
+        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "usage": {
+            "input_tokens":  resp.usage.input_tokens,
+            "output_tokens": resp.usage.output_tokens,
+        },
+    }
+
+
+async def _llm_call(messages: list[dict], cfg: dict, temperature: float | None = None) -> dict:
+    """Dispatch to the correct provider based on config."""
+    llm  = cfg["llm"]
+    temp = temperature if temperature is not None else llm["temperature"]
+    if llm.get("provider", "local") == "anthropic":
+        return await _llm_call_anthropic(messages, llm, temp)
+    return await _llm_call_local(messages, llm, temp)
 
 
 # ── Mode helpers ──────────────────────────────────────────────────────────────
@@ -70,6 +196,13 @@ def _mode_context_string(mode: str) -> str:
         "build":    "**Mode: BUILD** — Full tool access. Execute tasks, write code, make changes.",
         "converse": "**Mode: CONVERSE** — Conversational assistant. Answer questions, explain, discuss.",
     }.get(mode, "")
+
+
+class PendingApprovalError(Exception):
+    """Raised when a tool call requires user approval before it can execute."""
+    def __init__(self, tool: str, params: dict):
+        self.tool   = tool
+        self.params = params
 
 
 def _content(llm_response: dict) -> str:
@@ -99,6 +232,8 @@ async def _run_worker(
     max_iterations: int,
     cfg:            dict,
     temperature:    float | None = None,
+    mode:           str = "converse",
+    approved_tools: list[str] | None = None,
 ) -> tuple[str, list[dict]]:
     """
     Run the worker agent with its inner tool-call loop.
@@ -117,16 +252,33 @@ async def _run_worker(
             return content, full_messages
 
         # Execute the tool
-        tool_result = await call_tool(tc["tool"], tc.get("params", {}), allowed_tools)
+        tool_result = await call_tool(tc["tool"], tc.get("params", {}), allowed_tools, mode, approved_tools)
 
-        # Append tool call + result as messages and continue
+        # Raise pending approval — caller (run_agent_loop) will return the UI prompt
+        if tool_result.get("pending_approval"):
+            raise PendingApprovalError(tool_result["tool"], tool_result["params"])
+
+        # Format result clearly so the model can distinguish success from failure
+        if "error" in tool_result:
+            result_text = (
+                f"[tool_result: {tc['tool']}] ERROR\n"
+                f"{tool_result['error']}\n\n"
+                "Report this error to the user with a clear explanation of what went wrong."
+            )
+        else:
+            result_text = (
+                f"[tool_result: {tc['tool']}] OK\n"
+                + json.dumps(tool_result, ensure_ascii=False, indent=2)
+            )
+
         full_messages.append({"role": "assistant", "content": content})
-        full_messages.append({
-            "role":    "user",
-            "content": f"[tool_result: {tc['tool']}]\n{json.dumps(tool_result, ensure_ascii=False)}",
-        })
+        full_messages.append({"role": "user", "content": result_text})
 
-    # Exhausted iterations — last content is best effort
+    # Exhausted iterations without a final answer — ask for a plain-text summary
+    full_messages.append({"role": "assistant", "content": content})
+    full_messages.append({"role": "user", "content": "Summarize what happened and give your final answer in plain text."})
+    resp    = await _llm_call(full_messages, cfg, temperature)
+    content = _content(resp)
     return content, full_messages
 
 
@@ -212,11 +364,12 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
 
     w_cfg  = agents_cfg.get("worker", {})
     s_cfg  = agents_cfg.get("supervisor", {})
-    w_tools     = _mode_tools(cfg, mode, w_cfg.get("allowed_tools", []))
-    w_max_iter  = w_cfg.get("max_tool_iterations", 10)
-    max_retries = cfg["agent"]["max_retries"]
-    sup_enabled = cfg["agent"]["supervisor_enabled"]
-    temperature = _mode_temperature(cfg, mode)
+    w_tools        = _mode_tools(cfg, mode, w_cfg.get("allowed_tools", []))
+    w_max_iter     = w_cfg.get("max_tool_iterations", 10)
+    max_retries    = cfg["agent"]["max_retries"]
+    sup_enabled    = cfg["agent"]["supervisor_enabled"]
+    temperature    = _mode_temperature(cfg, mode)
+    approved_tools = body.get("approved_tools", [])
 
     best_response = ""
     best_score    = -1.0
@@ -230,13 +383,19 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
                 allowed_tools=w_tools,
                 session_id=session_id,
                 attempt=attempt,
+                agent_mode=mode,
                 extra={"{{AGENT_MODE}}": _mode_context_string(mode)},
             )
 
             try:
                 worker_response, _ = await _run_worker(
-                    messages, worker_prompt, w_tools, w_max_iter, cfg, temperature
+                    messages, worker_prompt, w_tools, w_max_iter, cfg, temperature, mode, approved_tools
                 )
+            except PendingApprovalError as e:
+                approval_data = {"tool": e.tool, "params": e.params}
+                resp = _format_response(f"Awaiting your approval to run `{e.tool}`.", session_id)
+                resp["pending_approval"] = approval_data
+                return resp
             except httpx.HTTPError as e:
                 worker_response = f"[LLM error: {e}]"
 
@@ -245,6 +404,7 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
 
             if not sup_enabled:
                 logger.log_turn(0, "final", raw_input, worker_response)
+                await _auto_store_memory(raw_input, worker_response, session_id, mode, w_tools)
                 return _format_response(worker_response, session_id)
 
             sup_prompt, _ = generate(
@@ -272,6 +432,7 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
 
             if supervisor_result.get("pass", False):
                 logger.log_turn(0, "final", raw_input, worker_response)
+                await _auto_store_memory(raw_input, worker_response, session_id, mode, w_tools)
                 return _format_response(worker_response, session_id)
 
             # Prepare retry: inject supervisor feedback as user message
@@ -285,6 +446,7 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
             ]
 
         logger.log_turn(0, "final", raw_input, best_response)
+        await _auto_store_memory(raw_input, best_response, session_id, mode, w_tools)
         return _format_response(best_response, session_id)
     finally:
         cleanup_generated(session_id)
@@ -355,13 +517,14 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
         return {"error": f"Unknown role: {role!r}. Check agents.yaml."}
 
     # Mode applies to any role that supports it (primarily worker; others use base temp)
-    mode_cfg      = cfg.get("agent", {}).get("mode", {})
-    mode          = body.get("mode", mode_cfg.get("default", "converse"))
-    base_tools    = role_cfg.get("allowed_tools", [])
-    allowed_tools = _mode_tools(cfg, mode, base_tools)
-    max_iter      = role_cfg.get("max_tool_iterations", 10)
-    temperature   = _mode_temperature(cfg, mode)
-    logger        = SessionLogger(session_id)
+    mode_cfg       = cfg.get("agent", {}).get("mode", {})
+    mode           = body.get("mode", mode_cfg.get("default", "converse"))
+    base_tools     = role_cfg.get("allowed_tools", [])
+    allowed_tools  = _mode_tools(cfg, mode, base_tools)
+    max_iter       = role_cfg.get("max_tool_iterations", 10)
+    temperature    = _mode_temperature(cfg, mode)
+    approved_tools = body.get("approved_tools", [])
+    logger         = SessionLogger(session_id)
     raw_input     = body.get("messages", [])
 
     # Session continuity + rolling window — same logic as run_agent_loop
@@ -387,15 +550,22 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
         allowed_tools=allowed_tools,
         session_id=session_id,
         attempt=0,
+        agent_mode=mode,
         extra={"{{AGENT_MODE}}": _mode_context_string(mode)},
     )
 
     try:
         try:
-            response, _ = await _run_worker(messages, prompt, allowed_tools, max_iter, cfg, temperature)
+            response, _ = await _run_worker(messages, prompt, allowed_tools, max_iter, cfg, temperature, mode, approved_tools)
+        except PendingApprovalError as e:
+            approval_data = {"tool": e.tool, "params": e.params}
+            resp = _format_response(f"Awaiting your approval to run `{e.tool}`.", session_id)
+            resp["pending_approval"] = approval_data
+            return resp
         except Exception as e:
             response = f"[{role} error: {e}]"
         logger.log_turn(0, "final", raw_input, response)
+        await _auto_store_memory(raw_input, response, session_id, mode, allowed_tools)
         return _format_response(response, session_id)
     finally:
         cleanup_generated(session_id)
