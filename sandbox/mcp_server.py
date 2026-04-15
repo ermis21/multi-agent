@@ -237,6 +237,8 @@ def _shell_exec(params: dict) -> dict:
         }
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": f"Timed out after {timeout_s:.0f}s"}
+    except Exception as e:
+        return {"exit_code": -1, "stdout": "", "stderr": str(e)}
 
 
 # ── Git tools (cwd = /project) ─────────────────────────────────────────────
