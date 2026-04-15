@@ -278,9 +278,11 @@ async def config_patch(request: Request):
 async def models():
     """Proxy the llama.cpp /v1/models endpoint."""
     cfg = get_config()
+    llm = cfg.get("llm", {})
+    base = llm.get("url") or llm.get("base_url", "")
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.get(f"{cfg['llm']['base_url']}/v1/models")
+            r = await client.get(f"{base}/v1/models")
             return r.json()
     except Exception as e:
         return {"error": str(e)}

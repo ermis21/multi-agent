@@ -14,16 +14,69 @@ Endpoints (called by sandbox discord_* tools):
 """
 
 import asyncio
+import io
 import os
+import wave
 from contextlib import asynccontextmanager
 
 import discord
 from fastapi import FastAPI
+from piper.voice import PiperVoice
 from pydantic import BaseModel
 
 import bot_config
 import bot_mod
 import bot_worker
+
+# ── Piper TTS ────────────────────────────────────────────────────────────────
+
+_PIPER_MODEL  = os.environ.get("PIPER_MODEL", "/models/en_US-ryan-low.onnx")
+_piper_voice: PiperVoice | None = None
+
+
+def _get_voice() -> PiperVoice:
+    global _piper_voice
+    if _piper_voice is None:
+        _piper_voice = PiperVoice.load(_PIPER_MODEL)
+    return _piper_voice
+
+
+def _synthesize(text: str) -> bytes:
+    """Synthesize text → WAV bytes (s16le, mono, native sample rate)."""
+    import numpy as np
+    voice  = _get_voice()
+    chunks = list(voice.synthesize(text))
+    if not chunks:
+        raise ValueError("Piper returned no audio chunks")
+    # Concatenate all sentence chunks, convert float32 → int16
+    audio = np.concatenate([c.audio_float_array for c in chunks])
+    audio = np.clip(audio, -1.0, 1.0)
+    pcm16 = (audio * 32767).astype(np.int16)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(chunks[0].sample_rate)
+        wf.writeframes(pcm16.tobytes())
+    buf.seek(0)
+    return buf.read()
+
+
+def _wav_to_discord_pcm(wav_bytes: bytes) -> bytes:
+    """Convert WAV bytes → raw s16le PCM at 48 kHz stereo for discord.PCMAudio."""
+    import audioop
+    buf = io.BytesIO(wav_bytes)
+    with wave.open(buf, "rb") as wf:
+        framerate = wf.getframerate()
+        nchannels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        frames    = wf.readframes(wf.getnframes())
+    if framerate != 48000:
+        frames, _ = audioop.ratecv(frames, sampwidth, nchannels, framerate, 48000, None)
+    if nchannels == 1:
+        frames = audioop.tostereo(frames, sampwidth, 1, 1)
+    return frames
 
 
 def _log_task_error(task: asyncio.Task) -> None:
@@ -100,6 +153,16 @@ class CreateCategoryRequest(BaseModel):
     name:     str
     guild_id: int | None = None
     bot:      str = "mod"
+
+class SpeakRequest(BaseModel):
+    channel_id: int
+    text:       str
+    bot:        str = "worker"
+
+class SpeakVoiceRequest(BaseModel):
+    voice_channel_id: int
+    text:             str
+    bot:              str = "worker"
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -247,3 +310,54 @@ async def create_category(req: CreateCategoryRequest):
         return {"ok": True, "category_id": str(cat.id), "name": cat.name}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/discord/speak")
+async def speak_message(req: SpeakRequest):
+    """Generate TTS audio from text and send it as a WAV file to a Discord channel."""
+    bot_client = _get_bot_client(req.bot)
+    try:
+        channel = bot_client.get_channel(req.channel_id)
+        if channel is None:
+            channel = await bot_client.fetch_channel(req.channel_id)
+        loop      = asyncio.get_event_loop()
+        wav_bytes = await loop.run_in_executor(None, _synthesize, req.text)
+        audio     = discord.File(io.BytesIO(wav_bytes), filename="response.wav")
+        msg       = await channel.send(file=audio)
+        return {"ok": True, "message_id": str(msg.id)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/discord/speak_voice")
+async def speak_voice(req: SpeakVoiceRequest):
+    """Synthesize TTS and play it directly in a Discord voice channel."""
+    bot_client = _get_bot_client(req.bot)
+    vc = None
+    try:
+        voice_channel = bot_client.get_channel(req.voice_channel_id)
+        if voice_channel is None:
+            voice_channel = await bot_client.fetch_channel(req.voice_channel_id)
+
+        loop      = asyncio.get_event_loop()
+        wav_bytes = await loop.run_in_executor(None, _synthesize, req.text)
+        pcm_bytes = await loop.run_in_executor(None, _wav_to_discord_pcm, wav_bytes)
+
+        vc     = await voice_channel.connect(timeout=10.0, reconnect=False)
+        source = discord.PCMAudio(io.BytesIO(pcm_bytes))
+
+        done = asyncio.Event()
+
+        def _after(err):
+            if err:
+                print(f"[voice] playback error: {err}", flush=True)
+            loop.call_soon_threadsafe(done.set)
+
+        vc.play(source, after=_after)
+        await asyncio.wait_for(done.wait(), timeout=120.0)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    finally:
+        if vc and vc.is_connected():
+            await vc.disconnect(force=True)

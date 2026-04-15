@@ -486,6 +486,9 @@ def _discord_list_channels(params: dict) -> dict:
 def _discord_create_category(params: dict) -> dict:
     return _discord_proxy("create_category", params)
 
+def _tts_speak(params: dict) -> dict:
+    return _discord_proxy("speak", params)
+
 
 # ── Diagnostics ────────────────────────────────────────────────────────────
 
@@ -677,6 +680,7 @@ HANDLERS = {
     "discord_delete_channel":  _discord_delete_channel,
     "discord_list_channels":   _discord_list_channels,
     "discord_create_category": _discord_create_category,
+    "tts_speak":               _tts_speak,
     # Diagnostics
     "diagnostic_check":       _diagnostic_check,
 }

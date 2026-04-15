@@ -32,6 +32,7 @@ SLOW_TOOLS: frozenset[str] = frozenset({
     "memory_add", "memory_search", "memory_list",
     "notion_search", "notion_get_page", "notion_create_page", "notion_update_page",
     "discord_send", "discord_read", "discord_set_nickname", "discord_edit_channel",
+    "tts_speak",
     "diagnostic_check",
 })
 
@@ -115,7 +116,8 @@ async def call_tool(
     error = data.get("error")
     if error is not None:
         return {"error": error or "Tool failed with no error detail"}
-    return data.get("result", {})
+    result = data.get("result")
+    return result if isinstance(result, dict) else {}
 
 
 def _extract_tool_call(content: str) -> dict | None:

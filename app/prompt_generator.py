@@ -293,6 +293,15 @@ Create a new category channel in the Discord guild.
 {"tool": "discord_create_category", "params": {"name": "🛠️ System Work"}}
 ```""",
 
+    "tts_speak": """\
+### tts_speak
+Generate a spoken audio response and send it as a WAV file to a Discord channel.
+Use this when the user asks you to "speak", "say out loud", or "respond with voice".
+```json
+{"tool": "tts_speak", "params": {"channel_id": 123456789, "text": "Hello! Here is your answer."}}
+```
+`channel_id` is required. Keep `text` concise — long responses may take a few seconds to synthesise.""",
+
     "diagnostic_check": """\
 ### diagnostic_check
 Run a deterministic health check of all system components (filesystem, ChromaDB,

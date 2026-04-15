@@ -19,6 +19,10 @@ x-logging: &logging
     max-size: "10m"
     max-file: "5"
 
+secrets:
+  openvpn_config:
+    file: /home/homelab/openclaw/secrets/openvpn_config
+
 services:
 
   # ── Notion MCP Server ─────────────────────────────────────────────────────
@@ -56,8 +60,9 @@ services:
       DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
       DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
       DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
+      DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Gemma}"
       DISCORD_MAX_MESSAGE_LENGTH: "1900"
-      MAB_API_URL: "http://mab-api:8090"
+      MAB_API_URL: "http://mab-vpn:8090"
     networks:
       - mab-net
     healthcheck:
@@ -74,6 +79,34 @@ services:
     depends_on:
       mab-api:
         condition: service_healthy
+
+  # ── OpenVPN Sidecar ───────────────────────────────────────────────────────
+  # mab-api and mab-sandbox share this container's network namespace via
+  # network_mode: service:mab-vpn, inheriting the tunnel routes automatically.
+  mab-vpn:
+    build:
+      context: ./vpn
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-vpn
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    secrets: [openvpn_config]
+    networks:
+      - mab-net
+      - llama-api_default
+    ports:
+      - "8090:8090"
+    sysctls:
+      - net.ipv4.conf.all.rp_filter=2
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ip link show tun0 2>/dev/null | grep -q UP"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    logging: *logging
 
   # ── Isolated MCP Tool Sandbox ──────────────────────────────────────────────
   # Start sandbox first; mab-api depends on it being healthy.
@@ -95,7 +128,7 @@ services:
       DISCORD_URL: "http://mab-discord:4000"
       DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
-      LLAMA_URL: "http://host.docker.internal:8080"
+      LLAMA_URL: "http://llama-api-manager:8081"
     volumes:
       # Shared workspace (soul, memory, user files)
       - ./workspace:/workspace
@@ -108,10 +141,7 @@ services:
       - ./prompts:/app/prompts
       # MemPalace persistent ChromaDB storage
       - ./mempalace:/mempalace
-    networks:
-      - mab-net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: "service:mab-vpn"
     # No ports: section — not exposed to host, internal network only
     mem_limit: 1g
     security_opt:
@@ -124,6 +154,9 @@ services:
       start_period: 10s
     restart: unless-stopped
     logging: *logging
+    depends_on:
+      mab-vpn:
+        condition: service_healthy
 
   # ── Orchestration API ──────────────────────────────────────────────────────
   mab-api:
@@ -135,10 +168,11 @@ services:
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--reload"]
     environment:
       # LLM inference endpoint (existing llama-api on host)
-      LLAMA_URL: "http://host.docker.internal:8080"
+      LLAMA_URL: "http://llama-api-manager:8081"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      # MCP sandbox endpoint (internal Docker network)
-      SANDBOX_URL: "http://mab-sandbox:9000"
+      # mab-sandbox shares this container's network namespace (via mab-vpn),
+      # so it is reachable on localhost rather than by hostname.
+      SANDBOX_URL: "http://localhost:9000"
       # Path overrides (these paths are inside the container)
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
@@ -156,13 +190,7 @@ services:
       - ./app:/app/app
       # Claude Code OAuth credentials — read-only, for Anthropic provider auth
       - /home/homelab/.claude/.credentials.json:/app/.claude_credentials.json:ro
-    ports:
-      - "8090:8090"
-    extra_hosts:
-      # Allows http://host.docker.internal:8080 to reach the host's llama-api
-      - "host.docker.internal:host-gateway"
-    networks:
-      - mab-net
+    network_mode: "service:mab-vpn"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8090/health"]
       interval: 10s
@@ -172,12 +200,13 @@ services:
     restart: unless-stopped
     logging: *logging
     depends_on:
+      mab-vpn:
+        condition: service_healthy
       mab-sandbox:
         condition: service_healthy
 
 networks:
   mab-net:
-    # Not fully internal: mab-api needs host.docker.internal for llama-api.
-    # mab-sandbox has no extra_hosts and no exposed ports, so it's
-    # effectively isolated from the internet.
     driver: bridge
+  llama-api_default:
+    external: true

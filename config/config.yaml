@@ -1,13 +1,24 @@
 llm:
   provider: local
   base_url: http://llama-api-manager:8081
-  model: local-model
+  model: gemma-4-E4B-it-Q8_0.gguf
   temperature: 1.0
   max_tokens: 131072
   top_p: 0.95
   top_k: 64
   enable_thinking: true
   thinking_budget_tokens: 8000
+  url: null
+models:
+  vpn_local:
+    provider: local
+    url: http://10.64.82.60:8000
+    model: llama3.2:latest
+    temperature: 1.0
+    max_tokens: 131072
+    top_p: 0.95
+    top_k: 64
+    enable_thinking: false
 prompts:
   mode: concise
   workspace_file_max_chars: 4000
@@ -197,3 +208,4 @@ tools:
 logging:
   sessions_dir: /sessions
   log_supervisor_turns: true
+  verbose_tools: true

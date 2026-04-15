@@ -35,6 +35,7 @@ worker:
     - discord_read
     - discord_set_nickname
     - discord_edit_channel
+    - tts_speak
     - read_config
     - write_config
 
