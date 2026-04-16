@@ -116,15 +116,52 @@ class MCPRequest(BaseModel):
 # ── Tool implementations ───────────────────────────────────────────────────
 
 def _file_read(params: dict) -> dict:
-    path = _resolve_read_path(params["path"])
-    return {"content": path.read_text(encoding="utf-8")}
+    try:
+        path = _resolve_read_path(params["path"])
+        return {"content": path.read_text(encoding="utf-8")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"file_read failed: {e}"}
 
 
 def _file_write(params: dict) -> dict:
-    path = _safe_path(params["path"], WORKSPACE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(params["content"], encoding="utf-8")
-    return {"written": len(params["content"]), "path": str(path.relative_to(WORKSPACE))}
+    try:
+        path = _safe_path(params["path"], WORKSPACE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(params["content"], encoding="utf-8")
+        return {"written": len(params["content"]), "path": str(path.relative_to(WORKSPACE))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"file_write failed: {e}"}
+
+
+def _file_edit(params: dict) -> dict:
+    """
+    Replace exactly one occurrence of old_string with new_string in a workspace file.
+    Fails if old_string is not found or matches more than once — forces the caller
+    to pick an anchor that uniquely identifies the edit site.
+    Workspace only — /project is mounted read-only.
+    """
+    try:
+        path = _safe_path(params["path"], WORKSPACE)
+        old  = params["old_string"]
+        new  = params["new_string"]
+        if not path.exists():
+            return {"error": f"file not found in workspace: {params['path']}"}
+        content = path.read_text(encoding="utf-8")
+        count = content.count(old)
+        if count == 0:
+            return {"error": f"old_string not found in {params['path']}"}
+        if count > 1:
+            return {"error": f"old_string matches {count} places in {params['path']} — make it more specific"}
+        path.write_text(content.replace(old, new, 1), encoding="utf-8")
+        return {"ok": True, "path": params["path"], "replaced": 1}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"file_edit failed: {e}"}
 
 
 def _file_list(params: dict) -> dict:
@@ -174,38 +211,53 @@ def _directory_tree(params: dict) -> dict:
 
 def _file_move(params: dict) -> dict:
     """Move or rename a file within workspace."""
-    src  = _safe_path(params["source"],      WORKSPACE)
-    dest = _safe_path(params["destination"], WORKSPACE)
-    if not src.exists():
-        return {
-            "error": (
-                f"Source not found in workspace: '{params['source']}'. "
-                "file_move only operates within /workspace. "
-                "To move project files, use shell_exec with 'mv' — but note /project is read-only inside the container."
-            )
-        }
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    src.rename(dest)
-    return {"ok": True, "destination": str(dest.relative_to(WORKSPACE))}
+    try:
+        src  = _safe_path(params["source"],      WORKSPACE)
+        dest = _safe_path(params["destination"], WORKSPACE)
+        if not src.exists():
+            return {
+                "error": (
+                    f"Source not found in workspace: '{params['source']}'. "
+                    "file_move only operates within /workspace. "
+                    "To move project files, use shell_exec with 'mv' — but note /project is read-only inside the container."
+                )
+            }
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dest)
+        return {"ok": True, "destination": str(dest.relative_to(WORKSPACE))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"file_move failed: {e}"}
 
 
 def _create_dir(params: dict) -> dict:
     """Create a directory (and parents) in workspace."""
-    path = _safe_path(params["path"], WORKSPACE)
-    path.mkdir(parents=True, exist_ok=True)
-    return {"ok": True, "path": params["path"]}
+    try:
+        path = _safe_path(params["path"], WORKSPACE)
+        path.mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": params["path"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"create_dir failed: {e}"}
 
 
 def _file_info(params: dict) -> dict:
     """Return stat metadata for a file or directory."""
-    p = _resolve_read_path(params["path"])
-    s = p.stat()
-    return {
-        "path":     params["path"],
-        "size":     s.st_size,
-        "is_dir":   p.is_dir(),
-        "modified": datetime.fromtimestamp(s.st_mtime, tz=timezone.utc).isoformat(),
-    }
+    try:
+        p = _resolve_read_path(params["path"])
+        s = p.stat()
+        return {
+            "path":     params["path"],
+            "size":     s.st_size,
+            "is_dir":   p.is_dir(),
+            "modified": datetime.fromtimestamp(s.st_mtime, tz=timezone.utc).isoformat(),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        return {"error": f"file_info failed: {e}"}
 
 
 def _shell_exec(params: dict) -> dict:
@@ -258,6 +310,8 @@ def _git_run(args: list[str]) -> dict:
         }
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": "git timed out"}
+    except Exception as e:
+        return {"exit_code": -1, "stdout": "", "stderr": f"git failed: {e}"}
 
 
 def _git_status(_params: dict) -> dict:
@@ -297,6 +351,8 @@ def _docker_compose(args: list[str]) -> dict:
         }
     except subprocess.TimeoutExpired:
         return {"exit_code": -1, "stdout": "", "stderr": "docker compose timed out"}
+    except Exception as e:
+        return {"exit_code": -1, "stdout": "", "stderr": f"docker compose failed: {e}"}
 
 
 def _docker_test_up(_params: dict) -> dict:
@@ -643,6 +699,7 @@ HANDLERS = {
     # Workspace
     "file_read":              _file_read,
     "file_write":             _file_write,
+    "file_edit":              _file_edit,
     "file_list":              _file_list,
     "file_search":            _file_search,
     "directory_tree":         _directory_tree,

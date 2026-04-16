@@ -14,6 +14,7 @@ worker:
   allowed_tools:
     - file_read
     - file_write
+    - file_edit
     - file_list
     - file_search
     - directory_tree
@@ -38,6 +39,15 @@ worker:
     - tts_speak
     - read_config
     - write_config
+    - run_agent
+
+  # Roles this agent can spawn as sub-agents via run_agent.
+  spawnable_agents:
+    - coding_agent
+    - research_agent
+    - tool_builder
+    - skill_builder
+    - webfetch_summarizer
 
   # Maximum tool call iterations per completion (prevents runaway loops).
   max_tool_iterations: 10
@@ -87,9 +97,15 @@ config_agent:
 #   3. docker_test_up → docker_test_health to verify
 #   4. If broken: git_rollback + docker_test_down
 improvement_agent:
+  description: "Self-improves service code with git + Docker test verification."
+  spawnable_agents:
+    - coding_agent
+    - research_agent
+    - tool_builder
   allowed_tools:
     - file_read
     - file_write
+    - file_edit
     - file_list
     - file_search
     - directory_tree
@@ -105,6 +121,7 @@ improvement_agent:
     - docker_test_up
     - docker_test_down
     - docker_test_health
+    - run_agent
 
   # Higher iteration limit for multi-step improvement workflows.
   max_tool_iterations: 20
@@ -195,6 +212,7 @@ cron_creator:
 # ── Research Agent ────────────────────────────────────────────────────────────
 # Read-only investigation across code, web, and memory.
 research_agent:
+  description: "Read-only investigation across code, web, and memory."
   allowed_tools:
     - web_search
     - web_fetch
@@ -209,9 +227,11 @@ research_agent:
 # ── Coding Agent ──────────────────────────────────────────────────────────────
 # Implements code changes and self-verifies via tests/lint/type-check.
 coding_agent:
+  description: "Implements code changes and self-verifies via tests/lint/type-check."
   allowed_tools:
     - file_read
     - file_write
+    - file_edit
     - file_list
     - file_search
     - directory_tree
@@ -230,6 +250,7 @@ coding_agent:
 # ── Tool Builder ──────────────────────────────────────────────────────────────
 # Scaffolds new tools (TOOL_DOCS entry + handler stub).
 tool_builder:
+  description: "Scaffolds new tools (handler + docs entry)."
   allowed_tools:
     - file_read
     - file_write
@@ -241,6 +262,7 @@ tool_builder:
 # ── Skill Builder ─────────────────────────────────────────────────────────────
 # Authors SKILL.md files with frontmatter + trigger conditions.
 skill_builder:
+  description: "Authors SKILL.md files with trigger conditions."
   allowed_tools:
     - file_read
     - file_write
@@ -251,6 +273,7 @@ skill_builder:
 # ── WebFetch Summarizer ───────────────────────────────────────────────────────
 # Compresses fetched URL content to relevant facts with verbatim quotes.
 webfetch_summarizer:
+  description: "Compresses fetched URL content to relevant facts."
   allowed_tools:
     - web_fetch
   max_tool_iterations: 5

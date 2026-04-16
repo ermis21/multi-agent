@@ -15,7 +15,9 @@ Endpoints:
 """
 
 import asyncio
+import json
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -23,11 +25,11 @@ import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents import run_agent_loop, run_agent_role, run_config_agent, run_soul_update
 from app.config_loader import get_config, patch_config
-from app.mcp_client import call_tool
+from app.mcp_client import call_tool, resolve_approval
 from app.prompt_generator import cleanup_all_generated
 from app.session_logger import get_session, list_sessions
 
@@ -87,6 +89,28 @@ async def _run_discord_moderation() -> None:
 app = FastAPI(title="mab-api", version="0.1.0", lifespan=lifespan, docs_url="/docs")
 
 
+# ── SSE streaming helper ──────────────────────────────────────────────────────
+
+async def _sse_generator(queue: asyncio.Queue, timeout: float = 660.0) -> AsyncIterator[str]:
+    """Yield SSE-formatted events from *queue* until a ``done`` event arrives."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            yield f"event: error\ndata: {json.dumps({'error': 'stream timeout'})}\n\n"
+            return
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            yield f"event: error\ndata: {json.dumps({'error': 'stream timeout'})}\n\n"
+            return
+        event_type = item.get("event", "unknown")
+        event_data = json.dumps(item.get("data", {}), ensure_ascii=False)
+        yield f"event: {event_type}\ndata: {event_data}\n\n"
+        if event_type == "done":
+            return
+
+
 # ── Chat completions ───────────────────────────────────────────────────────────
 
 @app.post("/v1/chat/completions")
@@ -95,12 +119,27 @@ async def chat_completions(request: Request):
     OpenAI-compatible chat completions endpoint.
     Runs the supervisor/worker loop and returns the final response.
 
-    Optional extra field: "session_id" — if provided, session log uses this ID.
+    Optional extra fields:
+      - "session_id": session log uses this ID.
+      - "stream": true → return SSE stream with real-time tool traces.
     """
     body = await request.json()
     session_id = body.pop("session_id", None) or (
         datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
     )
+
+    if body.pop("stream", False):
+        queue: asyncio.Queue = asyncio.Queue()
+        asyncio.create_task(
+            run_agent_loop(body, session_id, trace_queue=queue),
+            name=f"stream_{session_id}",
+        )
+        return StreamingResponse(
+            _sse_generator(queue),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     result = await run_agent_loop(body, session_id)
     return JSONResponse(result)
 
@@ -208,6 +247,21 @@ async def _probe_llm(cfg: dict) -> dict:
         return {"status": status, "detail": f"HTTP {r.status_code} from {base_url}"}
     except Exception as e:
         return {"status": "fail", "detail": str(e)}
+
+
+# ── Tool approval callback ────────────────────────────────────────────────────
+
+@app.post("/v1/approval_response")
+async def approval_response(request: Request):
+    """Called by the Discord bot when the user clicks Yes/No/Always on an approval embed."""
+    body = await request.json()
+    approval_id = body.get("approval_id", "")
+    approved = body.get("approved", False)
+    always = body.get("always", False)
+    found = resolve_approval(approval_id, approved, always)
+    if not found:
+        raise HTTPException(404, "Unknown or expired approval_id")
+    return {"ok": True}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────

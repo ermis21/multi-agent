@@ -41,7 +41,7 @@ intents.voice_states = True   # needed to check if user is in a voice channel
 
 client = discord.Client(intents=intents)
 tree   = app_commands.CommandTree(client)
-_http  = httpx.AsyncClient(timeout=600)
+_http  = httpx.AsyncClient(timeout=180)
 
 # ── Per-user+channel state ────────────────────────────────────────────────────
 _session_ids: dict[str, str] = {}
@@ -120,17 +120,6 @@ def _stop_thinking(session_id: str) -> None:
         task.cancel()
 
 
-def _format_single_trace(t: dict) -> str:
-    """Format one tool trace as Discord subtext."""
-    name     = t.get("tool", "?")
-    duration = t.get("duration_s", 0)
-    error    = t.get("error")
-    if error:
-        return f"-# ⚠ {name} ({duration:.2f}s) {error}"
-    n = t.get("lines", 0)
-    return f"-# {name} ({duration:.2f}s, {n} lines)"
-
-
 def _format_tool_trace(traces: list[dict]) -> str:
     """Format tool call telemetry as Discord subtext (small, muted lines).
 
@@ -138,60 +127,17 @@ def _format_tool_trace(traces: list[dict]) -> str:
     keeping tool reports visually subordinate to the actual response.
     Errors get a ⚠ prefix to stay visible despite the small size.
     """
-    return "\n".join(_format_single_trace(t) for t in traces)
-
-
-async def _consume_sse_stream(stream, channel: discord.TextChannel) -> dict | None:
-    """Read SSE events from an httpx streaming response, dispatching traces in real-time.
-
-    Returns the full API response dict from the ``done`` event, or None on error.
-    """
-    current_event: str | None = None
-    current_data:  str | None = None
-    async for raw_line in stream.aiter_lines():
-        line = raw_line.strip()
-        if not line:
-            # Blank line marks end of an SSE event
-            if current_event and current_data is not None:
-                if current_event == "tool_trace":
-                    trace = json.loads(current_data)
-                    await channel.send(_format_single_trace(trace))
-                elif current_event == "retry":
-                    info = json.loads(current_data)
-                    await channel.send(f"-# \u21bb supervisor retry (attempt {info['attempt']})")
-                elif current_event == "done":
-                    return json.loads(current_data)
-                elif current_event == "error":
-                    err = json.loads(current_data)
-                    await channel.send(f"[stream error: {err.get('error', 'unknown')}]")
-                    return None
-            current_event = None
-            current_data = None
-            continue
-        if line.startswith("event:"):
-            current_event = line[len("event:"):].strip()
-        elif line.startswith("data:"):
-            current_data = line[len("data:"):].strip()
-    return None  # stream ended without a done event
-
-
-def get_channel_for_session(session_id: str) -> int | None:
-    """Look up the Discord channel ID associated with a session_id."""
-    for ch_id, sid in _channel_sessions.items():
-        if sid == session_id:
-            return ch_id
-    for key, sid in _session_ids.items():
-        if sid == session_id:
-            return int(key.split("_")[0])
-    return None
-
-
-def get_mode_for_channel(channel_id: int) -> str:
-    """Return the agent mode for a channel (first user found), defaulting to converse."""
-    for key, mode in _user_modes.items():
-        if key.startswith(f"{channel_id}_"):
-            return mode
-    return "converse"
+    lines = []
+    for t in traces:
+        name     = t.get("tool", "?")
+        duration = t.get("duration_s", 0)
+        error    = t.get("error")
+        if error:
+            lines.append(f"-# ⚠ {name} ({duration:.2f}s) {error}")
+        else:
+            n = t.get("lines", 0)
+            lines.append(f"-# {name} ({duration:.2f}s, {n} lines)")
+    return "\n".join(lines)
 
 
 # ── State persistence — survives container restarts ───────────────────────────
@@ -361,20 +307,22 @@ class SpeakView(discord.ui.View):
             await interaction.followup.send(f"Voice generation failed: {e}", ephemeral=True)
 
 
-class CallbackApprovalView(discord.ui.View):
-    """Three-button confirmation UI that POSTs back to mab-api to unblock call_tool()."""
+class ApprovalView(discord.ui.View):
+    """Three-button confirmation UI: Yes / No / Always allow."""
 
-    def __init__(self, approval_id: str, tool: str, params: dict, session_id: str):
-        super().__init__(timeout=600)
-        self.approval_id = approval_id
-        self.tool        = tool
-        self.params      = params
-        self.session_id  = session_id
+    def __init__(self, approval: dict, session_id: str, mode: str, original_message: str = ""):
+        super().__init__(timeout=300)
+        self.approval         = approval
+        self.session_id       = session_id
+        self.mode             = mode
+        self.original_message = original_message
         self.message: discord.Message | None = None
 
-    async def _respond(self, interaction: discord.Interaction, approved: bool, always: bool = False) -> None:
+    async def _resume(self, interaction: discord.Interaction, *, approved: bool, always: bool = False) -> None:
+        # Acknowledge the button click immediately so Discord doesn't show "failed"
         await interaction.response.defer()
 
+        # Disable all buttons on the approval embed
         for item in self.children:
             item.disabled = True  # type: ignore[attr-defined]
         if self.message:
@@ -383,22 +331,63 @@ class CallbackApprovalView(discord.ui.View):
             except Exception:
                 pass
 
+        tool = self.approval["tool"]
+
         if always:
-            _session_always_allow.setdefault(self.session_id, set()).add(self.tool)
+            _session_always_allow.setdefault(self.session_id, set()).add(tool)
 
+        always_allow_list = list(_session_always_allow.get(self.session_id, set()))
+
+        if approved:
+            # Send a minimal resume message; the API will restore mid-execution state
+            # from disk (saved when PendingApprovalError was raised) and continue
+            # exactly where it paused rather than replaying the whole request.
+            payload = {
+                "messages":       [{"role": "user", "content": self.original_message or "[approved] Yes, proceed."}],
+                "session_id":     self.session_id,
+                "mode":           self.mode,
+                "approved_tools": always_allow_list + [tool],
+            }
+        else:
+            payload = {
+                "messages": [{"role": "user", "content": (
+                    f"The user declined to run `{tool}`. Do not execute this tool. "
+                    "Explain what you were trying to do and ask how they'd like to proceed."
+                )}],
+                "session_id": self.session_id,
+                "mode":       self.mode,
+            }
+
+        _start_thinking(self.session_id, interaction.channel)
+        data = None
         try:
-            resp = await _http.post(f"{MAB_API_URL}/v1/approval_response", json={
-                "approval_id": self.approval_id,
-                "approved": approved,
-                "always": always,
-            })
+            resp = await _http.post(f"{MAB_API_URL}/v1/chat/completions", json=payload)
             resp.raise_for_status()
+            data = resp.json()
+            if data.get("pending_approval"):
+                embed = _make_approval_embed(data["pending_approval"], self.mode)
+                view  = ApprovalView(data["pending_approval"], self.session_id, self.mode,
+                                     original_message=self.original_message)
+                sent  = await interaction.followup.send(embed=embed, view=view)
+                view.message = sent
+                return
+            answer = data["choices"][0]["message"]["content"]
         except Exception as e:
-            await interaction.followup.send(f"Failed to send approval response: {e}", ephemeral=True)
-            return
+            err_str = str(e) or f"{type(e).__name__} (no message)"
+            answer = f"[error: {err_str}]"
+        finally:
+            _stop_thinking(self.session_id)
 
-        label = "always allowed" if always else ("approved" if approved else "denied")
-        await interaction.followup.send(f"`{self.tool}` — {label}.", ephemeral=True)
+        if data is not None and data.get("tool_trace"):
+            await interaction.followup.send(_format_tool_trace(data["tool_trace"]))
+
+        chunks = split_message(answer)
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            if is_last:
+                await interaction.followup.send(chunk, view=SpeakView(answer, interaction.channel_id))
+            else:
+                await interaction.followup.send(chunk)
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -408,26 +397,18 @@ class CallbackApprovalView(discord.ui.View):
                 await self.message.edit(content="⏱️ Approval timed out — action cancelled.", view=self)
             except Exception:
                 pass
-        # Deny so call_tool() can return instead of hanging
-        try:
-            await _http.post(f"{MAB_API_URL}/v1/approval_response", json={
-                "approval_id": self.approval_id,
-                "approved": False,
-            })
-        except Exception:
-            pass
 
     @discord.ui.button(label="Yes, proceed", style=discord.ButtonStyle.green, emoji="✅")
     async def yes(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        await self._respond(interaction, approved=True)
+        await self._resume(interaction, approved=True)
 
     @discord.ui.button(label="No, cancel", style=discord.ButtonStyle.red, emoji="❌")
     async def no(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        await self._respond(interaction, approved=False)
+        await self._resume(interaction, approved=False)
 
     @discord.ui.button(label="Always allow", style=discord.ButtonStyle.blurple, emoji="🔒")
     async def always_allow(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        await self._respond(interaction, approved=True, always=True)
+        await self._resume(interaction, approved=True, always=True)
 
 
 # ── Channel auto-create ───────────────────────────────────────────────────────
@@ -861,19 +842,17 @@ async def on_message(msg: discord.Message):
     _start_thinking(session_id, msg.channel)
     data = None
     try:
-        async with _http.stream(
-            "POST",
+        resp = await _http.post(
             f"{MAB_API_URL}/v1/chat/completions",
             json={
                 "messages":       [{"role": "user", "content": msg.content}],
                 "session_id":     session_id,
                 "mode":           mode,
                 "approved_tools": always_allow,
-                "stream":         True,
             },
-        ) as stream:
-            stream.raise_for_status()
-            data = await _consume_sse_stream(stream, msg.channel)
+        )
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
         err_str = str(e) or f"{type(e).__name__} (no message)"
         await msg.channel.send(f"[error: {err_str}]")
@@ -881,11 +860,18 @@ async def on_message(msg: discord.Message):
     finally:
         _stop_thinking(session_id)
 
-    if data is None:
-        await msg.channel.send("[error: stream ended unexpectedly]")
+    if data.get("pending_approval"):
+        embed = _make_approval_embed(data["pending_approval"], mode)
+        view  = ApprovalView(data["pending_approval"], session_id, mode,
+                             original_message=msg.content)
+        sent  = await msg.channel.send(embed=embed, view=view)
+        view.message = sent
         return
 
-    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "[no response]")
+    if data.get("tool_trace"):
+        await msg.channel.send(_format_tool_trace(data["tool_trace"]))
+
+    answer = data["choices"][0]["message"]["content"]
     chunks = split_message(answer)
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1

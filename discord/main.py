@@ -154,6 +154,12 @@ class CreateCategoryRequest(BaseModel):
     guild_id: int | None = None
     bot:      str = "mod"
 
+class ApprovalRequest(BaseModel):
+    tool:        str
+    params:      dict
+    approval_id: str
+    session_id:  str
+
 class SpeakRequest(BaseModel):
     channel_id: int
     text:       str
@@ -310,6 +316,27 @@ async def create_category(req: CreateCategoryRequest):
         return {"ok": True, "category_id": str(cat.id), "name": cat.name}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/discord/request_approval")
+async def request_approval(req: ApprovalRequest):
+    """Called by mab-api when a tool needs user approval. Shows buttons in Discord."""
+    channel_id = bot_worker.get_channel_for_session(req.session_id)
+    if channel_id is None:
+        return {"ok": False, "error": "No channel for session"}
+    channel = bot_worker.client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot_worker.client.fetch_channel(channel_id)
+        except Exception:
+            return {"ok": False, "error": f"Cannot fetch channel {channel_id}"}
+    mode = bot_worker.get_mode_for_channel(channel_id)
+    embed = bot_worker._make_approval_embed({"tool": req.tool, "params": req.params}, mode)
+    view = bot_worker.CallbackApprovalView(req.approval_id, req.tool, req.params, req.session_id)
+    sent = await channel.send(embed=embed, view=view)
+    view.message = sent
+    bot_worker._stop_thinking(req.session_id)
+    return {"ok": True}
 
 
 @app.post("/discord/speak")

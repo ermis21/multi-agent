@@ -13,6 +13,7 @@ Tool calls:
   or max_tool_iterations is reached.
 """
 
+import asyncio
 import json
 import os
 import time
@@ -29,37 +30,30 @@ from app.session_logger import SessionLogger, get_session
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://host.docker.internal:8080")
 WORKSPACE = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 
-# Pending-approval state: persisted here so the agent can resume mid-execution
-# after the user clicks Yes/No/Always in Discord.
-_APPROVAL_STATE_DIR = Path(os.environ.get("SESSIONS_DIR", "/sessions")) / ".approval_states"
+# Shell-style tools: a non-zero exit_code is promoted to a real error so the
+# model sees ERROR instead of a misleading OK when commands fail.
+_SHELL_TOOLS = frozenset({
+    "shell_exec", "execute_command",
+    "git_status", "git_commit", "git_rollback", "git_log",
+    "docker_test_up", "docker_test_down", "docker_test_health",
+})
+
+# Tokens/substrings that look like an attempted tool call — used to detect
+# parse failures so we can correct the model instead of accepting prose as final.
+_TOOL_CALL_HINTS = ("<|tool_call", "<tool_call", '"tool":', "call:")
 
 
-def _state_path(session_id: str) -> Path:
-    return _APPROVAL_STATE_DIR / f"{session_id}.json"
-
-
-def _save_approval_state(session_id: str, state: dict) -> None:
-    _APPROVAL_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    _state_path(session_id).write_text(
-        json.dumps(state, ensure_ascii=False), encoding="utf-8"
-    )
-
-
-def _load_approval_state(session_id: str) -> dict | None:
-    p = _state_path(session_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _clear_approval_state(session_id: str) -> None:
-    try:
-        _state_path(session_id).unlink(missing_ok=True)
-    except Exception:
-        pass
+def _promote_shell_error(method: str, result: dict) -> dict:
+    """If a shell-style tool returned exit_code != 0, surface it as an error."""
+    if method not in _SHELL_TOOLS or "error" in result:
+        return result
+    code = result.get("exit_code", 0)
+    if code == 0:
+        return result
+    stderr = (result.get("stderr") or "").strip()
+    out = dict(result)
+    out["error"] = f"exit {code}" + (f": {stderr}" if stderr else "")
+    return out
 
 _llm_client = httpx.AsyncClient(timeout=180)
 
@@ -239,27 +233,6 @@ def _mode_context_string(mode: str) -> str:
     }.get(mode, "")
 
 
-class PendingApprovalError(Exception):
-    """Raised when a tool call requires user approval before it can execute.
-
-    Carries the full in-flight conversation state so it can be saved to disk
-    and resumed exactly where it left off once the user approves.
-    """
-    def __init__(
-        self,
-        tool:          str,
-        params:        dict,
-        full_messages: list[dict] | None = None,
-        content:       str = "",
-        iteration:     int = 0,
-    ):
-        self.tool          = tool
-        self.params        = params
-        self.full_messages = full_messages or []
-        self.content       = content   # LLM response that produced the tool call
-        self.iteration     = iteration
-
-
 def _content(llm_response: dict) -> str:
     """Extract the assistant message content from a chat completion response."""
     try:
@@ -290,91 +263,70 @@ async def _run_worker(
     mode:           str = "converse",
     approved_tools: list[str] | None = None,
     role_cfg:       dict | None = None,
-    resume_state:   dict | None = None,
+    session_id:     str = "",
+    trace_queue:    asyncio.Queue | None = None,
 ) -> tuple[str, list[dict], list[dict]]:
     """
     Run the worker agent with its inner tool-call loop.
-
-    If resume_state is provided the loop resumes from a previously paused
-    mid-execution state (saved to disk when a PendingApprovalError was raised),
-    executing the now-approved tool before continuing normally.
 
     Returns (final_answer, updated_messages_list, tool_traces).
     tool_traces is a list of dicts: {tool, duration_s, lines, error}.
     """
     tool_traces: list[dict] = []
-
-    if resume_state:
-        # Restore exact conversation state from before the tool was blocked
-        full_messages   = resume_state["full_messages"]
-        pending_content = resume_state["pending_content"]
-        pending_tool    = resume_state["pending_tool"]
-        pending_params  = resume_state["pending_params"]
-        start_iter      = resume_state["iteration"] + 1
-
-        # Execute the now-approved tool and inject its result
-        t0 = time.time()
-        tool_result = await call_tool(pending_tool, pending_params, allowed_tools, mode, approved_tools)
-        duration = time.time() - t0
-        if "error" in tool_result:
-            result_text = (
-                f"[tool_result: {pending_tool}] ERROR\n"
-                f"{tool_result['error']}\n\n"
-                "Report this error to the user with a clear explanation of what went wrong."
-            )
-            tool_traces.append({"tool": pending_tool, "duration_s": round(duration, 2), "lines": 0, "error": tool_result["error"]})
-        else:
-            result_text = (
-                f"[tool_result: {pending_tool}] OK\n"
-                + json.dumps(tool_result, ensure_ascii=False, indent=2)
-            )
-            tool_traces.append({"tool": pending_tool, "duration_s": round(duration, 2), "lines": result_text.count("\n"), "error": None})
-        full_messages.append({"role": "assistant", "content": pending_content})
-        full_messages.append({"role": "user",      "content": result_text})
-    else:
-        full_messages = [{"role": "system", "content": system_prompt}] + messages
-        start_iter    = 0
+    spawnable = (role_cfg or {}).get("spawnable_agents", [])
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
 
     content = ""
-    for i in range(start_iter, max_iterations):
+    for i in range(max_iterations):
         resp    = await _llm_call(full_messages, cfg, temperature, role_cfg=role_cfg)
         content = _content(resp)
         tc      = _extract_tool_call(content)
 
         if tc is None:
+            # If the content *looks* like a malformed tool call, correct the
+            # model instead of accepting it as the final answer — this is what
+            # causes hallucinated "command executed successfully" cascades.
+            if any(h in content for h in _TOOL_CALL_HINTS):
+                full_messages.append({"role": "assistant", "content": content})
+                full_messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your tool call could not be parsed. Emit exactly:\n"
+                        "<|tool_call|>call: TOOL_NAME, {param_json}<|tool_call|>\n"
+                        "One line. No prose, no markdown, no nesting."
+                    ),
+                })
+                continue
             # No tool call — this is the final answer
             return content, full_messages, tool_traces
 
         # Execute the tool
         t0 = time.time()
-        tool_result = await call_tool(tc["tool"], tc.get("params", {}), allowed_tools, mode, approved_tools)
+        tool_result = await call_tool(tc["tool"], tc.get("params", {}), allowed_tools, mode, approved_tools,
+                                      session_id=session_id, spawnable_agents=spawnable)
+        tool_result = _promote_shell_error(tc["tool"], tool_result)
         duration = time.time() - t0
-
-        # Raise pending approval, carrying the full conversation state so callers
-        # can persist it to disk and resume exactly here once the user approves.
-        if tool_result.get("pending_approval"):
-            raise PendingApprovalError(
-                tool_result["tool"],
-                tool_result["params"],
-                full_messages,
-                content,
-                i,
-            )
 
         # Format result clearly so the model can distinguish success from failure
         if "error" in tool_result:
             result_text = (
                 f"[tool_result: {tc['tool']}] ERROR\n"
                 f"{tool_result['error']}\n\n"
-                "Report this error to the user with a clear explanation of what went wrong."
+                "This tool call failed. Do NOT stop — keep working on the user's request. "
+                "Pick one: retry with corrected parameters, try a different tool, or try a different approach. "
+                "Only give a final plain-text answer if every reasonable approach has been exhausted."
             )
             tool_traces.append({"tool": tc["tool"], "duration_s": round(duration, 2), "lines": 0, "error": tool_result["error"]})
+            if trace_queue is not None:
+                trace_queue.put_nowait({"event": "tool_trace", "data": tool_traces[-1]})
         else:
             result_text = (
                 f"[tool_result: {tc['tool']}] OK\n"
                 + json.dumps(tool_result, ensure_ascii=False, indent=2)
             )
             tool_traces.append({"tool": tc["tool"], "duration_s": round(duration, 2), "lines": result_text.count("\n"), "error": None})
+            if trace_queue is not None:
+                trace_queue.put_nowait({"event": "tool_trace", "data": tool_traces[-1]})
 
         full_messages.append({"role": "assistant", "content": content})
         full_messages.append({"role": "user", "content": result_text})
@@ -425,7 +377,7 @@ async def _run_supervisor(
 
 # ── Main agent loop ────────────────────────────────────────────────────────────
 
-async def run_agent_loop(body: dict, session_id: str) -> dict:
+async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue | None = None) -> dict:
     """
     Supervisor / worker loop for a single chat completion request.
 
@@ -477,15 +429,6 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
     temperature    = _mode_temperature(cfg, mode)
     approved_tools = body.get("approved_tools", [])
 
-    # If the user just approved a tool, load the saved mid-execution state so the
-    # worker can resume exactly where it paused instead of starting over.
-    resume_state: dict | None = None
-    if approved_tools:
-        saved = _load_approval_state(session_id)
-        if saved:
-            _clear_approval_state(session_id)
-            resume_state = saved
-
     best_response = ""
     best_score    = -1.0
     tool_traces: list[dict] = []
@@ -494,11 +437,15 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
 
     verbose_tools = cfg["logging"].get("verbose_tools", False)
 
+    # Gate tool-trace streaming on verbose_tools; the done sentinel always uses trace_queue directly.
+    _trace_q = trace_queue if (trace_queue is not None and verbose_tools) else None
+
     def _with_traces(resp: dict) -> dict:
         if verbose_tools and tool_traces:
             resp["tool_trace"] = tool_traces
         return resp
 
+    result_holder: dict | None = None
     try:
         for attempt in range(total_attempts):
             worker_prompt, _ = generate(
@@ -510,25 +457,16 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
                 extra={"{{AGENT_MODE}}": _mode_context_string(mode)},
             )
 
+            if trace_queue is not None and attempt > 0:
+                trace_queue.put_nowait({"event": "retry", "data": {"attempt": attempt}})
+
             try:
                 worker_response, _, tool_traces = await _run_worker(
                     messages, worker_prompt, w_tools, w_max_iter, cfg, temperature, mode, approved_tools,
                     role_cfg=w_cfg,
-                    resume_state=resume_state,
+                    session_id=session_id,
+                    trace_queue=_trace_q,
                 )
-                resume_state = None  # consumed; supervisor retries start fresh
-            except PendingApprovalError as e:
-                _save_approval_state(session_id, {
-                    "full_messages":   e.full_messages,
-                    "pending_content": e.content,
-                    "pending_tool":    e.tool,
-                    "pending_params":  e.params,
-                    "iteration":       e.iteration,
-                })
-                approval_data = {"tool": e.tool, "params": e.params}
-                resp = _format_response(f"Awaiting your approval to run `{e.tool}`.", session_id)
-                resp["pending_approval"] = approval_data
-                return resp
             except httpx.HTTPError as e:
                 worker_response = f"[LLM error: {e}]"
 
@@ -538,7 +476,8 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
             if not sup_enabled:
                 logger.log_turn(0, "final", raw_input, worker_response)
                 await _auto_store_memory(raw_input, worker_response, session_id, mode, w_tools)
-                return _with_traces(_format_response(worker_response, session_id))
+                result_holder = _with_traces(_format_response(worker_response, session_id))
+                return result_holder
 
             sup_prompt, _ = generate(
                 role="supervisor",
@@ -567,10 +506,14 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
             if supervisor_result.get("pass", False):
                 logger.log_turn(0, "final", raw_input, worker_response)
                 await _auto_store_memory(raw_input, worker_response, session_id, mode, w_tools)
-                return _with_traces(_format_response(worker_response, session_id))
+                result_holder = _with_traces(_format_response(worker_response, session_id))
+                return result_holder
 
             # Prepare retry: inject supervisor feedback as user message
             feedback = supervisor_result.get("feedback", "")
+            spawn_hint = supervisor_result.get("suggest_spawn", "")
+            if spawn_hint:
+                feedback += f" Use `run_agent` to delegate this to `{spawn_hint}`."
             messages = messages + [
                 {"role": "assistant", "content": worker_response},
                 {"role": "user",      "content": (
@@ -581,8 +524,11 @@ async def run_agent_loop(body: dict, session_id: str) -> dict:
 
         logger.log_turn(0, "final", raw_input, best_response)
         await _auto_store_memory(raw_input, best_response, session_id, mode, w_tools)
-        return _with_traces(_format_response(best_response, session_id))
+        result_holder = _with_traces(_format_response(best_response, session_id))
+        return result_holder
     finally:
+        if trace_queue is not None:
+            trace_queue.put_nowait({"event": "done", "data": result_holder or {"error": "agent loop failed"}})
         cleanup_generated(session_id)
 
 
@@ -612,7 +558,8 @@ async def run_soul_update() -> None:
 
     try:
         try:
-            await _run_worker(messages, prompt, soul_tools, soul_max_it, cfg, role_cfg=soul_cfg)  # traces discarded
+            await _run_worker(messages, prompt, soul_tools, soul_max_it, cfg, role_cfg=soul_cfg,
+                              session_id=soul_session)  # traces discarded
         except Exception:
             pass  # best-effort soul update; errors are non-fatal
 
@@ -661,14 +608,6 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
     logger         = SessionLogger(session_id)
     raw_input     = body.get("messages", [])
 
-    # Load saved mid-execution state if the user just approved a tool
-    resume_state: dict | None = None
-    if approved_tools:
-        saved = _load_approval_state(session_id)
-        if saved:
-            _clear_approval_state(session_id)
-            resume_state = saved
-
     # Session continuity + rolling window — same logic as run_agent_loop
     max_ctx     = cfg.get("agent", {}).get("max_context_turns", 20)
     prior_turns = get_session(session_id)
@@ -703,20 +642,9 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
         try:
             response, _, tool_traces = await _run_worker(
                 messages, prompt, allowed_tools, max_iter, cfg, temperature, mode, approved_tools,
-                role_cfg=role_cfg, resume_state=resume_state,
+                role_cfg=role_cfg,
+                session_id=session_id,
             )
-        except PendingApprovalError as e:
-            _save_approval_state(session_id, {
-                "full_messages":   e.full_messages,
-                "pending_content": e.content,
-                "pending_tool":    e.tool,
-                "pending_params":  e.params,
-                "iteration":       e.iteration,
-            })
-            approval_data = {"tool": e.tool, "params": e.params}
-            resp = _format_response(f"Awaiting your approval to run `{e.tool}`.", session_id)
-            resp["pending_approval"] = approval_data
-            return resp
         except Exception as e:
             response = f"[{role} error: {e or type(e).__name__}]"
         logger.log_turn(0, "final", raw_input, response)

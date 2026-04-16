@@ -54,6 +54,7 @@ Field contract:
 - `score`: float from 0.0 (terrible) to 1.0 (perfect)
 - `feedback`: one sentence — if failing, make it actionable for the worker
 - `alternative`: if failing, provide a better version of the response; if passing, empty string
+- `suggest_spawn`: (optional) if the task needs a specialist agent, name it here. Available: `coding_agent`, `research_agent`, `tool_builder`, `skill_builder`, `webfetch_summarizer`. Empty string if not applicable
 
 ## Example — passing
 
@@ -62,7 +63,8 @@ Field contract:
   "pass": true,
   "score": 0.9,
   "feedback": "Accurate, complete, and appropriately concise; directly answers the question.",
-  "alternative": ""
+  "alternative": "",
+  "suggest_spawn": ""
 }
 ```
 
@@ -73,7 +75,20 @@ Field contract:
   "pass": false,
   "score": 0.4,
   "feedback": "Answer hallucinates a nonexistent flag and ignores the user's second question about error handling.",
-  "alternative": "The correct flag is `--retry`, not `--retries`. For error handling, wrap the call in a try/except on ConnectionError and log before re-raising."
+  "alternative": "The correct flag is `--retry`, not `--retries`. For error handling, wrap the call in a try/except on ConnectionError and log before re-raising.",
+  "suggest_spawn": ""
+}
+```
+
+## Example — failing, needs specialist
+
+```json
+{
+  "pass": false,
+  "score": 0.3,
+  "feedback": "Worker cannot edit code in the read-only project mount. This task requires a coding agent.",
+  "alternative": "",
+  "suggest_spawn": "coding_agent"
 }
 ```
 

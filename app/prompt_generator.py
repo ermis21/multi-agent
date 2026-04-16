@@ -18,7 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config_loader import get_config
+from app.config_loader import get_config, get_agents_config
 
 PROMPTS_DIR  = Path(os.environ.get("PROMPTS_DIR",  "/app/prompts"))
 WORKSPACE    = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
@@ -32,275 +32,213 @@ TOOL_DOCS: dict[str, str] = {
     "file_read": """\
 ### file_read
 Read a file. Prefix path with `project/` to read the system source code (read-only).
-```json
-{"tool": "file_read", "params": {"path": "notes.txt"}}
-{"tool": "file_read", "params": {"path": "project/app/agents.py"}}
-```""",
+<|tool_call|>call: file_read, {"path": "notes.txt"}<|tool_call|>
+<|tool_call|>call: file_read, {"path": "project/app/agents.py"}<|tool_call|>""",
 
     "file_write": """\
 ### file_write
 Write content to a file in the workspace. Creates parent directories if needed.
-```json
-{"tool": "file_write", "params": {"path": "relative/path", "content": "text content"}}
-```""",
+Workspace only — cannot write under `project/` (read-only mount).
+<|tool_call|>call: file_write, {"path": "relative/path", "content": "text content"}<|tool_call|>""",
+
+    "file_edit": """\
+### file_edit
+Replace exactly one occurrence of `old_string` with `new_string` in a workspace file.
+Fails if `old_string` is not found or matches more than once — make it specific.
+Workspace only — cannot edit files under `project/` (read-only mount).
+<|tool_call|>call: file_edit, {"path": "notes.txt", "old_string": "foo", "new_string": "bar"}<|tool_call|>""",
 
     "file_list": """\
 ### file_list
 List files and directories. Prefix with `project/` to list source code.
-```json
-{"tool": "file_list", "params": {"path": "."}}
-{"tool": "file_list", "params": {"path": "project/app"}}
-```""",
+<|tool_call|>call: file_list, {"path": "."}<|tool_call|>
+<|tool_call|>call: file_list, {"path": "project/app"}<|tool_call|>""",
 
     "file_search": """\
 ### file_search
 Recursive glob search for files. Prefix path with `project/` to search source code.
-```json
-{"tool": "file_search", "params": {"path": ".", "pattern": "*.py"}}
-{"tool": "file_search", "params": {"path": "project/", "pattern": "*.md"}}
-```""",
+<|tool_call|>call: file_search, {"path": ".", "pattern": "*.py"}<|tool_call|>
+<|tool_call|>call: file_search, {"path": "project/", "pattern": "*.md"}<|tool_call|>""",
 
     "directory_tree": """\
 ### directory_tree
 Recursive directory tree (default depth 3, max 6). Prefix with `project/` for source code.
-```json
-{"tool": "directory_tree", "params": {"path": ".", "depth": 3}}
-{"tool": "directory_tree", "params": {"path": "project/", "depth": 2}}
-```""",
+<|tool_call|>call: directory_tree, {"path": ".", "depth": 3}<|tool_call|>
+<|tool_call|>call: directory_tree, {"path": "project/", "depth": 2}<|tool_call|>""",
 
     "file_move": """\
 ### file_move
 Move or rename a file within the workspace.
-```json
-{"tool": "file_move", "params": {"source": "old/path.txt", "destination": "new/path.txt"}}
-```""",
+<|tool_call|>call: file_move, {"source": "old/path.txt", "destination": "new/path.txt"}<|tool_call|>""",
 
     "create_dir": """\
 ### create_dir
 Create a directory (and parents) in the workspace.
-```json
-{"tool": "create_dir", "params": {"path": "my/new/folder"}}
-```""",
+<|tool_call|>call: create_dir, {"path": "my/new/folder"}<|tool_call|>""",
 
     "file_info": """\
 ### file_info
 Get size, type, and modification time for a file or directory. Supports `project/` prefix.
-```json
-{"tool": "file_info", "params": {"path": "project/app/agents.py"}}
-```""",
+<|tool_call|>call: file_info, {"path": "project/app/agents.py"}<|tool_call|>""",
 
     "shell_exec": """\
 ### shell_exec
 Execute a bash command in the workspace. Timeout max 120s.
 A Python venv is pre-created at `venv/` — use `venv/bin/python` or `venv/bin/pip install`.
-```json
-{"tool": "shell_exec", "params": {"command": "venv/bin/python script.py", "timeout_ms": 10000, "cwd": "."}}
-```""",
+> `/project` is READ-ONLY. Any write there (including `sed -i`) will fail. Use `file_edit`/`file_write` for workspace files, or switch to `coding_agent` for project source.
+> Always check `exit_code` in the result — non-zero means the command failed even if no exception was raised.
+<|tool_call|>call: shell_exec, {"command": "venv/bin/python script.py", "timeout_ms": 10000, "cwd": "."}<|tool_call|>""",
 
     "execute_command": """\
 ### execute_command
 Execute a shell command in the workspace (alias for shell_exec). Timeout max 120s.
 A Python venv is pre-created at `venv/` — use `venv/bin/python` or `venv/bin/pip install`.
-```json
-{"tool": "execute_command", "params": {"command": "venv/bin/pip install requests", "timeout_ms": 30000}}
-```""",
+> `/project` is READ-ONLY. Any write there (including `sed -i`) will fail. Use `file_edit`/`file_write` for workspace files, or switch to `coding_agent` for project source.
+> Always check `exit_code` in the result — non-zero means the command failed even if no exception was raised.
+<|tool_call|>call: execute_command, {"command": "venv/bin/pip install requests", "timeout_ms": 30000}<|tool_call|>""",
 
     "git_status": """\
 ### git_status
 Show current git status of the project repo (/project).
-```json
-{"tool": "git_status", "params": {}}
-```""",
+<|tool_call|>call: git_status, {}<|tool_call|>""",
 
     "git_commit": """\
 ### git_commit
 Stage all changes and create a commit in /project.
-```json
-{"tool": "git_commit", "params": {"message": "agent: describe the change"}}
-```""",
+<|tool_call|>call: git_commit, {"message": "agent: describe the change"}<|tool_call|>""",
 
     "git_rollback": """\
 ### git_rollback
 Create a revert commit to undo the last commit (safe, non-destructive).
-```json
-{"tool": "git_rollback", "params": {}}
-```""",
+<|tool_call|>call: git_rollback, {}<|tool_call|>""",
 
     "git_log": """\
 ### git_log
 Show recent commit history of /project.
-```json
-{"tool": "git_log", "params": {"n": 10}}
-```""",
+<|tool_call|>call: git_log, {"n": 10}<|tool_call|>""",
 
     "docker_test_up": """\
 ### docker_test_up
 Build and start the test stack (port 8091) using docker-compose.test.yml.
 Wait ~30s for it to become healthy before calling docker_test_health.
-```json
-{"tool": "docker_test_up", "params": {}}
-```""",
+<|tool_call|>call: docker_test_up, {}<|tool_call|>""",
 
     "docker_test_down": """\
 ### docker_test_down
 Stop and remove the test stack containers.
-```json
-{"tool": "docker_test_down", "params": {}}
-```""",
+<|tool_call|>call: docker_test_down, {}<|tool_call|>""",
 
     "docker_test_health": """\
 ### docker_test_health
 Probe the test stack health endpoint (http://host.docker.internal:8091/health).
-```json
-{"tool": "docker_test_health", "params": {}}
-```""",
+<|tool_call|>call: docker_test_health, {}<|tool_call|>""",
 
     "read_config": """\
 ### read_config
 Read the current system configuration (config/config.yaml).
-```json
-{"tool": "read_config", "params": {}}
-```""",
+<|tool_call|>call: read_config, {}<|tool_call|>""",
 
     "write_config": """\
 ### write_config
 Update configuration values. Provide only the keys you want to change.
-```json
-{"tool": "write_config", "params": {"prompts": {"mode": "concise"}, "agent": {"max_retries": 3}}}
-```""",
+<|tool_call|>call: write_config, {"prompts": {"mode": "concise"}, "agent": {"max_retries": 3}}<|tool_call|>""",
 
     "web_search": """\
 ### web_search
 Search the web via Exa. Returns titles, URLs, and highlight snippets.
-```json
-{"tool": "web_search", "params": {"query": "latest news about X", "n": 5, "type": "auto"}}
-```""",
+<|tool_call|>call: web_search, {"query": "latest news about X", "n": 5, "type": "auto"}<|tool_call|>""",
 
     "web_fetch": """\
 ### web_fetch
 Fetch and extract the readable text from a URL. Returns up to 8000 chars.
-```json
-{"tool": "web_fetch", "params": {"url": "https://example.com/article"}}
-```""",
+<|tool_call|>call: web_fetch, {"url": "https://example.com/article"}<|tool_call|>""",
 
     "memory_add": """\
 ### memory_add
 Store a piece of information in long-term memory with optional tags.
-```json
-{"tool": "memory_add", "params": {"content": "User prefers concise answers.", "tags": ["preference"]}}
-```""",
+<|tool_call|>call: memory_add, {"content": "User prefers concise answers.", "tags": ["preference"]}<|tool_call|>""",
 
     "memory_search": """\
 ### memory_search
 Semantic search over stored memories. Returns top-k matches with scores.
-```json
-{"tool": "memory_search", "params": {"query": "user preferences", "n": 5}}
-```""",
+<|tool_call|>call: memory_search, {"query": "user preferences", "n": 5}<|tool_call|>""",
 
     "memory_list": """\
 ### memory_list
 List the most recent stored memories.
-```json
-{"tool": "memory_list", "params": {"n": 20}}
-```""",
+<|tool_call|>call: memory_list, {"n": 20}<|tool_call|>""",
 
     "notion_search": """\
 ### notion_search
 Search across the connected Notion workspace.
-```json
-{"tool": "notion_search", "params": {"query": "project roadmap"}}
-```""",
+<|tool_call|>call: notion_search, {"query": "project roadmap"}<|tool_call|>""",
 
     "notion_get_page": """\
 ### notion_get_page
 Retrieve a Notion page by its ID.
-```json
-{"tool": "notion_get_page", "params": {"page_id": "abc123"}}
-```""",
+<|tool_call|>call: notion_get_page, {"page_id": "abc123"}<|tool_call|>""",
 
     "notion_create_page": """\
 ### notion_create_page
 Create a new page in Notion under a parent page or database.
-```json
-{"tool": "notion_create_page", "params": {"parent": {"page_id": "abc123"}, "properties": {"title": {"title": [{"text": {"content": "New Page"}}]}}}}
-```""",
+<|tool_call|>call: notion_create_page, {"parent": {"page_id": "abc123"}, "properties": {"title": {"title": [{"text": {"content": "New Page"}}]}}}<|tool_call|>""",
 
     "notion_update_page": """\
 ### notion_update_page
 Update the content of an existing Notion page.
-```json
-{"tool": "notion_update_page", "params": {"page_id": "abc123", "properties": {"title": {"title": [{"text": {"content": "Updated Title"}}]}}}}
-```""",
+<|tool_call|>call: notion_update_page, {"page_id": "abc123", "properties": {"title": {"title": [{"text": {"content": "Updated Title"}}]}}}<|tool_call|>""",
 
     "discord_send": """\
 ### discord_send
 Send a message to a Discord channel.
-```json
-{"tool": "discord_send", "params": {"channel_id": 123456789, "content": "Hello!", "bot": "worker"}}
-```""",
+<|tool_call|>call: discord_send, {"channel_id": 123456789, "content": "Hello!", "bot": "worker"}<|tool_call|>""",
 
     "discord_read": """\
 ### discord_read
 Read recent messages from a Discord channel.
-```json
-{"tool": "discord_read", "params": {"channel_id": 123456789, "limit": 20, "bot": "worker"}}
-```""",
+<|tool_call|>call: discord_read, {"channel_id": 123456789, "limit": 20, "bot": "worker"}<|tool_call|>""",
 
     "discord_set_nickname": """\
 ### discord_set_nickname
 Set a nickname for a guild member.
-```json
-{"tool": "discord_set_nickname", "params": {"guild_id": 123, "user_id": 456, "nickname": "NewName", "bot": "worker"}}
-```""",
+<|tool_call|>call: discord_set_nickname, {"guild_id": 123, "user_id": 456, "nickname": "NewName", "bot": "worker"}<|tool_call|>""",
 
     "discord_edit_channel": """\
 ### discord_edit_channel
 Edit a Discord channel's name, topic, or category.
-```json
-{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "name": "new-name", "topic": "New topic"}}
-{"tool": "discord_edit_channel", "params": {"channel_id": 123456789, "category_id": 987654321}}
-```
-Use `category_id` to move a channel to a different category.""",
+Use `category_id` to move a channel to a different category.
+<|tool_call|>call: discord_edit_channel, {"channel_id": 123456789, "name": "new-name", "topic": "New topic"}<|tool_call|>
+<|tool_call|>call: discord_edit_channel, {"channel_id": 123456789, "category_id": 987654321}<|tool_call|>""",
 
     "discord_create_channel": """\
 ### discord_create_channel
 Create a new text channel in the Discord guild.
-```json
-{"tool": "discord_create_channel", "params": {"name": "my-channel", "topic": "Optional topic", "category_id": 123456789}}
-```
-`category_id` is optional. Discover category IDs with `discord_list_channels` first.""",
+`category_id` is optional. Discover category IDs with `discord_list_channels` first.
+<|tool_call|>call: discord_create_channel, {"name": "my-channel", "topic": "Optional topic", "category_id": 123456789}<|tool_call|>""",
 
     "discord_delete_channel": """\
 ### discord_delete_channel
 Permanently delete a Discord channel. Cannot be undone.
-```json
-{"tool": "discord_delete_channel", "params": {"channel_id": 123456789}}
-```""",
+<|tool_call|>call: discord_delete_channel, {"channel_id": 123456789}<|tool_call|>""",
 
     "discord_list_channels": """\
 ### discord_list_channels
 List all channels in the Discord guild with metadata.
 Returns: id, name, type, category_id, category_name, topic, position, last_message_ts.
 `last_message_ts` is null if the channel has never had a message.
-```json
-{"tool": "discord_list_channels", "params": {}}
-```""",
+<|tool_call|>call: discord_list_channels, {}<|tool_call|>""",
 
     "discord_create_category": """\
 ### discord_create_category
 Create a new category channel in the Discord guild.
-```json
-{"tool": "discord_create_category", "params": {"name": "🛠️ System Work"}}
-```""",
+<|tool_call|>call: discord_create_category, {"name": "🛠️ System Work"}<|tool_call|>""",
 
     "tts_speak": """\
 ### tts_speak
 Generate a spoken audio response and send it as a WAV file to a Discord channel.
 Use this when the user asks you to "speak", "say out loud", or "respond with voice".
-```json
-{"tool": "tts_speak", "params": {"channel_id": 123456789, "text": "Hello! Here is your answer."}}
-```
-`channel_id` is required. Keep `text` concise — long responses may take a few seconds to synthesise.""",
+`channel_id` is required. Keep `text` concise — long responses may take a few seconds to synthesise.
+<|tool_call|>call: tts_speak, {"channel_id": 123456789, "text": "Hello! Here is your answer."}<|tool_call|>""",
 
     "diagnostic_check": """\
 ### diagnostic_check
@@ -308,9 +246,16 @@ Run a deterministic health check of all system components (filesystem, ChromaDB,
 git, LLM, Notion, Discord, API keys, config files, prompt templates).
 Returns JSON with pass/warn/fail per component and an overall status.
 No LLM involvement — fully deterministic.
-```json
-{"tool": "diagnostic_check", "params": {}}
-```""",
+<|tool_call|>call: diagnostic_check, {}<|tool_call|>""",
+
+    "run_agent": """\
+### run_agent
+Delegate a task to a specialized sub-agent. It runs independently with its own tools
+and cannot see your conversation. Give it a self-contained task with all needed context.
+<|tool_call|>call: run_agent, {"role": "coding_agent", "task": "Add clean_text_for_tts() to /workspace/bot_worker.py that strips markdown."}<|tool_call|>
+- `role` (required): agent from the "Available sub-agents" list.
+- `task` (required): complete instruction with file paths, constraints, expected outcome.
+The sub-agent's final response is returned as the tool result.""",
 }
 
 
@@ -329,44 +274,57 @@ def _read_workspace(name: str, max_chars: int) -> str:
 def _build_approval_context(cfg: dict, allowed_tools: list[str], mode: str = "converse") -> str:
     """
     Build the approval context block injected as {{APPROVAL_CONTEXT}}.
-    Lists only ask_user tools that are actually available to this agent in this mode.
-    Returns empty string if no ask_user tools are available.
+
+    The agent always sees "all tools pre-approved" so it calls any tool
+    directly without hesitation.  Actual approval gating (ask_user / auto_fail)
+    is enforced externally by call_tool() in mcp_client.py, which pauses the
+    worker loop and surfaces a Yes / No / Always prompt in Discord.  The agent
+    never needs to know about this; from its perspective the tool call simply
+    takes a little longer to return.
     """
-    mode_approval  = cfg.get("approval", {}).get(mode, {})
-    ask_user       = mode_approval.get("ask_user", [])
-    auto_allow_paths = mode_approval.get("auto_allow", {}).get("paths", [])
-    relevant = [t for t in ask_user if t in allowed_tools]
-    if not relevant:
-        return ""
-    tool_list = "\n".join(f"- `{t}`" for t in relevant)
-    path_note = ""
-    if auto_allow_paths:
-        prefixes = "`, `".join(auto_allow_paths)
-        path_note = (
-            f"\n\n**Exception:** writing to `{prefixes}` does **not** require confirmation — "
-            "use these paths freely for session plans and notes."
-        )
-    return (
-        "## Approval Required\n\n"
-        "Before calling any of the tools listed below, **describe exactly what you are "
-        "about to do and ask the user for explicit confirmation**. "
-        f"Wait for a clear 'yes' before proceeding. On 'no', stop and explain.\n\n"
-        f"{tool_list}{path_note}"
-    )
+    return ""
 
 
 def _build_tool_block(allowed_tools: list[str]) -> str:
     if not allowed_tools:
         return "_No tools available for this agent role._"
     docs = [TOOL_DOCS[t] for t in allowed_tools if t in TOOL_DOCS]
+    inventory = ", ".join(f"`{t}`" for t in allowed_tools)
     header = (
-        "Call a tool by responding with **only** a JSON object — no prose, "
-        "no markdown fences, just the raw JSON. Example:\n"
-        '```json\n{"tool": "file_read", "params": {"path": "example.txt"}}\n```\n'
-        "Give your final answer once you have enough information.\n\n"
-        "## Available Tools\n"
+        "## Calling a tool\n\n"
+        "Emit exactly one tool call on its own, in this format and nothing else:\n"
+        '`<|tool_call|>call: TOOL_NAME, {param_json}<|tool_call|>`\n\n'
+        "Example:\n"
+        '`<|tool_call|>call: file_read, {"path": "example.txt"}<|tool_call|>`\n\n'
+        "Rules:\n"
+        "- No prose, no markdown fences, no nesting around the call.\n"
+        "- `param_json` is a flat JSON object — do NOT wrap it in `{\"params\": ...}`.\n"
+        "- Give your final plain-text answer only once you have enough information.\n\n"
+        f"## Your tools ({len(allowed_tools)})\n\n"
+        f"You have access to **exactly these tools** — do not claim otherwise, "
+        f"do not invent tool names, and do not call anything outside this list:\n"
+        f"{inventory}\n\n"
+        "## Tool reference\n"
     )
     return header + "\n\n".join(docs)
+
+
+def _build_skills_block(spawnable_agents: list[str], agents_cfg: dict) -> str:
+    """Build the {{SKILLS}} block listing available sub-agents."""
+    if not spawnable_agents:
+        return ""
+    rows = []
+    for role in spawnable_agents:
+        desc = agents_cfg.get(role, {}).get("description", "")
+        rows.append(f"| `{role}` | {desc} |")
+    table = "| Agent | What it does |\n|-------|-------------|\n" + "\n".join(rows)
+    return (
+        "## Available sub-agents\n\n"
+        "You can delegate work to specialized agents using the `run_agent` tool.\n"
+        "Each sub-agent runs independently with its own tools — it cannot see your conversation.\n"
+        "Give it a **self-contained** task with all file paths, context, and constraints it needs.\n\n"
+        f"{table}\n"
+    )
 
 
 def _load_base_template(role: str, mode: str) -> str:
@@ -421,12 +379,16 @@ def generate(
 
     # Build substitution map
     soul_max = cfg["soul"]["max_chars"]
+    agents_cfg = get_agents_config()
+    role_cfg = agents_cfg.get(role, {})
+    spawnable = role_cfg.get("spawnable_agents", [])
     subs = {
         "{{SOUL}}":          _read_workspace("SOUL.md",     max_chars),
         "{{USER}}":          _read_workspace("USER.md",     max_chars),
         "{{MEMORY}}":        _read_workspace("MEMORY.md",   max_chars),
         "{{IDENTITY}}":      _read_workspace("IDENTITY.md", max_chars),
         "{{ALLOWED_TOOLS}}": _build_tool_block(allowed_tools),
+        "{{SKILLS}}":        _build_skills_block(spawnable, agents_cfg),
         "{{AGENT_ID}}":      agent_id,
         "{{AGENT_ROLE}}":    role,
         "{{SESSION_ID}}":    session_id,

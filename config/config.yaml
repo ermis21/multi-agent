@@ -1,14 +1,14 @@
 llm:
   provider: local
   base_url: http://llama-api-manager:8081
-  model: gemma-4-E4B-it-Q8_0.gguf
+  model: gemma-4-31B-it-Q4_K_M.gguf
   temperature: 1.0
   max_tokens: 131072
   top_p: 0.95
   top_k: 64
-  enable_thinking: true
+  enable_thinking: false
   thinking_budget_tokens: 8000
-  url: null
+  url: http://10.64.82.60:8000
 models:
   vpn_local:
     provider: local

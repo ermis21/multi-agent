@@ -173,6 +173,7 @@ services:
       # mab-sandbox shares this container's network namespace (via mab-vpn),
       # so it is reachable on localhost rather than by hostname.
       SANDBOX_URL: "http://localhost:9000"
+      DISCORD_URL: "http://mab-discord:4000"
       # Path overrides (these paths are inside the container)
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
