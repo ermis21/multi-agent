@@ -1,0 +1,286 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend — Agent Role Configuration
+#
+# Defines permissions and behaviour for each agent role.
+# Roles: worker, supervisor, soul_updater, config_agent, improvement_agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Worker ────────────────────────────────────────────────────────────────────
+# The primary responder. Handles user requests, may use tools.
+worker:
+  # MCP tools this role may call. Tool docs are injected into its prompt
+  # dynamically — it never sees docs for tools it cannot use.
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_edit
+    - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
+    - shell_exec
+    - web_search
+    - web_fetch
+    - memory_add
+    - memory_search
+    - memory_list
+    - notion_search
+    - notion_get_page
+    - notion_create_page
+    - notion_update_page
+    - discord_send
+    - discord_read
+    - discord_set_nickname
+    - discord_edit_channel
+    - tts_speak
+    - read_config
+    - write_config
+    - run_agent
+
+  # Roles this agent can spawn as sub-agents via run_agent.
+  spawnable_agents:
+    - coding_agent
+    - research_agent
+    - tool_builder
+    - skill_builder
+    - webfetch_summarizer
+
+  # Maximum tool call iterations per completion (prevents runaway loops).
+  max_tool_iterations: 10
+
+
+# ── Supervisor ────────────────────────────────────────────────────────────────
+# Grades the worker's response. Returns JSON with pass/score/feedback.
+# Never calls tools — it only reads the conversation and responds with JSON.
+supervisor:
+  allowed_tools: []
+
+  # Whether to include the full conversation history when grading.
+  # true = can check coherence across turns; false = only grades final answer.
+  include_conversation_history: true
+
+
+# ── Soul Updater ──────────────────────────────────────────────────────────────
+# Runs at 5 AM via cron. Reads workspace files, rewrites SOUL.md.
+# Needs file_read + file_write only.
+soul_updater:
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+  max_tool_iterations: 8
+
+
+# ── Config Agent ──────────────────────────────────────────────────────────────
+# Runs on POST /config/agent. Guides the user through configuration questions.
+# Tightly restricted: can only read and write config files, nothing else.
+config_agent:
+  allowed_tools:
+    - read_config
+    - write_config
+    - web_search
+    - web_fetch
+
+  # Strategic questions the config agent walks through in order.
+  # The agentic_config.md prompt expands on each of these.
+
+
+# ── Improvement Agent ─────────────────────────────────────────────────────────
+# Has access to the full project repo, git tools, and Docker test stack.
+# Use this role to self-improve the service code:
+#   1. Edit files in /project via file_read / file_write
+#   2. git_commit to save changes
+#   3. docker_test_up → docker_test_health to verify
+#   4. If broken: git_rollback + docker_test_down
+improvement_agent:
+  description: "Self-improves service code with git + Docker test verification."
+  spawnable_agents:
+    - coding_agent
+    - research_agent
+    - tool_builder
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_edit
+    - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
+    - shell_exec
+    - git_status
+    - git_commit
+    - git_rollback
+    - git_log
+    - docker_test_up
+    - docker_test_down
+    - docker_test_health
+    - run_agent
+
+  # Higher iteration limit for multi-step improvement workflows.
+  max_tool_iterations: 20
+
+
+# ── Discord Agent ─────────────────────────────────────────────────────────────
+# Handles Discord-specific tasks: sending messages, reading channels,
+# managing nicknames and channel metadata.
+discord_agent:
+  allowed_tools:
+    - discord_send
+    - discord_read
+    - discord_set_nickname
+    - discord_edit_channel
+    - memory_search
+    - memory_add
+
+  max_tool_iterations: 10
+
+
+# ── Testing Agent ─────────────────────────────────────────────────────────────
+# Deterministic + LLM-driven auditor.
+# Call via POST /v1/agents/testing_agent.
+# Runs diagnostic_check first (no LLM), then does workspace/memory round-trips
+# and produces a structured markdown audit report.
+# Invoke after improvement_agent changes to verify system integrity.
+testing_agent:
+  allowed_tools:
+    - diagnostic_check
+    - file_read
+    - file_write
+    - file_list
+    - file_search
+    - directory_tree
+    - file_info
+    - execute_command
+    - shell_exec
+    - read_config
+    - memory_add
+    - memory_search
+    - web_search
+
+  max_tool_iterations: 15
+
+
+# ── Discord Moderator ─────────────────────────────────────────────────────────
+# Cron-based channel organizer. Runs every 3 days.
+# Lists all channels, deletes empty ones, archives inactive, organizes into themed categories.
+discord_moderator:
+  allowed_tools:
+    - discord_list_channels
+    - discord_create_channel
+    - discord_delete_channel
+    - discord_create_category
+    - discord_edit_channel
+    - discord_read
+    - discord_send
+    - memory_add
+    - memory_search
+  max_tool_iterations: 30
+
+
+# ── Agent Spawner ─────────────────────────────────────────────────────────────
+# Writes self-contained briefs for sub-agents. Read-only context gathering.
+agent_spawner:
+  allowed_tools:
+    - memory_search
+    - file_read
+  max_tool_iterations: 5
+
+
+# ── Session Compactor ─────────────────────────────────────────────────────────
+# Pure text transformation — compresses long sessions into resumable summaries.
+session_compactor:
+  allowed_tools: []
+  max_tool_iterations: 1
+
+
+# ── Cron Creator ──────────────────────────────────────────────────────────────
+# Translates natural-language schedules into cron + prompt pairs.
+cron_creator:
+  allowed_tools:
+    - read_config
+    - write_config
+  max_tool_iterations: 5
+
+
+# ── Research Agent ────────────────────────────────────────────────────────────
+# Read-only investigation across code, web, and memory.
+research_agent:
+  description: "Read-only investigation across code, web, and memory."
+  allowed_tools:
+    - web_search
+    - web_fetch
+    - file_read
+    - file_search
+    - file_list
+    - directory_tree
+    - memory_search
+  max_tool_iterations: 15
+
+
+# ── Coding Agent ──────────────────────────────────────────────────────────────
+# Implements code changes and self-verifies via tests/lint/type-check.
+coding_agent:
+  description: "Implements code changes and self-verifies via tests/lint/type-check."
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_edit
+    - file_list
+    - file_search
+    - directory_tree
+    - file_move
+    - create_dir
+    - file_info
+    - execute_command
+    - shell_exec
+    - git_status
+    - git_commit
+    - git_rollback
+    - git_log
+  max_tool_iterations: 20
+
+
+# ── Tool Builder ──────────────────────────────────────────────────────────────
+# Scaffolds new tools (TOOL_DOCS entry + handler stub).
+tool_builder:
+  description: "Scaffolds new tools (handler + docs entry)."
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_search
+    - directory_tree
+  max_tool_iterations: 10
+
+
+# ── Skill Builder ─────────────────────────────────────────────────────────────
+# Authors SKILL.md files with frontmatter + trigger conditions.
+skill_builder:
+  description: "Authors SKILL.md files with trigger conditions."
+  allowed_tools:
+    - file_read
+    - file_write
+    - file_list
+  max_tool_iterations: 8
+
+
+# ── WebFetch Summarizer ───────────────────────────────────────────────────────
+# Compresses fetched URL content to relevant facts with verbatim quotes.
+webfetch_summarizer:
+  description: "Compresses fetched URL content to relevant facts."
+  allowed_tools:
+    - web_fetch
+  max_tool_iterations: 5
+
+
+# ── Prompt Suggester ──────────────────────────────────────────────────────────
+# Generates 3–5 likely follow-up prompts for the user.
+prompt_suggester:
+  allowed_tools: []
+  max_tool_iterations: 1

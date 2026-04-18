@@ -1,0 +1,22 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Discord Bot Configuration
+#
+# Channel IDs are set via environment variables (comma-separated):
+#   DISCORD_WORKER_CHANNELS=123456,789012
+#   DISCORD_CONFIG_CHANNELS=345678
+#
+# This file holds non-secret config that agents can read and update.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Channel IDs the worker bot listens in (informational — set via env var)
+worker_channels: []
+
+# Channel IDs the config bot listens in (informational — set via env var)
+config_channels: []
+
+# Optional: post supervisor grading summaries here after each response
+# Set to null to disable
+supervisor_log_channel: null
+
+# Max Discord message length before splitting (Discord limit: 2000)
+max_message_length: 1900

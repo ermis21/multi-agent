@@ -1,0 +1,213 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend (mab) — Production Stack
+#
+# Services:
+#   mab-api      Public API on port 8090. Orchestrates supervisor/worker loop.
+#                Calls llama-api on host port 8080 for LLM inference.
+#                Calls mab-sandbox for tool execution.
+#   mab-sandbox  Isolated MCP tool server (internal only, not exposed).
+#                Has Docker socket and full project mount for self-improvement.
+#
+# Usage:
+#   docker compose up -d --build
+#   docker compose logs -f
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+secrets:
+  openvpn_config:
+    file: /home/homelab/openclaw/secrets/openvpn_config
+
+services:
+
+  # ── Notion MCP Server ─────────────────────────────────────────────────────
+  mab-notion:
+    build:
+      context: ./notion
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-notion
+    environment:
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+    networks:
+      - mab-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').createConnection(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Discord Bots ──────────────────────────────────────────────────────────
+  mab-discord:
+    build:
+      context: ./discord
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-discord
+    environment:
+      DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
+      DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+      DISCORD_TOKEN_MOD: "${DISCORD_TOKEN_MOD:-}"
+      DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
+      DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
+      DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
+      DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
+      DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Gemma}"
+      DISCORD_MAX_MESSAGE_LENGTH: "1900"
+      MAB_API_URL: "http://mab-vpn:8090"
+    networks:
+      - mab-net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    volumes:
+      # Persistent bot state — session IDs and user modes survive container restarts
+      - ./discord_state:/app/state
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      mab-api:
+        condition: service_healthy
+
+  # ── OpenVPN Sidecar ───────────────────────────────────────────────────────
+  # mab-api and mab-sandbox share this container's network namespace via
+  # network_mode: service:mab-vpn, inheriting the tunnel routes automatically.
+  mab-vpn:
+    build:
+      context: ./vpn
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-vpn
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    secrets: [openvpn_config]
+    networks:
+      - mab-net
+      - llama-api_default
+    ports:
+      - "8090:8090"
+    sysctls:
+      - net.ipv4.conf.all.rp_filter=2
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ip link show tun0 2>/dev/null | grep -q UP"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    logging: *logging
+
+  # ── Isolated MCP Tool Sandbox ──────────────────────────────────────────────
+  # Start sandbox first; mab-api depends on it being healthy.
+  mab-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-sandbox
+    command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      WORKSPACE_DIR: "/workspace"
+      PROJECT_DIR: "/project"
+      MEMPALACE_HOME: "/mempalace"
+      PROMPTS_DIR: "/app/prompts"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      NOTION_URL: "http://mab-notion:3000"
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+      DISCORD_URL: "http://mab-discord:4000"
+      DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
+      DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+      LLAMA_URL: "http://llama-api-manager:8081"
+    volumes:
+      # Shared workspace (soul, memory, user files)
+      - ./workspace:/workspace
+      # Full project repo for agent self-inspection — read-only (not a clone)
+      - .:/project:ro
+      # Docker socket for docker_test_up / docker_test_down tools
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Live-reload: code changes take effect on next request without rebuild
+      - ./sandbox:/app/sandbox
+      - ./prompts:/app/prompts
+      # MemPalace persistent ChromaDB storage
+      - ./mempalace:/mempalace
+    network_mode: "service:mab-vpn"
+    # No ports: section — not exposed to host, internal network only
+    mem_limit: 1g
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      mab-vpn:
+        condition: service_healthy
+
+  # ── Orchestration API ──────────────────────────────────────────────────────
+  mab-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-api
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--reload"]
+    environment:
+      # LLM inference endpoint (existing llama-api on host)
+      LLAMA_URL: "http://llama-api-manager:8081"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      # mab-sandbox shares this container's network namespace (via mab-vpn),
+      # so it is reachable on localhost rather than by hostname.
+      SANDBOX_URL: "http://localhost:9000"
+      DISCORD_URL: "http://mab-discord:4000"
+      # Path overrides (these paths are inside the container)
+      CONFIG_PATH: "/app/config/config.yaml"
+      AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
+      SESSIONS_DIR: "/sessions"
+      WORKSPACE_DIR: "/workspace"
+      PROMPTS_DIR: "/app/prompts"
+    volumes:
+      # Shared workspace
+      - ./workspace:/workspace
+      # Session logs (JSONL, API only)
+      - ./sessions:/sessions
+      # Live-editable: config, prompts, and app code all reload without restart
+      - ./config:/app/config
+      - ./prompts:/app/prompts
+      - ./app:/app/app
+      # Claude Code OAuth credentials — read-only, for Anthropic provider auth
+      - /home/homelab/.claude/.credentials.json:/app/.claude_credentials.json:ro
+    network_mode: "service:mab-vpn"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      mab-vpn:
+        condition: service_healthy
+      mab-sandbox:
+        condition: service_healthy
+
+networks:
+  mab-net:
+    driver: bridge
+  llama-api_default:
+    external: true

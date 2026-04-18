@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-Agent Backend — Test/Staging Stack
+#
+# Identical to docker-compose.yml except:
+#   - Container names: mab-api-test, mab-sandbox-test
+#   - Public port: 8091 (so it runs alongside the prod stack on 8090)
+#   - Network: mab-net-test (isolated from prod stack)
+#   - restart: "no"  (manual lifecycle — agents spin it up and tear it down)
+#
+# Used by the improvement_agent role to test code changes before going live.
+# The sandbox calls:
+#   docker_test_up   → docker compose -f docker-compose.test.yml up -d --build
+#   docker_test_down → docker compose -f docker-compose.test.yml down
+#   docker_test_health → curl http://host.docker.internal:8091/health
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+services:
+
+  mab-notion-test:
+    build:
+      context: ./notion
+      dockerfile: Dockerfile
+    container_name: mab-notion-test
+    environment:
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
+    networks:
+      - mab-net-test
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').createConnection(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: "no"
+    logging: *logging
+
+  mab-sandbox-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-sandbox-test
+    command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
+    environment:
+      WORKSPACE_DIR: "/workspace"
+      PROJECT_DIR: "/project"
+      MEMPALACE_HOME: "/mempalace"
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      NOTION_URL: "http://mab-notion-test:3000"
+      DISCORD_URL: ""
+    volumes:
+      - ./workspace:/workspace
+      - .:/project
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./sandbox:/app/sandbox
+      - ./prompts:/app/prompts
+      - ./mempalace:/mempalace
+    networks:
+      - mab-net-test
+    mem_limit: 1g
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+    logging: *logging
+
+  mab-api-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      network: host
+    container_name: mab-api-test
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    environment:
+      LLAMA_URL: "http://host.docker.internal:8080"
+      SANDBOX_URL: "http://mab-sandbox-test:9000"
+      CONFIG_PATH: "/app/config/config.yaml"
+      AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
+      SESSIONS_DIR: "/sessions"
+      WORKSPACE_DIR: "/workspace"
+      PROMPTS_DIR: "/app/prompts"
+    volumes:
+      - ./workspace:/workspace
+      - ./sessions:/sessions
+      - ./config:/app/config
+      - ./prompts:/app/prompts
+      - ./app:/app/app
+    ports:
+      - "8091:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - mab-net-test
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: "no"
+    logging: *logging
+    depends_on:
+      mab-sandbox-test:
+        condition: service_healthy
+
+networks:
+  mab-net-test:
+    driver: bridge
