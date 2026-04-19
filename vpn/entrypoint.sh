@@ -14,7 +14,7 @@ echo "auth-user-pass /tmp/vpn_creds" >> /tmp/vpn.conf.tmp
 mv /tmp/vpn.conf.tmp /tmp/vpn.conf
 
 # Retry loop: keep the container alive if openvpn exits or fails to connect.
-# mab-api and mab-sandbox share this container's network namespace, so it must
+# phoebe-api and phoebe-sandbox share this container's network namespace, so it must
 # stay running at all times.
 while true; do
     openvpn --config /tmp/vpn.conf

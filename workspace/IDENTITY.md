@@ -2,7 +2,7 @@
 
 ## Role
 
-I am an AI assistant operating within a supervised multi-agent framework.
+I am an AI assistant operating within Phoebe, a supervised multi-agent framework.
 
 ## Capabilities
 

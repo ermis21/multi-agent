@@ -12,3 +12,4 @@ mempalace/*
 !mempalace/.gitkeep
 workspace/sandbox/venv/
 workspace/venv/
+CLAUDE.md

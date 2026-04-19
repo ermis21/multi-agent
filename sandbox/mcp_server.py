@@ -1,5 +1,5 @@
 """
-MCP Tool Server — runs in mab-sandbox container.
+MCP Tool Server — runs in phoebe-sandbox container.
 
 Exposes tools over HTTP JSON-RPC (POST /mcp).
 NOT exposed publicly — internal Docker network only.
@@ -21,7 +21,9 @@ File path prefixes:
   project/   → /project    (read-only; .env blocked)
 """
 
+import json
 import os
+import re
 import resource
 import stat as _stat
 import subprocess
@@ -39,14 +41,14 @@ from exa_py import Exa
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="mab-sandbox-mcp", docs_url=None, redoc_url=None)
+app = FastAPI(title="phoebe-sandbox-mcp", docs_url=None, redoc_url=None)
 
 WORKSPACE       = Path(os.environ.get("WORKSPACE_DIR",   "/workspace")).resolve()
 PROJECT         = Path(os.environ.get("PROJECT_DIR",     "/project")).resolve()
 MEMPALACE_HOME  = Path(os.environ.get("MEMPALACE_HOME",  "/mempalace"))
 EXA_API_KEY     = os.environ.get("EXA_API_KEY", "")
-NOTION_URL      = os.environ.get("NOTION_URL",   "http://mab-notion:3000")
-DISCORD_URL     = os.environ.get("DISCORD_URL",  "http://mab-discord:4000")
+NOTION_URL      = os.environ.get("NOTION_URL",   "http://phoebe-notion:3000")
+DISCORD_URL     = os.environ.get("DISCORD_URL",  "http://phoebe-discord:4000")
 LLAMA_URL       = os.environ.get("LLAMA_URL",    "http://host.docker.internal:8080")
 NOTION_TOKEN    = os.environ.get("NOTION_TOKEN", "")
 PROMPTS_DIR     = Path(os.environ.get("PROMPTS_DIR",     "/app/prompts"))
@@ -79,7 +81,13 @@ def _safe_path(rel: str, root: Path) -> Path:
     """Resolve path and reject anything escaping root."""
     target = (root / rel).resolve()
     if not str(target).startswith(str(root)):
-        raise HTTPException(status_code=400, detail=f"Path traversal rejected: {rel!r}")
+        root_name = "workspace" if root == WORKSPACE else ("project" if root == PROJECT else str(root))
+        hint = (
+            f"Path {rel!r} is outside the {root_name} root ({root}). "
+            f"Writable root is {WORKSPACE}; readable roots are {WORKSPACE} and {PROJECT} (read-only). "
+            f"Retry with a path under /workspace/ (e.g. /workspace/{Path(rel).name})."
+        )
+        raise HTTPException(status_code=400, detail=hint)
     return target
 
 
@@ -121,6 +129,17 @@ def _file_read(params: dict) -> dict:
         return {"content": path.read_text(encoding="utf-8")}
     except HTTPException:
         raise
+    except FileNotFoundError:
+        return {"error": (
+            f"file not found: {params['path']}. "
+            f"Use file_list or directory_tree to verify the path. "
+            f"Paths under /project are read-only source; /workspace is writable."
+        )}
+    except IsADirectoryError:
+        return {"error": (
+            f"{params['path']} is a directory, not a file. "
+            f"Use file_list or directory_tree to inspect directory contents."
+        )}
     except Exception as e:
         return {"error": f"file_read failed: {e}"}
 
@@ -149,13 +168,25 @@ def _file_edit(params: dict) -> dict:
         old  = params["old_string"]
         new  = params["new_string"]
         if not path.exists():
-            return {"error": f"file not found in workspace: {params['path']}"}
+            return {"error": (
+                f"file not found in workspace: {params['path']}. "
+                f"file_edit only modifies existing files — to create a new file, use file_write "
+                f"(excluded in plan mode; ask the user to switch with /mode build). "
+                f"To verify the path, use file_list or directory_tree."
+            )}
         content = path.read_text(encoding="utf-8")
         count = content.count(old)
         if count == 0:
-            return {"error": f"old_string not found in {params['path']}"}
+            return {"error": (
+                f"old_string not found in {params['path']}. "
+                f"Read the current file contents with file_read before retrying — "
+                f"old_string must match the file byte-for-byte, including whitespace."
+            )}
         if count > 1:
-            return {"error": f"old_string matches {count} places in {params['path']} — make it more specific"}
+            return {"error": (
+                f"old_string matches {count} places in {params['path']} — make it more specific "
+                f"by including surrounding context so it appears exactly once."
+            )}
         path.write_text(content.replace(old, new, 1), encoding="utf-8")
         return {"ok": True, "path": params["path"], "replaced": 1}
     except HTTPException:
@@ -260,6 +291,13 @@ def _file_info(params: dict) -> dict:
         return {"error": f"file_info failed: {e}"}
 
 
+_TMP_HINT = (
+    "[note] Command touches /tmp. Files written there do not persist across tool calls "
+    "and are invisible to other tools (file_read, file_list, etc.). For anything you "
+    "want to keep or hand off, use /workspace/.\n"
+)
+
+
 def _shell_exec(params: dict) -> dict:
     command     = params["command"]
     timeout_ms  = params.get("timeout_ms", 30_000)
@@ -282,9 +320,13 @@ def _shell_exec(params: dict) -> dict:
             preexec_fn=_set_limits,
             env=_SUBPROCESS_ENV,
         )
+        stdout = result.stdout[-MAX_STDOUT_CHARS:]
+        # /tmp tripwire: non-blocking nudge prepended when commands touch /tmp
+        if "/tmp" in command:
+            stdout = _TMP_HINT + stdout
         return {
             "exit_code": result.returncode,
-            "stdout":    result.stdout[-MAX_STDOUT_CHARS:],
+            "stdout":    stdout,
             "stderr":    result.stderr[-MAX_STDERR_CHARS:],
         }
     except subprocess.TimeoutExpired:
@@ -396,12 +438,12 @@ def _web_fetch(params: dict) -> dict:
     url = params["url"]
     try:
         r    = httpx.get(url, timeout=10, follow_redirects=True,
-                         headers={"User-Agent": "mab-agent/1.0"})
+                         headers={"User-Agent": "phoebe-agent/1.0"})
         soup = BeautifulSoup(r.text, "lxml")
         for tag in soup(["script", "style", "nav", "footer"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
-        return {"url": url, "text": text[:MAX_STDOUT_CHARS]}
+        return {"url": url, "status": r.status_code, "text": text[:MAX_STDOUT_CHARS]}
     except Exception as e:
         return {"url": url, "error": str(e)}
 
@@ -664,18 +706,186 @@ def _diagnostic_check(_params: dict) -> dict:
         except Exception as e:
             checks[label] = fail(str(e))
 
-    # prompt_templates — all required base templates must exist
-    required = [
-        "worker_full.md", "worker_concise.md",
-        "supervisor_full.md", "supervisor_concise.md",
-        "soul_updater.md", "config_agent.md", "improvement_agent.md",
-        "testing_agent_full.md", "testing_agent_concise.md",
+    # prompt_templates — all required base templates must exist, with expected {{vars}}
+    required_with_checks = [
+        # (filename, [required regex patterns])
+        ("worker_full.md",           [r"\{\{ALLOWED_TOOLS\}\}", r"<\|end\|>"]),
+        ("worker_concise.md",        [r"\{\{ALLOWED_TOOLS\}\}", r"<\|end\|>"]),
+        ("supervisor_full.md",       [r"\{\{RUBRIC\}\}",        r"\{\{THRESHOLD\}\}"]),
+        ("supervisor_concise.md",    [r"\{\{RUBRIC\}\}",        r"\{\{THRESHOLD\}\}"]),
+        ("soul_updater.md",          []),
+        ("config_agent.md",          []),
+        ("improvement_agent.md",     []),
+        ("testing_agent_full.md",    []),
+        ("testing_agent_concise.md", []),
+        ("research_agent.md",        []),
+        ("coding_agent.md",          []),
+        ("tool_builder.md",          []),
+        ("skill_builder.md",         [r"/workspace/skills/"]),
+        ("webfetch_summarizer.md",   []),
+        ("prompt_suggester.md",      []),
+        ("session_compactor.md",     []),
+        ("cron_creator.md",          []),
+        ("agent_spawner.md",         []),
     ]
-    missing_tpl = [t for t in required if not (PROMPTS_DIR / "base" / t).exists()]
-    if not missing_tpl:
-        checks["prompt_templates"] = ok(f"all {len(required)} templates present")
+    missing_tpl: list[str] = []
+    missing_var: list[str] = []
+    for fname, patterns in required_with_checks:
+        path = PROMPTS_DIR / "base" / fname
+        if not path.exists():
+            missing_tpl.append(fname)
+            continue
+        try:
+            text = path.read_text()
+        except Exception:
+            missing_tpl.append(fname)
+            continue
+        for pat in patterns:
+            if not re.search(pat, text):
+                missing_var.append(f"{fname}:missing {pat}")
+    if not missing_tpl and not missing_var:
+        checks["prompt_templates"] = ok(f"all {len(required_with_checks)} templates present and valid")
+    elif missing_tpl:
+        checks["prompt_templates"] = warn(f"missing files: {', '.join(missing_tpl[:3])}")
     else:
-        checks["prompt_templates"] = warn(f"missing: {', '.join(missing_tpl)}")
+        checks["prompt_templates"] = warn(f"template-var gaps: {', '.join(missing_var[:3])}")
+
+    # config_schema — reach the API inside the shared netns (localhost:8090)
+    try:
+        r = httpx.get("http://localhost:8090/v1/config/validate", timeout=5)
+        if r.status_code == 200:
+            body = r.json()
+            if body.get("valid"):
+                checks["config_schema"] = ok("no schema drift")
+            else:
+                errs = body.get("errors", [])
+                checks["config_schema"] = warn(f"{len(errs)} issue(s): {'; '.join(errs[:3])}")
+        else:
+            checks["config_schema"] = warn(f"API HTTP {r.status_code}")
+    except Exception as e:
+        checks["config_schema"] = fail(f"API unreachable: {e}")
+
+    # supervisor_mode_overrides — structural check on parsed config
+    try:
+        cfg_data = yaml.safe_load(_CONFIG_YAML.read_text()) or {}
+        overrides = (cfg_data.get("agent") or {}).get("supervisor_mode_overrides") or {}
+        if not overrides:
+            default_thresh = (cfg_data.get("agent") or {}).get("supervisor_pass_threshold", 0.7)
+            checks["supervisor_mode_overrides"] = warn(
+                f"no mode overrides set — all modes fall back to supervisor_pass_threshold={default_thresh}"
+            )
+        else:
+            bad = []
+            for mode in ("plan", "build", "converse"):
+                val = overrides.get(mode)
+                if val is None:
+                    continue
+                if not isinstance(val, (int, float)) or val < 0.0 or val > 1.0:
+                    bad.append(f"{mode}={val!r}")
+            if bad:
+                checks["supervisor_mode_overrides"] = fail(f"invalid values: {', '.join(bad)}")
+            else:
+                present = [m for m in ("plan", "build", "converse") if m in overrides]
+                checks["supervisor_mode_overrides"] = ok(f"configured: {', '.join(present)}")
+    except Exception as e:
+        checks["supervisor_mode_overrides"] = fail(str(e))
+
+    # skills_directory — scan workspace/skills/*/SKILL.md and sanity-check frontmatter
+    skills_root = WORKSPACE / "skills"
+    try:
+        if not skills_root.is_dir():
+            checks["skills_directory"] = ok("no skills directory (0 skills)")
+        else:
+            skill_files = sorted(skills_root.glob("*/SKILL.md"))
+            if not skill_files:
+                checks["skills_directory"] = ok("0 skills")
+            else:
+                malformed: list[str] = []
+                for sf in skill_files:
+                    try:
+                        text = sf.read_text(encoding="utf-8")
+                        if not text.lstrip().startswith("---"):
+                            malformed.append(sf.parent.name)
+                            continue
+                        # quick frontmatter parse — find the closing ---
+                        body = text.lstrip()
+                        end_idx = body.find("\n---", 3)
+                        if end_idx < 0:
+                            malformed.append(sf.parent.name)
+                            continue
+                        fm_text = body[3:end_idx].strip()
+                        meta = yaml.safe_load(fm_text) or {}
+                        if not isinstance(meta, dict) or not meta.get("name"):
+                            malformed.append(sf.parent.name)
+                    except Exception:
+                        malformed.append(sf.parent.name)
+                if not malformed:
+                    checks["skills_directory"] = ok(f"{len(skill_files)} skill(s), all parseable")
+                else:
+                    checks["skills_directory"] = warn(
+                        f"{len(skill_files)} skill(s), {len(malformed)} malformed: {', '.join(malformed[:3])}"
+                    )
+    except Exception as e:
+        checks["skills_directory"] = fail(str(e))
+
+    # inject_endpoint_reachable — POST to a non-existent session; expect 404
+    try:
+        r = httpx.post(
+            "http://localhost:8090/v1/sessions/__diag__/inject",
+            json={"text": "", "mode": "queue"},
+            timeout=5,
+        )
+        if r.status_code == 404:
+            checks["inject_endpoint_reachable"] = ok("route mounted")
+        elif r.status_code in (400, 422):
+            # Endpoint present but rejected payload — still proves routing
+            checks["inject_endpoint_reachable"] = ok(f"route mounted (HTTP {r.status_code})")
+        else:
+            checks["inject_endpoint_reachable"] = warn(f"unexpected HTTP {r.status_code}")
+    except Exception as e:
+        checks["inject_endpoint_reachable"] = fail(f"API unreachable: {e}")
+
+    # session_state_integrity — glob sessions/*.state.json, verify schema fields parse
+    try:
+        import glob as _glob
+        # /project is the repo bind-mount; sessions/ lives at the repo root
+        candidates = _glob.glob("/project/sessions/*/state.json")
+        if not candidates:
+            checks["session_state_integrity"] = ok("no state files yet")
+        else:
+            corrupt: list[str] = []
+            missing_jsonl: list[str] = []
+            for p in candidates:
+                sid = Path(p).parent.name
+                try:
+                    data = json.loads(Path(p).read_text(encoding="utf-8"))
+                except Exception:
+                    corrupt.append(sid)
+                    continue
+                for key in ("session_id", "created_at", "history"):
+                    if key not in data:
+                        corrupt.append(f"{sid}:missing {key}")
+                        break
+                else:
+                    jsonl = data.get("history", {}).get("full") or ""
+                    jsonl_path = Path(jsonl if jsonl.startswith("/") else f"/project/{jsonl}")
+                    if not jsonl_path.exists():
+                        missing_jsonl.append(sid)
+            total = len(candidates)
+            bad = len(corrupt)
+            if bad == 0 and not missing_jsonl:
+                checks["session_state_integrity"] = ok(f"{total} state file(s), all parseable")
+            elif bad == 0:
+                checks["session_state_integrity"] = warn(
+                    f"{total} state file(s) parse; {len(missing_jsonl)} missing matching JSONL: "
+                    + ", ".join(missing_jsonl[:3])
+                )
+            else:
+                checks["session_state_integrity"] = warn(
+                    f"{bad}/{total} state files corrupt: " + ", ".join(corrupt[:3])
+                )
+    except Exception as e:
+        checks["session_state_integrity"] = fail(f"integrity probe failed: {e}")
 
     # Compute overall
     statuses   = [c["status"] for c in checks.values()]
@@ -725,7 +935,7 @@ HANDLERS = {
     "memory_add":             _memory_add,
     "memory_search":          _memory_search,
     "memory_list":            _memory_list,
-    # Notion (proxied through mab-notion container)
+    # Notion (proxied through phoebe-notion container)
     "notion_search":          lambda p: _notion_call("notion_search", p),
     "notion_get_page":        lambda p: _notion_call("notion_get_page", p),
     "notion_create_page":     lambda p: _notion_call("notion_create_page", p),

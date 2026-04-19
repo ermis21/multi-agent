@@ -1,10 +1,10 @@
 """
-Integration test suite for mab-api.
+Integration test suite for phoebe-api.
 
 Requires the stack to be running: make up (or make test-up for isolated stack).
 Run with: pytest test/ -v
 
-Set MAB_URL env var to override the default http://localhost:8090.
+Set PHOEBE_URL env var to override the default http://localhost:8090.
 """
 
 import time
@@ -14,6 +14,9 @@ import httpx
 import pytest
 
 from conftest import BASE_URL, answer, chat
+
+# Every test in this file hits the running stack — mark the whole module live.
+pytestmark = pytest.mark.live
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -65,11 +68,11 @@ def test_supervisor_session_logged(client):
 
 def test_tool_file_roundtrip(client):
     filename = f"test_{uuid.uuid4().hex[:6]}.txt"
-    content  = "mab-test-content-xyz"
+    content  = "phoebe-test-content-xyz"
 
     resp = chat(client, f"Write the text '{content}' to the file '{filename}' in the workspace, then read it back and tell me what it says.")
     text = answer(resp)
-    assert content in text or "mab-test-content-xyz" in text.lower()
+    assert content in text or "phoebe-test-content-xyz" in text.lower()
 
 
 # ── Session continuity ─────────────────────────────────────────────────────────

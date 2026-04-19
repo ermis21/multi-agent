@@ -1,10 +1,10 @@
 """
-MCP client — bridges mab-api to mab-sandbox.
+MCP client — bridges phoebe-api to phoebe-sandbox.
 
 All tool calls flow through call_tool():
   1. Check if the method is in the agent's allowed_tools list.
   2. Route LOCAL_TOOLS (read_config, write_config) to local functions — no HTTP.
-  3. Everything else → POST http://mab-sandbox:9000/mcp
+  3. Everything else → POST http://phoebe-sandbox:9000/mcp
 
 Timeouts:
   File ops (file_read, file_write, file_list): 10s
@@ -20,10 +20,11 @@ from uuid import uuid4
 import httpx
 
 from app.config_loader import get_config, patch_config
+from app.session_state import SessionState, log_approval
 
-SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://mab-sandbox:9000")
+SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://phoebe-sandbox:9000")
 
-LOCAL_TOOLS: frozenset[str] = frozenset({"read_config", "write_config", "run_agent"})
+LOCAL_TOOLS: frozenset[str] = frozenset({"read_config", "write_config", "run_agent", "deliberate", "ask_user"})
 
 FAST_TIMEOUT_S = 10
 SLOW_TIMEOUT_S = 130
@@ -38,6 +39,8 @@ SLOW_TOOLS: frozenset[str] = frozenset({
     "tts_speak",
     "diagnostic_check",
     "run_agent",
+    "deliberate",
+    "ask_user",
 })
 
 # Shared client — connection pool reused across tool calls in the same process.
@@ -48,14 +51,24 @@ _client = httpx.AsyncClient(timeout=SLOW_TIMEOUT_S)
 # When a tool needs user approval, call_tool() POSTs an approval request to the
 # Discord service and waits on an asyncio.Event.  The event is set when the user
 # clicks a button in Discord, which triggers a callback to /v1/approval_response
-# on mab-api, which calls resolve_approval().  call_tool() never returns
+# on phoebe-api, which calls resolve_approval().  call_tool() never returns
 # "pending_approval" — it simply doesn't return until the tool runs or is denied.
 
-DISCORD_URL = os.environ.get("DISCORD_URL", "http://mab-discord:4000")
+DISCORD_URL = os.environ.get("DISCORD_URL", "http://phoebe-discord:4000")
 _discord_http = httpx.AsyncClient(timeout=10)
 
 # approval_id → {event: asyncio.Event, approved: bool, always: bool}
 _pending_approvals: dict[str, dict] = {}
+
+
+def _safe_log_approval(session_id: str, tool: str, status: str, extra: dict | None = None) -> None:
+    """Best-effort approval audit — never raises out of the hot path."""
+    if not session_id:
+        return
+    try:
+        log_approval(session_id, tool, status, extra)
+    except Exception:
+        pass
 
 
 def resolve_approval(approval_id: str, approved: bool, always: bool = False) -> bool:
@@ -90,6 +103,24 @@ async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | 
     if role not in allowed:
         return {"error": f"Cannot spawn '{role}'. Available sub-agents: {allowed}"}
     child_sid = f"{session_id or 'sub'}_{role}_{uuid4().hex[:6]}"
+
+    parent_state = None
+    if session_id:
+        try:
+            parent_state = SessionState.load_or_create(session_id)
+            parent_state.add_sub_session(child_sid)
+            parent_state.save()
+        except Exception:
+            parent_state = None
+    try:
+        child_state = SessionState.load_or_create(child_sid)
+        child_state.set("parent_session_id", session_id or None)
+        child_state.set("agent_role", role)
+        child_state.set("source_trigger", {"type": "sub_agent", "ref": session_id or None})
+        child_state.save()
+    except Exception:
+        pass
+
     try:
         from app.agents import run_agent_role  # lazy import — avoids circular
         result = await run_agent_role(role, {"messages": [{"role": "user", "content": task}]}, child_sid)
@@ -97,6 +128,13 @@ async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | 
         return {"role": role, "response": text, "sub_session_id": child_sid}
     except Exception as e:
         return {"error": f"Sub-agent '{role}' failed: {e}"}
+    finally:
+        if parent_state is not None:
+            try:
+                parent_state.complete_sub_session(child_sid)
+                parent_state.save()
+            except Exception:
+                pass
 
 
 async def call_tool(
@@ -107,6 +145,7 @@ async def call_tool(
     approved_tools: list[str] | None = None,
     session_id: str = "",
     spawnable_agents: list[str] | None = None,
+    extra_auto_allow_paths: list[str] | None = None,
 ) -> dict:
     """
     Execute a tool call.
@@ -124,21 +163,48 @@ async def call_tool(
     auto_fail        = set(mode_approval.get("auto_fail", []))
     ask_user         = set(mode_approval.get("ask_user", []))
     auto_allow_paths = mode_approval.get("auto_allow", {}).get("paths", [])
+    if extra_auto_allow_paths:
+        auto_allow_paths = auto_allow_paths + extra_auto_allow_paths
     pre_approved     = set(approved_tools or [])
+
+    # Session-scoped deny lists (Phase 12.6) — consulted before mode-level gates.
+    state = None
+    if session_id:
+        try:
+            state = SessionState.load_or_create(session_id)
+        except Exception:
+            state = None
+    if state is not None:
+        denied = set(state.get("permissions.denied_tools", []) or [])
+        if method in denied:
+            _safe_log_approval(session_id, method, "auto_failed", {"reason": "denied_tools"})
+            return {"error": f"Tool '{method}' is on this session's denied_tools list."}
+        always_deny = state.get("permissions.always_deny_paths", []) or []
+        p_path = params.get("path") or params.get("destination") or params.get("source", "")
+        if p_path and any(str(p_path).startswith(prefix) for prefix in always_deny):
+            _safe_log_approval(session_id, method, "auto_failed",
+                               {"reason": "always_deny_paths", "path": str(p_path)})
+            return {"error": f"Path '{p_path}' is on this session's always_deny_paths list."}
 
     # Hard-block — no LLM or user approval can bypass this
     if method in auto_fail:
+        _safe_log_approval(session_id, method, "auto_failed", {"reason": "mode_auto_fail", "mode": mode})
         return {"error": f"Tool '{method}' is permanently blocked in {mode!r} mode by system policy."}
 
     # Ask-user gate — skip if pre-approved or if path is auto-allowed.
     # When approval is needed, POST to Discord and wait for the user's response.
     # call_tool() does NOT return until the tool has been approved+executed or denied.
-    if (method in ask_user
+    needs_ask = method in ask_user
+    if needs_ask and (method in pre_approved or _path_is_auto_allowed(method, params, auto_allow_paths)):
+        reason = "pre_approved" if method in pre_approved else "auto_allow_path"
+        _safe_log_approval(session_id, method, "auto_allowed", {"reason": reason})
+    if (needs_ask
             and method not in pre_approved
             and not _path_is_auto_allowed(method, params, auto_allow_paths)):
         approval_id = uuid4().hex[:12]
         event = asyncio.Event()
         _pending_approvals[approval_id] = {"event": event, "approved": False, "always": False}
+        _safe_log_approval(session_id, method, "requested", {"approval_id": approval_id, "mode": mode})
         try:
             await _discord_http.post(f"{DISCORD_URL}/discord/request_approval", json={
                 "tool": method, "params": params,
@@ -151,8 +217,12 @@ async def call_tool(
             await asyncio.wait_for(event.wait(), timeout=660)
         except asyncio.TimeoutError:
             _pending_approvals.pop(approval_id, None)
+            _safe_log_approval(session_id, method, "timeout", {"approval_id": approval_id})
             return {"error": f"Approval for '{method}' timed out."}
         result = _pending_approvals.pop(approval_id)
+        _safe_log_approval(session_id, method,
+                           "approved" if result["approved"] else "denied",
+                           {"always": bool(result.get("always")), "approval_id": approval_id})
         if not result["approved"]:
             return {"error": f"User declined to run '{method}'."}
         if result["always"] and approved_tools is not None:
@@ -163,13 +233,45 @@ async def call_tool(
         return {"config": get_config()}
 
     if method == "write_config":
+        from app.config_schema import ConfigPatchError
         try:
             return {"updated": True, "config": patch_config(params)}
+        except ConfigPatchError as e:
+            return {"error": str(e)}
         except Exception as e:
             return {"error": f"Config write failed: {e}"}
 
     if method == "run_agent":
         return await _run_agent_tool(params, session_id, spawnable_agents)
+
+    if method == "deliberate":
+        from app.debate import run_debate
+        result = await run_debate(
+            question=params.get("question", ""),
+            context=params.get("context", ""),
+            position_a=params.get("position_a", ""),
+            position_b=params.get("position_b", ""),
+            session_id=session_id,
+            debate_id=params.get("debate_id", ""),
+            max_exchanges=params.get("max_exchanges", 0),
+        )
+        if session_id and isinstance(result, dict) and result.get("debate_id"):
+            try:
+                dst = SessionState.load_or_create(session_id)
+                dst.set("debate_id", result["debate_id"])
+                dst.save()
+            except Exception:
+                pass
+        return result
+
+    if method == "ask_user":
+        from app.ask_user import ask_user_question
+        return await ask_user_question(
+            question=params.get("question", ""),
+            options=params.get("options", []),
+            context=params.get("context", ""),
+            session_id=session_id,
+        )
 
     timeout = SLOW_TIMEOUT_S if method in SLOW_TOOLS else FAST_TIMEOUT_S
     try:

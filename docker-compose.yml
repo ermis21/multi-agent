@@ -1,11 +1,11 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-Agent Backend (mab) — Production Stack
+# Phoebe (Multi-Agent Backend) — Production Stack
 #
 # Services:
-#   mab-api      Public API on port 8090. Orchestrates supervisor/worker loop.
+#   phoebe-api      Public API on port 8090. Orchestrates supervisor/worker loop.
 #                Calls llama-api on host port 8080 for LLM inference.
-#                Calls mab-sandbox for tool execution.
-#   mab-sandbox  Isolated MCP tool server (internal only, not exposed).
+#                Calls phoebe-sandbox for tool execution.
+#   phoebe-sandbox  Isolated MCP tool server (internal only, not exposed).
 #                Has Docker socket and full project mount for self-improvement.
 #
 # Usage:
@@ -26,16 +26,16 @@ secrets:
 services:
 
   # ── Notion MCP Server ─────────────────────────────────────────────────────
-  mab-notion:
+  phoebe-notion:
     build:
       context: ./notion
       dockerfile: Dockerfile
       network: host
-    container_name: mab-notion
+    container_name: phoebe-notion
     environment:
       NOTION_TOKEN: "${NOTION_TOKEN:-}"
     networks:
-      - mab-net
+      - phoebe-net
     healthcheck:
       test: ["CMD", "node", "-e", "require('net').createConnection(3000,'localhost').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
       interval: 10s
@@ -46,12 +46,12 @@ services:
     logging: *logging
 
   # ── Discord Bots ──────────────────────────────────────────────────────────
-  mab-discord:
+  phoebe-discord:
     build:
       context: ./discord
       dockerfile: Dockerfile
       network: host
-    container_name: mab-discord
+    container_name: phoebe-discord
     environment:
       DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
@@ -62,9 +62,16 @@ services:
       DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
       DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Gemma}"
       DISCORD_MAX_MESSAGE_LENGTH: "1900"
-      MAB_API_URL: "http://mab-vpn:8090"
+      PHOEBE_API_URL: "http://phoebe-vpn:8090"
+      # E2E scenario runner (optional; empty in production)
+      DISCORD_TEST_CHANNEL_ID: "${DISCORD_TEST_CHANNEL_ID:-}"
+      DISCORD_TEST_DRIVER_USER_ID: "${DISCORD_TEST_DRIVER_USER_ID:-}"
+      PHOEBE_ENABLE_TEXT_COMMANDS: "${PHOEBE_ENABLE_TEXT_COMMANDS:-}"
+      # "1" = keep scenario messages in the channel (default); "0" = delete bot
+      # messages after each scenario (CI-style).
+      PHOEBE_E2E_PERSIST_MESSAGES: "${PHOEBE_E2E_PERSIST_MESSAGES:-1}"
     networks:
-      - mab-net
+      - phoebe-net
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
       interval: 10s
@@ -74,26 +81,38 @@ services:
     volumes:
       # Persistent bot state — session IDs and user modes survive container restarts
       - ./discord_state:/app/state
+      # E2E scenario runner — mounted read-only so `make e2e` works without rebuild
+      - ./discord/e2e_scenarios.py:/app/e2e_scenarios.py:ro
+      # E2E scenarios need to write a probe SKILL.md to exercise skill-discovery
+      - ./workspace:/workspace
+      # Session state files — read-only hydration source for bot on startup
+      - ./sessions:/sessions:ro
+      # Source mounts so bot_worker/bot_config/bot_mod edits don't require a rebuild
+      - ./discord/bot_worker.py:/app/bot_worker.py
+      - ./discord/bot_config.py:/app/bot_config.py
+      - ./discord/bot_mod.py:/app/bot_mod.py
+      - ./discord/main.py:/app/main.py
+      - ./discord/utils.py:/app/utils.py
     restart: unless-stopped
     logging: *logging
     depends_on:
-      mab-api:
+      phoebe-api:
         condition: service_healthy
 
   # ── OpenVPN Sidecar ───────────────────────────────────────────────────────
-  # mab-api and mab-sandbox share this container's network namespace via
-  # network_mode: service:mab-vpn, inheriting the tunnel routes automatically.
-  mab-vpn:
+  # phoebe-api and phoebe-sandbox share this container's network namespace via
+  # network_mode: service:phoebe-vpn, inheriting the tunnel routes automatically.
+  phoebe-vpn:
     build:
       context: ./vpn
       dockerfile: Dockerfile
       network: host
-    container_name: mab-vpn
+    container_name: phoebe-vpn
     cap_add: [NET_ADMIN]
     devices: [/dev/net/tun:/dev/net/tun]
     secrets: [openvpn_config]
     networks:
-      - mab-net
+      - phoebe-net
       - llama-api_default
     ports:
       - "8090:8090"
@@ -109,13 +128,13 @@ services:
     logging: *logging
 
   # ── Isolated MCP Tool Sandbox ──────────────────────────────────────────────
-  # Start sandbox first; mab-api depends on it being healthy.
-  mab-sandbox:
+  # Start sandbox first; phoebe-api depends on it being healthy.
+  phoebe-sandbox:
     build:
       context: .
       dockerfile: Dockerfile
       network: host
-    container_name: mab-sandbox
+    container_name: phoebe-sandbox
     command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
     environment:
       WORKSPACE_DIR: "/workspace"
@@ -123,9 +142,9 @@ services:
       MEMPALACE_HOME: "/mempalace"
       PROMPTS_DIR: "/app/prompts"
       EXA_API_KEY: "${EXA_API_KEY:-}"
-      NOTION_URL: "http://mab-notion:3000"
+      NOTION_URL: "http://phoebe-notion:3000"
       NOTION_TOKEN: "${NOTION_TOKEN:-}"
-      DISCORD_URL: "http://mab-discord:4000"
+      DISCORD_URL: "http://phoebe-discord:4000"
       DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
       LLAMA_URL: "http://llama-api-manager:8081"
@@ -141,7 +160,7 @@ services:
       - ./prompts:/app/prompts
       # MemPalace persistent ChromaDB storage
       - ./mempalace:/mempalace
-    network_mode: "service:mab-vpn"
+    network_mode: "service:phoebe-vpn"
     # No ports: section — not exposed to host, internal network only
     mem_limit: 1g
     security_opt:
@@ -155,25 +174,27 @@ services:
     restart: unless-stopped
     logging: *logging
     depends_on:
-      mab-vpn:
+      phoebe-vpn:
         condition: service_healthy
 
   # ── Orchestration API ──────────────────────────────────────────────────────
-  mab-api:
+  phoebe-api:
     build:
       context: .
       dockerfile: Dockerfile
       network: host
-    container_name: mab-api
+    container_name: phoebe-api
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090", "--reload"]
     environment:
       # LLM inference endpoint (existing llama-api on host)
       LLAMA_URL: "http://llama-api-manager:8081"
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
-      # mab-sandbox shares this container's network namespace (via mab-vpn),
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      GLM_API_KEY: "${GLM_API_KEY:-}"
+      # phoebe-sandbox shares this container's network namespace (via phoebe-vpn),
       # so it is reachable on localhost rather than by hostname.
       SANDBOX_URL: "http://localhost:9000"
-      DISCORD_URL: "http://mab-discord:4000"
+      DISCORD_URL: "http://phoebe-discord:4000"
       # Path overrides (these paths are inside the container)
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
@@ -189,9 +210,12 @@ services:
       - ./config:/app/config
       - ./prompts:/app/prompts
       - ./app:/app/app
+      # Tests (pure-unit runnable inside the container via `make test-fast`)
+      - ./test:/app/test
+      - ./pytest.ini:/app/pytest.ini:ro
       # Claude Code OAuth credentials — read-only, for Anthropic provider auth
       - /home/homelab/.claude/.credentials.json:/app/.claude_credentials.json:ro
-    network_mode: "service:mab-vpn"
+    network_mode: "service:phoebe-vpn"
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8090/health"]
       interval: 10s
@@ -201,13 +225,13 @@ services:
     restart: unless-stopped
     logging: *logging
     depends_on:
-      mab-vpn:
+      phoebe-vpn:
         condition: service_healthy
-      mab-sandbox:
+      phoebe-sandbox:
         condition: service_healthy
 
 networks:
-  mab-net:
+  phoebe-net:
     driver: bridge
   llama-api_default:
     external: true

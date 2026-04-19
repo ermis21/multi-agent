@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-Agent Backend — Agent Role Configuration
+# Phoebe (Multi-Agent Backend) — Agent Role Configuration
 #
 # Defines permissions and behaviour for each agent role.
 # Roles: worker, supervisor, soul_updater, config_agent, improvement_agent
@@ -37,9 +37,12 @@ worker:
     - discord_set_nickname
     - discord_edit_channel
     - tts_speak
+    - diagnostic_check
     - read_config
     - write_config
     - run_agent
+    - deliberate
+    - ask_user
 
   # Roles this agent can spawn as sub-agents via run_agent.
   spawnable_agents:

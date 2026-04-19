@@ -1,5 +1,5 @@
 """
-Evaluation script for mab-api.
+Evaluation script for phoebe-api.
 
 Loads eval pairs from fixtures/eval_pairs.json, sends each question to the API,
 and scores responses based on expected topic coverage.

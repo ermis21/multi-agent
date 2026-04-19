@@ -1,8 +1,9 @@
 """
-JSONL session logger — mirrors the llama-api/manager pattern.
+JSONL session logger.
 
-Each session is stored as {sessions_dir}/{session_id}.jsonl.
-Each line in the file is one turn (JSON object).
+Each session lives in its own directory: `{sessions_dir}/{session_id}/turns.jsonl`.
+Each line in `turns.jsonl` is one turn (JSON object). Sidecars (state.json,
+approvals.jsonl, tool_errors.jsonl, active.jsonl) live beside it.
 """
 
 import json
@@ -13,11 +14,19 @@ from pathlib import Path
 SESSIONS_DIR = Path(os.environ.get("SESSIONS_DIR", "/sessions"))
 
 
+def _session_dir(session_id: str) -> Path:
+    return SESSIONS_DIR / session_id
+
+
+def _turns_path(session_id: str) -> Path:
+    return _session_dir(session_id) / "turns.jsonl"
+
+
 class SessionLogger:
     def __init__(self, session_id: str):
         self.session_id = session_id
-        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        self.path = SESSIONS_DIR / f"{session_id}.jsonl"
+        _session_dir(session_id).mkdir(parents=True, exist_ok=True)
+        self.path = _turns_path(session_id)
 
     def log_turn(
         self,
@@ -46,7 +55,7 @@ def list_sessions() -> list[dict]:
     """Return summary of all sessions (id + turn count + last timestamp)."""
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     result = []
-    for p in sorted(SESSIONS_DIR.glob("*.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
+    for p in sorted(SESSIONS_DIR.glob("*/turns.jsonl"), key=lambda x: x.stat().st_mtime, reverse=True):
         lines = p.read_text(encoding="utf-8").strip().splitlines()
         last_ts = ""
         if lines:
@@ -55,7 +64,7 @@ def list_sessions() -> list[dict]:
             except json.JSONDecodeError:
                 pass
         result.append({
-            "session_id": p.stem,
+            "session_id": p.parent.name,
             "turns":      len(lines),
             "last_turn":  last_ts,
             "size_bytes": p.stat().st_size,
@@ -65,7 +74,7 @@ def list_sessions() -> list[dict]:
 
 def get_session(session_id: str) -> list[dict]:
     """Return all turns for a session."""
-    path = SESSIONS_DIR / f"{session_id}.jsonl"
+    path = _turns_path(session_id)
     if not path.exists():
         return []
     turns = []

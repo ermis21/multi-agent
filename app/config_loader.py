@@ -42,10 +42,16 @@ def patch_config(patch: dict) -> dict:
     Accepts both nested dicts and dotted-key notation:
       {"tools": {"discord": {"default_channel_id": "x"}}}
       {"tools.discord.default_channel_id": "x"}   ← expanded automatically
+
+    The merged result is validated against RootConfig before the file is
+    written — schema drift raises ConfigPatchError and the file is left
+    untouched.
     """
-    cfg = yaml.safe_load(CONFIG_PATH.read_text())
-    _deep_merge(cfg, _expand_dotted_keys(patch))
-    CONFIG_PATH.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False, allow_unicode=True))
+    from app.config_schema import validate_patch  # lazy — avoids import cycle on module load
+
+    current = yaml.safe_load(CONFIG_PATH.read_text()) or {}
+    merged = validate_patch(current, patch)  # raises ConfigPatchError on drift
+    CONFIG_PATH.write_text(yaml.dump(merged, default_flow_style=False, sort_keys=False, allow_unicode=True))
     get_config._cache[0] = 0.0  # invalidate cache
     return get_config()
 
@@ -57,7 +63,7 @@ def _expand_dotted_keys(patch: dict) -> dict:
     """
     expanded: dict = {}
     for key, value in patch.items():
-        if "." in key:
+        if isinstance(key, str) and "." in key:
             parts = key.split(".")
             node = expanded
             for part in parts[:-1]:

@@ -34,14 +34,14 @@ async def on_ready():
         guild = client.get_guild(GUILD_ID) or await client.fetch_guild(GUILD_ID)
         # Ensure the config bot's channel exists — previously the config bot tried
         # to create this itself but lacked Manage Channels.
-        ch = discord.utils.get(guild.text_channels, name="mab-config")
+        ch = discord.utils.get(guild.text_channels, name="phoebe-config")
         if ch is None:
             ch = await guild.create_text_channel(
-                "mab-config", topic="Multi-agent config assistant"
+                "phoebe-config", topic="Multi-agent config assistant"
             )
-            print(f"[mod-bot] created #mab-config ({ch.id})", flush=True)
+            print(f"[mod-bot] created #phoebe-config ({ch.id})", flush=True)
         else:
-            print(f"[mod-bot] found #mab-config ({ch.id})", flush=True)
+            print(f"[mod-bot] found #phoebe-config ({ch.id})", flush=True)
     except Exception as e:
         print(f"[mod-bot] channel setup failed: {e}", flush=True)
 

@@ -150,7 +150,7 @@ Search the web via Exa. Returns titles, URLs, and highlight snippets.
 
     "web_fetch": """\
 ### web_fetch
-Fetch and extract the readable text from a URL. Returns up to 8000 chars.
+Fetch and extract the readable text from a URL. Returns `{url, status, text}` — `status` is the HTTP status code (e.g. 200), `text` is the extracted body (≤ 8000 chars).
 <|tool_call|>call: web_fetch, {"url": "https://example.com/article"}<|tool_call|>""",
 
     "memory_add": """\
@@ -256,6 +256,50 @@ and cannot see your conversation. Give it a self-contained task with all needed 
 - `role` (required): agent from the "Available sub-agents" list.
 - `task` (required): complete instruction with file paths, constraints, expected outcome.
 The sub-agent's final response is returned as the tool result.""",
+
+    "deliberate": """\
+### deliberate
+Run a structured debate between two positions to resolve a genuine decision.
+Two advocates argue point-by-point in short (1-2 sentence) exchanges.
+After 4 messages, YOU receive the full transcript and decide which side wins.
+You can continue the debate for more rounds or accept a side.
+
+When to use:
+- Two plausible approaches and you're genuinely unsure which is better
+- A choice that would be costly to reverse
+- Tradeoffs you're not sure how to weigh
+
+Do NOT use for trivial decisions, obvious choices, or questions the user should answer.
+
+Frame positions as STRONG, SPECIFIC arguments — not wishy-washy hedges.
+
+**New debate:**
+<|tool_call|>call: deliberate, {"question": "Regex vs AST for extracting function signatures?", "context": "Python files, well-formatted, 50-500 lines each. Need name + params + return type.", "position_a": "Regex: simpler, fast, sufficient for well-formatted code", "position_b": "AST: handles edge cases like decorators, multiline signatures, nested functions"}<|tool_call|>
+
+**Continue a debate** (if status was "active" and you want more rounds):
+<|tool_call|>call: deliberate, {"debate_id": "debate_abc12345", "question": "", "context": "", "position_a": "", "position_b": "", "max_exchanges": 4}<|tool_call|>
+
+You receive both the transcript AND an independent judge's verdict.
+Then you decide:
+- Accept the judge's verdict -> proceed with the winning approach
+- Continue -> call deliberate again with the debate_id for more rounds
+- Override the judge -> if you have context the advocates/judge didn't (explain why)
+
+Result includes: transcript, positions, concessions, judge_winner, judge_reason, judge_confidence.""",
+
+    "ask_user": """\
+### ask_user
+Ask the user a multiple-choice clarification question. 2-5 options.
+The system may answer on the user's behalf if the answer is obvious from context.
+
+Use when:
+- The user's intent is ambiguous (could mean A or B)
+- You need a preference only the user can provide
+- The choice depends on context you don't have
+
+Do NOT ask questions you can answer by reading files, searching memory, or investigating.
+
+<|tool_call|>call: ask_user, {"question": "Which database should I configure?", "options": ["PostgreSQL (recommended for production)", "SQLite (simpler, for development)", "Keep current setup"], "context": "User asked to set up the database. Workspace has both pg and sqlite configs."}<|tool_call|>""",
 }
 
 
@@ -310,45 +354,155 @@ def _build_tool_block(allowed_tools: list[str]) -> str:
 
 
 def _build_skills_block(spawnable_agents: list[str], agents_cfg: dict) -> str:
-    """Build the {{SKILLS}} block listing available sub-agents."""
-    if not spawnable_agents:
-        return ""
-    rows = []
-    for role in spawnable_agents:
-        desc = agents_cfg.get(role, {}).get("description", "")
-        rows.append(f"| `{role}` | {desc} |")
-    table = "| Agent | What it does |\n|-------|-------------|\n" + "\n".join(rows)
-    return (
-        "## Available sub-agents\n\n"
-        "You can delegate work to specialized agents using the `run_agent` tool.\n"
-        "Each sub-agent runs independently with its own tools — it cannot see your conversation.\n"
-        "Give it a **self-contained** task with all file paths, context, and constraints it needs.\n\n"
-        f"{table}\n"
-    )
+    """Build the {{SKILLS}} block listing available sub-agents and skill playbooks."""
+    parts: list[str] = []
+    if spawnable_agents:
+        rows = []
+        for role in spawnable_agents:
+            desc = agents_cfg.get(role, {}).get("description", "")
+            rows.append(f"| `{role}` | {desc} |")
+        table = "| Agent | What it does |\n|-------|-------------|\n" + "\n".join(rows)
+        parts.append(
+            "## Available sub-agents\n\n"
+            "You can delegate work to specialized agents using the `run_agent` tool.\n"
+            "Each sub-agent runs independently with its own tools — it cannot see your conversation.\n"
+            "Give it a **self-contained** task with all file paths, context, and constraints it needs.\n\n"
+            f"{table}\n"
+        )
+
+    skills = _discover_skills()
+    if skills:
+        rows = []
+        for s in skills:
+            trig = s.get("when", "").strip().replace("\n", " ")
+            if len(trig) > 90:
+                trig = trig[:89] + "…"
+            rows.append(f"| `{s['name']}` | {trig or '_(no trigger listed)_'} | `{s['path']}` |")
+        table = "| Skill | Trigger | Path |\n|-------|---------|------|\n" + "\n".join(rows)
+        parts.append(
+            "## Available skill playbooks\n\n"
+            "These are procedures saved under `workspace/skills/*/SKILL.md`.\n"
+            "Read the full file with `file_read` when the trigger matches what you're doing.\n\n"
+            f"{table}\n"
+        )
+
+    return "\n".join(parts)
 
 
-def _load_base_template(role: str, mode: str) -> str:
+# ── Skill discovery ───────────────────────────────────────────────────────────
+# Cached by mtime of the skills directory (cheap scan; only re-parse on change).
+_SKILLS_CACHE: dict = {"mtime": 0.0, "entries": []}
+
+
+def _discover_skills() -> list[dict]:
+    """Scan workspace/skills/*/SKILL.md and return a list of skill metadata dicts.
+
+    Each SKILL.md may start with YAML frontmatter:
+        ---
+        name: log-triage
+        description: One-line summary
+        when-to-trigger: When the user asks about error logs
+        ---
+    Fields we extract: name (fallback: directory name), description, when (trigger line).
     """
-    Load the appropriate base template.
-    Falls back to the full template if the concise one doesn't exist.
+    skills_root = WORKSPACE / "skills"
+    try:
+        mtime = skills_root.stat().st_mtime
+    except FileNotFoundError:
+        _SKILLS_CACHE["mtime"] = 0.0
+        _SKILLS_CACHE["entries"] = []
+        return []
+    if mtime == _SKILLS_CACHE["mtime"]:
+        return _SKILLS_CACHE["entries"]
+
+    entries: list[dict] = []
+    for skill_md in sorted(skills_root.glob("*/SKILL.md")):
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        meta = _parse_frontmatter(text)
+        name = meta.get("name") or skill_md.parent.name
+        when = (
+            meta.get("when-to-trigger")
+            or meta.get("when_to_trigger")
+            or meta.get("description")
+            or ""
+        )
+        rel_path = f"workspace/skills/{skill_md.parent.name}/SKILL.md"
+        entries.append({"name": name, "when": when, "path": rel_path})
+
+    _SKILLS_CACHE["mtime"] = mtime
+    _SKILLS_CACHE["entries"] = entries
+    return entries
+
+
+def _parse_frontmatter(text: str) -> dict:
+    """Minimal `key: value` YAML frontmatter parser — avoids a yaml dependency here."""
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    block = text[3:end].strip()
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        line = line.rstrip()
+        if not line or ":" not in line or line.lstrip().startswith("#"):
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip().lower()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            out[key] = value
+    return out
+
+
+def _load_base_template(role: str, mode: str, agent_mode: str = "") -> str:
     """
-    # soul_updater and config_agent have their own dedicated templates
+    Load the appropriate base template with 3-tier fallback for agent_mode.
+
+    For worker/supervisor roles when agent_mode is set (plan/build/converse):
+      1. {role}_{agent_mode}_{mode}.md  (e.g. worker_plan_concise.md)
+      2. {role}_{agent_mode}.md         (e.g. worker_plan.md)
+      3. {role}_{mode}.md               (e.g. worker_full.md — existing fallback)
+
+    Dedicated roles (soul_updater, coding_agent, etc.) skip this and use {role}.md.
+    """
+    base = PROMPTS_DIR / "base"
+
+    # Dedicated roles have their own single template — no mode variants
     if role in ("soul_updater", "config_agent", "improvement_agent", "discord_moderator",
                 "agent_spawner", "session_compactor", "cron_creator", "research_agent",
                 "coding_agent", "tool_builder", "skill_builder",
                 "webfetch_summarizer", "prompt_suggester"):
         filename = f"{role}.md"
-    else:
-        filename = f"{role}_{mode}.md"
+        path = base / filename
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        raise FileNotFoundError(f"No prompt template found for role={role!r} at {path}")
 
-    path = PROMPTS_DIR / "base" / filename
-    if not path.exists():
-        # Fallback: try the full variant
-        fallback = PROMPTS_DIR / "base" / f"{role}_full.md"
-        if fallback.exists():
-            return fallback.read_text(encoding="utf-8")
-        raise FileNotFoundError(f"No prompt template found for role={role!r} mode={mode!r} at {path}")
-    return path.read_text(encoding="utf-8")
+    # 3-tier fallback for worker/supervisor with agent_mode
+    if agent_mode and role in ("worker", "supervisor"):
+        # Tier 1: role_agentmode_promptmode (e.g. worker_plan_concise.md)
+        tier1 = base / f"{role}_{agent_mode}_{mode}.md"
+        if tier1.exists():
+            return tier1.read_text(encoding="utf-8")
+        # Tier 2: role_agentmode (e.g. worker_plan.md)
+        tier2 = base / f"{role}_{agent_mode}.md"
+        if tier2.exists():
+            return tier2.read_text(encoding="utf-8")
+
+    # Tier 3 / default: role_promptmode (e.g. worker_full.md)
+    path = base / f"{role}_{mode}.md"
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+
+    # Final fallback: try the full variant
+    fallback = base / f"{role}_full.md"
+    if fallback.exists():
+        return fallback.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"No prompt template found for role={role!r} mode={mode!r} agent_mode={agent_mode!r}")
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -375,13 +529,24 @@ def generate(
 
     agent_id = f"{role}_{session_id[:8]}_{attempt}_{uuid.uuid4().hex[:6]}"
 
-    template = _load_base_template(role, mode)
+    template = _load_base_template(role, mode, agent_mode=agent_mode)
 
     # Build substitution map
     soul_max = cfg["soul"]["max_chars"]
     agents_cfg = get_agents_config()
     role_cfg = agents_cfg.get(role, {})
     spawnable = role_cfg.get("spawnable_agents", [])
+
+    # Mirror the discovered skill catalog onto session state (skills.active).
+    if session_id:
+        try:
+            from app.session_state import SessionState
+            _st = SessionState.load_or_create(session_id)
+            _st.set("skills.active", [s["name"] for s in _discover_skills()])
+            _st.save()
+        except Exception:
+            pass
+
     subs = {
         "{{SOUL}}":          _read_workspace("SOUL.md",     max_chars),
         "{{USER}}":          _read_workspace("USER.md",     max_chars),
@@ -398,7 +563,11 @@ def generate(
         "{{THRESHOLD}}":     str(cfg["agent"]["supervisor_pass_threshold"]),
         "{{SOUL_MAX_CHARS}}": str(soul_max),
         "{{MODE}}":          mode,
-        "{{AGENT_MODE}}":       "",   # overridden via extra= when a mode is active
+        "{{AGENT_MODE}}":           "",   # overridden via extra= when a mode is active
+        "{{PLAN_CONTEXT}}":         "",   # overridden via extra= when a plan is active
+        "{{SUPERVISOR_HANDLER}}":   "",   # empty by default; injected via extra= on retries
+        "{{PLAN_CONTEXT_SECTION}}": "",   # empty by default; injected via extra= in build mode
+        "{{TOOL_TRACES}}":          "(no tools were called)",  # default; overridden via extra=
         "{{APPROVAL_CONTEXT}}": _build_approval_context(cfg, allowed_tools, agent_mode),
         **(extra or {}),
     }

@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs soul-update test-up test-down config-agent test eval test-full doctor
+.PHONY: up down build restart logs soul-update test-up test-down config-agent test eval test-full doctor e2e e2e-one
 
 # ── Production stack ─────────────────────────────────────────────────────────
 
@@ -12,16 +12,16 @@ down:
 	docker compose down
 
 restart:
-	docker compose restart mab-api
+	docker compose restart phoebe-api
 
 logs:
 	docker compose logs -f
 
 logs-api:
-	docker compose logs -f mab-api
+	docker compose logs -f phoebe-api
 
 logs-sandbox:
-	docker compose logs -f mab-sandbox
+	docker compose logs -f phoebe-sandbox
 
 status:
 	docker compose ps
@@ -66,13 +66,34 @@ test-health:
 
 # ── Tests & eval ─────────────────────────────────────────────────────────────
 
-test:
-	pytest test/ -v
+# Pure-unit tests: no stack dependencies. Runs inside phoebe-api so deps are available.
+# Default 'test' target runs these — fast, always safe.
+test-fast:
+	docker exec phoebe-api pytest /app/test -m "not live"
+
+# Integration tests: require the full stack at PHOEBE_URL (default http://localhost:8090).
+test-integration:
+	PHOEBE_LIVE=1 docker exec -e PHOEBE_LIVE=1 -e PHOEBE_URL=$${PHOEBE_URL:-http://localhost:8090} phoebe-api pytest /app/test -m live
+
+# Default: fast tests only. Use `make test-integration` for live E2E coverage.
+test: test-fast
 
 eval:
 	python test/eval.py
 
-test-full: up test eval
+test-full: up test-fast test-integration eval
+
+# ── Discord end-to-end scenarios ─────────────────────────────────────────────
+# Drives the worker bot from the config bot. Requires:
+#   DISCORD_TEST_CHANNEL_ID, DISCORD_TEST_DRIVER_USER_ID, PHOEBE_ENABLE_TEXT_COMMANDS=1
+# set in the phoebe-discord container's environment.
+
+e2e:
+	docker exec phoebe-discord python /app/e2e_scenarios.py
+
+e2e-one:
+	@if [ -z "$(SCENARIO)" ]; then echo "usage: make e2e-one SCENARIO=<name>"; exit 2; fi
+	docker exec phoebe-discord python /app/e2e_scenarios.py --scenario $(SCENARIO)
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────
 

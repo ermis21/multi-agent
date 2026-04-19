@@ -115,7 +115,7 @@ def _get_bot_client(bot: str) -> discord.Client:
     return bot_config.client
 
 
-app = FastAPI(title="mab-discord", lifespan=lifespan, docs_url=None, redoc_url=None)
+app = FastAPI(title="phoebe-discord", lifespan=lifespan, docs_url=None, redoc_url=None)
 
 
 # ── Request models ──────────────────────────────────────────────────────────
@@ -176,6 +176,62 @@ class SpeakVoiceRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/discord/in_flight")
+async def channel_in_flight(channel_id: int):
+    """Authoritative bot-side readiness check for a channel.
+
+    Returns {"in_flight": bool, "session_id": str|None}. The bot clears
+    `_channel_in_flight` only after the SSE stream finishes rendering, which
+    is strictly after the api clears `_active_sessions` — so this endpoint is
+    the correct signal for e2e scenarios to gate on before starting a new run.
+    """
+    sid = bot_worker._channel_in_flight.get(channel_id)
+    return {"in_flight": sid is not None, "session_id": sid}
+
+
+@app.post("/discord/channel_reset")
+async def channel_reset(channel_id: int):
+    """Escape hatch: forcibly clear a channel's in-flight flag.
+
+    Used by the e2e runner when `wait_for_idle` times out. Also cancels any
+    thinking indicator tied to the stale session."""
+    sid = bot_worker._channel_in_flight.pop(channel_id, None)
+    if sid:
+        bot_worker._stop_thinking(sid)
+    return {"cleared": sid is not None, "session_id": sid}
+
+
+@app.post("/discord/session_reset")
+async def session_reset(channel_id: int, user_id: int | None = None):
+    """Rotate the session id for a channel — no prior conversation history will
+    be replayed into the next message. Used by the e2e runner before each
+    scenario to prevent context bleed (stale write_config tool-calls from prior
+    runs were the load-bearing cause)."""
+    return bot_worker.reset_channel_session(channel_id, user_id)
+
+
+class PurgeRequest(BaseModel):
+    channel_id: int
+    bot: str = "mod"
+
+
+@app.post("/discord/purge_channel")
+async def purge_channel(req: PurgeRequest):
+    """Delete every message in the channel that the requesting bot can reach.
+
+    Used by the e2e runner at startup to clear leftover state from prior runs.
+    Uses the mod bot by default (has Manage Messages). Caps at 1000 messages
+    to avoid pathological loops."""
+    bot_client = _get_bot_client(req.bot)
+    try:
+        channel = bot_client.get_channel(req.channel_id) or \
+                  await bot_client.fetch_channel(req.channel_id)
+        deleted = await channel.purge(limit=1000)
+        return {"ok": True, "deleted": len(deleted)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 @app.post("/discord/send")
@@ -318,9 +374,44 @@ async def create_category(req: CreateCategoryRequest):
         return {"ok": False, "error": str(e)}
 
 
+class AskQuestionRequest(BaseModel):
+    question:    str
+    options:     list[str]
+    question_id: str
+    session_id:  str
+
+
+@app.post("/discord/ask_question")
+async def ask_question(req: AskQuestionRequest):
+    """Post a multiple-choice question to the user's Discord channel."""
+    channel_id = bot_worker.get_channel_for_session(req.session_id)
+    if channel_id is None:
+        return {"ok": False, "error": "No channel for session"}
+    channel = bot_worker.client.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await bot_worker.client.fetch_channel(channel_id)
+        except Exception:
+            return {"ok": False, "error": f"Cannot fetch channel {channel_id}"}
+
+    view = bot_worker.QuestionView(req.question_id, req.options, req.session_id)
+    embed = discord.Embed(
+        title="Clarification needed",
+        description=req.question,
+        color=0x5865F2,
+    )
+    letters = "ABCDE"
+    for i, opt in enumerate(req.options):
+        embed.add_field(name=f"{letters[i]}", value=opt, inline=False)
+
+    await channel.send(embed=embed, view=view)
+    bot_worker._stop_thinking(req.session_id)
+    return {"ok": True}
+
+
 @app.post("/discord/request_approval")
 async def request_approval(req: ApprovalRequest):
-    """Called by mab-api when a tool needs user approval. Shows buttons in Discord."""
+    """Called by phoebe-api when a tool needs user approval. Shows buttons in Discord."""
     channel_id = bot_worker.get_channel_for_session(req.session_id)
     if channel_id is None:
         return {"ok": False, "error": "No channel for session"}

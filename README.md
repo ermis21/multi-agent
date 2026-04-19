@@ -1,6 +1,6 @@
-# mab — Multi-Agent Backend
+# Phoebe — Multi-Agent Backend
 
-A production-grade multi-agent orchestration system built on FastAPI and llama.cpp. Implements a **supervisor/worker loop** where worker agents complete tasks and a supervisor grades responses before they are returned. Supports multiple specialized agent roles, persistent memory, and integrations with Discord, Notion, and Exa web search.
+Phoebe is a production-grade multi-agent orchestration system built on FastAPI and llama.cpp. Implements a **supervisor/worker loop** where worker agents complete tasks and a supervisor grades responses before they are returned. Supports multiple specialized agent roles, persistent memory, and integrations with Discord, Notion, and Exa web search.
 
 ---
 
@@ -8,14 +8,14 @@ A production-grade multi-agent orchestration system built on FastAPI and llama.c
 
 ```
                          ┌─────────────────────┐
-  OpenAI-compatible ───► │   mab-api  :8090     │
+  OpenAI-compatible ───► │   phoebe-api  :8090     │
   /v1/chat/completions   │  (FastAPI, uvicorn)  │
                          └──────┬──────┬────────┘
                                 │      │
               ┌─────────────────┘      └──────────────────┐
               ▼                                            ▼
   ┌───────────────────────┐               ┌───────────────────────┐
-  │  mab-sandbox  :9000   │               │  mab-discord  :4000   │
+  │  phoebe-sandbox  :9000   │               │  phoebe-discord  :4000   │
   │ (MCP tool server,     │               │  (Discord bot gateway,│
   │  Docker socket,       │               │   3 bot tokens)       │
   │  ChromaDB memory)     │               └───────────────────────┘
@@ -23,12 +23,12 @@ A production-grade multi-agent orchestration system built on FastAPI and llama.c
               │
               ▼
   ┌───────────────────────┐
-  │  mab-notion   :3000   │
+  │  phoebe-notion   :3000   │
   │  (Notion MCP server)  │
   └───────────────────────┘
 ```
 
-All services communicate over the `mab-net` Docker bridge network. `mab-api` reaches the host's llama.cpp instance via `host.docker.internal:8080`.
+All services communicate over the `phoebe-net` Docker bridge network. `phoebe-api` reaches the host's llama.cpp instance via `host.docker.internal:8080`.
 
 ---
 
@@ -65,10 +65,10 @@ make doctor      # Full subsystem diagnostics
 | `make up` | Start all services (`docker compose up -d`) |
 | `make build` | Rebuild images from scratch (no cache) |
 | `make down` | Stop and remove containers |
-| `make restart` | Restart `mab-api` only |
+| `make restart` | Restart `phoebe-api` only |
 | `make logs` | Stream all service logs |
-| `make logs-api` | Stream `mab-api` logs |
-| `make logs-sandbox` | Stream `mab-sandbox` logs |
+| `make logs-api` | Stream `phoebe-api` logs |
+| `make logs-sandbox` | Stream `phoebe-sandbox` logs |
 | `make status` | Show container status |
 
 ### Interaction
@@ -214,7 +214,7 @@ Persistent agent identity and memory live in `workspace/`:
 
 ## Scheduled Jobs
 
-Two cron jobs start automatically with `mab-api`:
+Two cron jobs start automatically with `phoebe-api`:
 
 | Job | Schedule | Description |
 |---|---|---|

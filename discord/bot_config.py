@@ -1,9 +1,9 @@
 """
-Config Discord bot — routes messages to the mab-api config agent.
+Config Discord bot — routes messages to the phoebe-api config agent.
 Used for guided configuration via Discord channels.
 
 Slash commands: /help, /status
-Auto-creates #mab-config channel on startup if it doesn't exist.
+Auto-creates #phoebe-config channel on startup if it doesn't exist.
 """
 
 import os
@@ -14,7 +14,7 @@ import httpx
 
 from utils import is_allowed, split_message
 
-MAB_API_URL  = os.environ.get("MAB_API_URL", "http://mab-api:8090")
+PHOEBE_API_URL  = os.environ.get("PHOEBE_API_URL", "http://phoebe-api:8090")
 CONFIG_TOKEN = os.environ.get("DISCORD_TOKEN_CONFIG", "")
 GUILD_ID     = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 
@@ -39,7 +39,7 @@ async def cmd_status(interaction: discord.Interaction):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
     try:
-        resp = await _http.get(f"{MAB_API_URL}/config")
+        resp = await _http.get(f"{PHOEBE_API_URL}/config")
         resp.raise_for_status()
         cfg   = resp.json()
         llm   = cfg.get("llm", {})
@@ -80,12 +80,12 @@ async def on_ready():
         try:
             guild = client.get_guild(GUILD_ID) or await client.fetch_guild(GUILD_ID)
             # Channel creation is handled by mod-bot; just find the existing channel.
-            ch = discord.utils.get(guild.text_channels, name="mab-config")
+            ch = discord.utils.get(guild.text_channels, name="phoebe-config")
             if ch:
                 CONFIG_CHANNEL_IDS.add(ch.id)
                 print(f"[config-bot] listening on #{ch.name} ({ch.id})", flush=True)
             else:
-                print("[config-bot] #mab-config not found yet — mod-bot will create it", flush=True)
+                print("[config-bot] #phoebe-config not found yet — mod-bot will create it", flush=True)
         except Exception as e:
             print(f"[config-bot] channel lookup failed: {e}", flush=True)
         try:
@@ -111,7 +111,7 @@ async def on_message(msg: discord.Message):
     async with msg.channel.typing():
         try:
             resp = await _http.post(
-                f"{MAB_API_URL}/config/agent",
+                f"{PHOEBE_API_URL}/config/agent",
                 json={
                     "messages":   [{"role": "user", "content": msg.content}],
                     "session_id": session_id,
