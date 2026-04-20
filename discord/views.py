@@ -58,15 +58,35 @@ class CallbackApprovalView(discord.ui.View):
 
     async def _respond(self, interaction: discord.Interaction, approved: bool, always: bool = False) -> None:
         import bot_worker as bw
-        await interaction.response.defer()
 
-        channel = self.message.channel if self.message else None
+        channel = interaction.channel or (self.message.channel if self.message else None)
 
-        if self.message:
-            try:
-                await self.message.delete()
-            except Exception:
-                pass
+        # Disable buttons + annotate the original embed so the user sees an
+        # immediate, persistent record of the decision. Replaces the old
+        # delete-and-pray pattern that left the channel silent for minutes.
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if approved and always:
+            status = f"🔒 Always allowing `{self.tool}` in this session — resuming..."
+        elif approved:
+            status = f"✅ Approved `{self.tool}` — resuming..."
+        else:
+            status = f"❌ Denied `{self.tool}` — worker will continue."
+        try:
+            await interaction.response.edit_message(content=status, embed=None, view=self)
+        except Exception:
+            if self.message:
+                try:
+                    await self.message.edit(content=status, embed=None, view=self)
+                except Exception:
+                    pass
+
+        # Guarantee the thinking indicator is active before the HTTP round-trip
+        # so the user sees continuous "bot is working" feedback. _start_thinking
+        # is idempotent if the indicator is still running from the pre-approval
+        # stream.
+        if approved and channel:
+            bw._start_thinking(self.session_id, channel)
 
         if always:
             bw._session_always_allow.setdefault(self.session_id, set()).add(self.tool)
@@ -79,11 +99,8 @@ class CallbackApprovalView(discord.ui.View):
                 "always": always,
             })
             resp.raise_for_status()
-        except Exception:
-            pass
-
-        if approved and channel:
-            bw._start_thinking(self.session_id, channel)
+        except Exception as e:
+            print(f"[approval] response failed: {e}", flush=True)
 
     async def on_timeout(self) -> None:
         import bot_worker as bw

@@ -1260,74 +1260,81 @@ async def on_message(msg: discord.Message):
     _start_thinking(session_id, msg.channel)
     _channel_in_flight[msg.channel.id] = session_id
     data = None
+    # _channel_in_flight must stay set through chunk rendering so a rapid
+    # follow-up message routes to the InjectionView dispatcher, not a second
+    # worker. It's cleared in the outer finally, after the last chunk lands.
     try:
-        async with _http.stream(
-            "POST",
-            f"{PHOEBE_API_URL}/v1/chat/completions",
-            json={
-                "messages":         [{"role": "user", "content": msg.content}],
-                "session_id":       session_id,
-                "mode":             mode,
-                "approved_tools":   always_allow,
-                "stream":           True,
-                "plan_context":     plan_context,
-                "privileged_paths": privileged_paths,
-            },
-        ) as stream:
-            stream.raise_for_status()
-            data = await _consume_sse_stream(stream, msg.channel)
-    except Exception as e:
-        err_str = str(e) or f"{type(e).__name__} (no message)"
-        await msg.channel.send(f"[error: {err_str}]")
-        _channel_in_flight.pop(msg.channel.id, None)
-        return
-    finally:
-        _stop_thinking(session_id)
-        _channel_in_flight.pop(msg.channel.id, None)
-
-    if data is None:
-        await msg.channel.send("[error: stream ended unexpectedly]")
-        return
-
-    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "[no response]")
-
-    # Detect MODE_SWITCH sentinel from converse mode → auto-switch to plan
-    if "[MODE_SWITCH: plan]" in answer:
-        answer = answer.replace("[MODE_SWITCH: plan]", "").strip()
-        _set_mode_for_session(session_id, "plan")
-
-    is_plan_output = (
-        mode == "plan"
-        and re.search(r"^## Scope\b", answer, re.MULTILINE) is not None
-        and re.search(r"^## Steps\b", answer, re.MULTILINE) is not None
-    )
-
-    chunks = split_message(answer)
-    for i, chunk in enumerate(chunks):
-        is_last = i == len(chunks) - 1
-        if is_last and is_plan_output:
-            view = PlanReviewView(answer, session_id)
-            sent = await msg.channel.send(chunk, view=view)
-            view.message = sent
-        elif is_last:
-            await msg.channel.send(chunk, view=SpeakView(answer, msg.channel.id))
-        else:
-            await msg.channel.send(chunk)
-
-    # Replay any "queue"-mode injections captured during the run as fresh turns.
-    queued = data.get("queued_injections") or []
-    for q_text in queued:
-        if not q_text:
-            continue
         try:
-            await msg.channel.send(f"-# \U0001f5c3\ufe0f replaying queued: {q_text[:120]}")
-            fake = SimpleNamespace(
-                author=msg.author, channel=msg.channel, content=q_text,
-                guild=msg.guild,
-            )
-            await on_message(fake)  # type: ignore[arg-type]
+            async with _http.stream(
+                "POST",
+                f"{PHOEBE_API_URL}/v1/chat/completions",
+                json={
+                    "messages":         [{"role": "user", "content": msg.content}],
+                    "session_id":       session_id,
+                    "mode":             mode,
+                    "approved_tools":   always_allow,
+                    "stream":           True,
+                    "plan_context":     plan_context,
+                    "privileged_paths": privileged_paths,
+                },
+            ) as stream:
+                stream.raise_for_status()
+                data = await _consume_sse_stream(stream, msg.channel)
         except Exception as e:
-            print(f"[worker-bot] queued-injection replay failed: {e}", flush=True)
+            err_str = str(e) or f"{type(e).__name__} (no message)"
+            await msg.channel.send(f"[error: {err_str}]")
+            return
+        finally:
+            _stop_thinking(session_id)
+
+        if data is None:
+            await msg.channel.send("[error: stream ended unexpectedly]")
+            return
+
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "[no response]")
+
+        # Detect MODE_SWITCH sentinel from converse mode → auto-switch to plan
+        if "[MODE_SWITCH: plan]" in answer:
+            answer = answer.replace("[MODE_SWITCH: plan]", "").strip()
+            _set_mode_for_session(session_id, "plan")
+
+        is_plan_output = (
+            mode == "plan"
+            and re.search(r"^## Scope\b", answer, re.MULTILINE) is not None
+            and re.search(r"^## Steps\b", answer, re.MULTILINE) is not None
+        )
+
+        chunks = split_message(answer)
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            if is_last and is_plan_output:
+                view = PlanReviewView(answer, session_id)
+                sent = await msg.channel.send(chunk, view=view)
+                view.message = sent
+            elif is_last:
+                await msg.channel.send(chunk, view=SpeakView(answer, msg.channel.id))
+            else:
+                await msg.channel.send(chunk)
+    finally:
+        _channel_in_flight.pop(msg.channel.id, None)
+
+    # Queued injections replay as fresh turns. This MUST run after the in-flight
+    # flag is cleared — the recursive on_message() call checks _channel_in_flight
+    # and would otherwise re-enter the dispatcher instead of starting a worker.
+    if data is not None:
+        queued = data.get("queued_injections") or []
+        for q_text in queued:
+            if not q_text:
+                continue
+            try:
+                await msg.channel.send(f"-# \U0001f5c3\ufe0f replaying queued: {q_text[:120]}")
+                fake = SimpleNamespace(
+                    author=msg.author, channel=msg.channel, content=q_text,
+                    guild=msg.guild,
+                )
+                await on_message(fake)  # type: ignore[arg-type]
+            except Exception as e:
+                print(f"[worker-bot] queued-injection replay failed: {e}", flush=True)
 
 
 async def run():
