@@ -49,18 +49,24 @@ services:
     command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
     environment:
       WORKSPACE_DIR: "/workspace"
+      CONFIG_DIR: "/config"
+      STATE_DIR: "/state"
+      CACHE_DIR: "/cache"
       PROJECT_DIR: "/project"
-      MEMPALACE_HOME: "/mempalace"
+      MEMPALACE_HOME: "/state/chroma"
+      PROMPTS_DIR: "/config/prompts"
+      GENERATED_DIR: "/cache/prompts"
       EXA_API_KEY: "${EXA_API_KEY:-}"
       NOTION_URL: "http://phoebe-notion-test:3000"
       DISCORD_URL: ""
     volumes:
+      - ./config:/config
+      - ./state:/state
+      - ./cache:/cache
       - ./workspace:/workspace
       - .:/project
       - /var/run/docker.sock:/var/run/docker.sock
       - ./sandbox:/app/sandbox
-      - ./prompts:/app/prompts
-      - ./mempalace:/mempalace
     networks:
       - phoebe-net-test
     mem_limit: 1g
@@ -87,14 +93,19 @@ services:
       SANDBOX_URL: "http://phoebe-sandbox-test:9000"
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
-      SESSIONS_DIR: "/sessions"
+      SESSIONS_DIR: "/state/sessions"
       WORKSPACE_DIR: "/workspace"
-      PROMPTS_DIR: "/app/prompts"
+      CONFIG_DIR: "/config"
+      STATE_DIR: "/state"
+      CACHE_DIR: "/cache"
+      PROMPTS_DIR: "/config/prompts"
+      GENERATED_DIR: "/cache/prompts"
     volumes:
+      - ./config:/config
+      - ./state:/state
+      - ./cache:/cache
       - ./workspace:/workspace
-      - ./sessions:/sessions
       - ./config:/app/config
-      - ./prompts:/app/prompts
       - ./app:/app/app
     ports:
       - "8091:8090"

@@ -43,6 +43,7 @@ worker:
     - run_agent
     - deliberate
     - ask_user
+    - tool_result_recall
 
   # Roles this agent can spawn as sub-agents via run_agent.
   spawnable_agents:
@@ -68,7 +69,7 @@ supervisor:
 
 
 # ── Soul Updater ──────────────────────────────────────────────────────────────
-# Runs at 5 AM via cron. Reads workspace files, rewrites SOUL.md.
+# Runs at 5 AM via cron. Reads system/ files, rewrites system/SOUL.md.
 # Needs file_read + file_write only.
 soul_updater:
   allowed_tools:
@@ -125,6 +126,7 @@ improvement_agent:
     - docker_test_down
     - docker_test_health
     - run_agent
+    - tool_result_recall
 
   # Higher iteration limit for multi-step improvement workflows.
   max_tool_iterations: 20
@@ -148,7 +150,7 @@ discord_agent:
 # ── Testing Agent ─────────────────────────────────────────────────────────────
 # Deterministic + LLM-driven auditor.
 # Call via POST /v1/agents/testing_agent.
-# Runs diagnostic_check first (no LLM), then does workspace/memory round-trips
+# Runs diagnostic_check first (no LLM), then does system/memory round-trips
 # and produces a structured markdown audit report.
 # Invoke after improvement_agent changes to verify system integrity.
 testing_agent:
@@ -224,6 +226,7 @@ research_agent:
     - file_list
     - directory_tree
     - memory_search
+    - tool_result_recall
   max_tool_iterations: 15
 
 
@@ -247,11 +250,12 @@ coding_agent:
     - git_commit
     - git_rollback
     - git_log
+    - tool_result_recall
   max_tool_iterations: 20
 
 
 # ── Tool Builder ──────────────────────────────────────────────────────────────
-# Scaffolds new tools (TOOL_DOCS entry + handler stub).
+# Scaffolds new tools (prompt snippet in config/prompts/tools/ + handler stub).
 tool_builder:
   description: "Scaffolds new tools (handler + docs entry)."
   allowed_tools:

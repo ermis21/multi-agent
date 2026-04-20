@@ -1,15 +1,22 @@
-prompts/generated/*
-!prompts/generated/.gitkeep
-sessions/
-workspace/memory/*
-!workspace/memory/.gitkeep
+# Regenerable prompt audit trail
+cache/
+# Agent-written state (tracked .gitkeep markers preserve the tree shape)
+state/sessions/
+state/discord/bot_worker_state.json
+state/chroma/
+state/soul/SOUL.md
+state/soul/MEMORY.md
+state/memory/*
+!state/memory/.gitkeep
+# Agent scratch
+workspace/*
+!workspace/.gitkeep
+# Secrets & junk
 .env
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-mempalace/*
-!mempalace/.gitkeep
-workspace/sandbox/venv/
-workspace/venv/
+archive/
+mempalace.bak/
 CLAUDE.md

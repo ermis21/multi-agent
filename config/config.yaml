@@ -52,9 +52,6 @@ prompts:
   mode: concise
   workspace_file_max_chars: 4000
   config_change_approval_required: true
-  # Emit per-mode capability/excluded-tool block in worker prompt. Turn off for
-  # models that already know plan/build/converse semantics (e.g. Claude) via
-  # per-model override: models.<name>.describe_mode_in_system_prompt: false.
   describe_mode_in_system_prompt: true
 agent:
   supervisor_enabled: true
@@ -258,6 +255,20 @@ debate:
   use_judge: true
   max_total_messages: 12
 logging:
-  sessions_dir: /sessions
+  sessions_dir: /state/sessions
   log_supervisor_turns: true
   verbose_tools: true
+context:
+  enabled: true
+  budgets:
+    soul: 512
+    user: 256
+    memory: 512
+    identity: 128
+    tool_docs: 1500
+    skills: 800
+    history: 6000
+    tool_result_inline: 1500
+  total_soft_cap: 12000
+  tokenizer_backend: llama
+  elision_strategy: head_tail

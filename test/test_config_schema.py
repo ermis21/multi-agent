@@ -104,3 +104,53 @@ def test_approval_bucket_forbids_extras(real_config):
     """approval.build.new_key should be rejected (closed schema)."""
     with pytest.raises(ConfigPatchError):
         validate_patch(real_config, {"approval": {"build": {"new_key": []}}})
+
+
+# ── Context (PR 1 — Gemma-aware budgets) ─────────────────────────────────────
+
+def test_context_defaults_valid():
+    """RootConfig with no `context` block must fall back to defaults cleanly."""
+    cfg = RootConfig.model_validate({})
+    assert cfg.context.enabled is True
+    assert cfg.context.budgets.soul == 512
+    assert cfg.context.total_soft_cap == 12000
+    assert cfg.context.tokenizer_backend == "llama"
+    assert cfg.context.elision_strategy == "head_tail"
+
+
+def test_context_unknown_key_rejected(real_config):
+    with pytest.raises(ConfigPatchError) as exc:
+        validate_patch(real_config, {"context": {"enabeld": True}})  # typo
+    msg = str(exc.value)
+    assert "enabeld" in msg and "enabled" in msg
+
+
+def test_context_budgets_unknown_key_rejected(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"context": {"budgets": {"made_up_slot": 100}}})
+
+
+def test_context_budget_negative_rejected(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"context": {"budgets": {"soul": -1}}})
+
+
+def test_context_soft_cap_negative_rejected(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"context": {"total_soft_cap": -100}})
+
+
+def test_context_tokenizer_backend_literal(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"context": {"tokenizer_backend": "sentencepiece"}})
+
+
+def test_context_elision_strategy_literal(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"context": {"elision_strategy": "random"}})
+
+
+def test_context_disabled_toggle_accepted(real_config):
+    """The master feature flag must accept `false` for rollback."""
+    out = validate_patch(real_config, {"context": {"enabled": False}})
+    assert out["context"]["enabled"] is False

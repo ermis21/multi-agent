@@ -17,7 +17,10 @@ Tools:
   Diagnostics: diagnostic_check
 
 File path prefixes:
-  (default)  → /workspace  (read + write)
+  (default)  → /workspace  (read + write; agent scratch)
+  config/    → /config     (read + write; identity/, prompts/, skills/, *.yaml)
+  state/     → /state      (read + write; soul/, memory/, sessions/, discord/, chroma/)
+  cache/     → /cache      (read + write; regenerable audit trails)
   project/   → /project    (read-only; .env blocked)
 """
 
@@ -44,14 +47,17 @@ from pydantic import BaseModel
 app = FastAPI(title="phoebe-sandbox-mcp", docs_url=None, redoc_url=None)
 
 WORKSPACE       = Path(os.environ.get("WORKSPACE_DIR",   "/workspace")).resolve()
+CONFIG          = Path(os.environ.get("CONFIG_DIR",      "/config")).resolve()
+STATE           = Path(os.environ.get("STATE_DIR",       "/state")).resolve()
+CACHE           = Path(os.environ.get("CACHE_DIR",       "/cache")).resolve()
 PROJECT         = Path(os.environ.get("PROJECT_DIR",     "/project")).resolve()
-MEMPALACE_HOME  = Path(os.environ.get("MEMPALACE_HOME",  "/mempalace"))
+MEMPALACE_HOME  = Path(os.environ.get("MEMPALACE_HOME",  "/state/chroma"))
 EXA_API_KEY     = os.environ.get("EXA_API_KEY", "")
 NOTION_URL      = os.environ.get("NOTION_URL",   "http://phoebe-notion:3000")
 DISCORD_URL     = os.environ.get("DISCORD_URL",  "http://phoebe-discord:4000")
 LLAMA_URL       = os.environ.get("LLAMA_URL",    "http://host.docker.internal:8080")
 NOTION_TOKEN    = os.environ.get("NOTION_TOKEN", "")
-PROMPTS_DIR     = Path(os.environ.get("PROMPTS_DIR",     "/app/prompts"))
+PROMPTS_DIR     = Path(os.environ.get("PROMPTS_DIR",     "/config/prompts"))
 
 # Config files — accessed via /project mount (sandbox has .:/project)
 _CONFIG_YAML    = PROJECT / "config" / "config.yaml"
@@ -62,6 +68,9 @@ _SUBPROCESS_ENV = {
     "PATH":      "/usr/local/bin:/usr/bin:/bin",
     "HOME":      "/tmp",
     "WORKSPACE": str(WORKSPACE),
+    "CONFIG":    str(CONFIG),
+    "STATE":     str(STATE),
+    "CACHE":     str(CACHE),
     "PROJECT":   str(PROJECT),
 }
 
@@ -81,10 +90,17 @@ def _safe_path(rel: str, root: Path) -> Path:
     """Resolve path and reject anything escaping root."""
     target = (root / rel).resolve()
     if not str(target).startswith(str(root)):
-        root_name = "workspace" if root == WORKSPACE else ("project" if root == PROJECT else str(root))
+        root_name = {
+            WORKSPACE: "workspace",
+            CONFIG:    "config",
+            STATE:     "state",
+            CACHE:     "cache",
+            PROJECT:   "project",
+        }.get(root, str(root))
         hint = (
             f"Path {rel!r} is outside the {root_name} root ({root}). "
-            f"Writable root is {WORKSPACE}; readable roots are {WORKSPACE} and {PROJECT} (read-only). "
+            f"Writable roots: /workspace (default), /config, /state, /cache. "
+            f"/project is read-only. "
             f"Retry with a path under /workspace/ (e.g. /workspace/{Path(rel).name})."
         )
         raise HTTPException(status_code=400, detail=hint)
@@ -93,18 +109,81 @@ def _safe_path(rel: str, root: Path) -> Path:
 
 _BLOCKED_FILES = {".env", ".env.local", ".env.production", ".env.staging"}
 
+
+def _strip_prefix(rel: str, prefix: str) -> str:
+    """Strip leading `prefix/` or `/prefix/` (or bare `prefix` / `/prefix`) from rel."""
+    return (
+        rel.removeprefix(f"/{prefix}")
+        .removeprefix(prefix)
+        .lstrip("/")
+    )
+
+
+_PREFIX_ROOTS = (
+    ("project", PROJECT),
+    ("config",  CONFIG),
+    ("state",   STATE),
+    ("cache",   CACHE),
+    ("workspace", WORKSPACE),
+)
+
+
+def _match_prefix(rel: str) -> tuple[str, Path] | None:
+    for name, root in _PREFIX_ROOTS:
+        if rel == name or rel == f"/{name}" or rel.startswith(f"{name}/") or rel.startswith(f"/{name}/"):
+            return name, root
+    return None
+
+
 def _resolve_read_path(rel: str) -> Path:
     """
-    Resolve a path for reading — supports both workspace and project (read-only).
-    Prefix with 'project/' to access the system source code.
-    Secrets files (.env etc.) in /project are blocked.
+    Resolve a path for reading.
+      project/  → /project  (read-only; .env* blocked)
+      config/   → /config   (rw; identity/, skills/, prompts/, *.yaml)
+      state/    → /state    (rw; soul/, memory/, sessions/, discord/, chroma/)
+      cache/    → /cache    (rw; regenerable)
+      workspace/ or no prefix → /workspace (agent scratch)
     """
-    if rel.startswith("project/") or rel == "project" or rel.startswith("/project"):
-        inner = rel.removeprefix("/project").removeprefix("project").lstrip("/")
-        p = _safe_path(inner or ".", PROJECT)
-        if p.name in _BLOCKED_FILES:
+    hit = _match_prefix(rel)
+    if hit:
+        name, root = hit
+        inner = _strip_prefix(rel, name)
+        p = _safe_path(inner or ".", root)
+        if root == PROJECT and p.name in _BLOCKED_FILES:
             raise HTTPException(status_code=403, detail=f"Access to {p.name!r} is not permitted")
         return p
+    return _safe_path(rel, WORKSPACE)
+
+
+def _resolve_write_path(rel: str) -> Path:
+    """
+    Resolve a path for writing.
+      config/ state/ cache/ workspace/ → respective root (rw)
+      project/ → rejected (read-only mount)
+      system/  → rejected (deprecated; use config/identity, config/skills, state/soul, state/memory)
+      no prefix → /workspace (agent scratch, default)
+    """
+    if rel.startswith("system/") or rel == "system" or rel.startswith("/system"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "`system/` is deprecated — use `config/identity/`, `config/skills/`, "
+                "`state/soul/`, or `state/memory/` depending on the target file."
+            ),
+        )
+    hit = _match_prefix(rel)
+    if hit:
+        name, root = hit
+        if root == PROJECT:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot write under project/ — /project is mounted read-only. "
+                    "Writable roots: /workspace (default), /config, /state, /cache."
+                ),
+            )
+        inner = _strip_prefix(rel, name)
+        return _safe_path(inner or ".", root)
     return _safe_path(rel, WORKSPACE)
 
 
@@ -146,10 +225,11 @@ def _file_read(params: dict) -> dict:
 
 def _file_write(params: dict) -> dict:
     try:
-        path = _safe_path(params["path"], WORKSPACE)
+        path = _resolve_write_path(params["path"])
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(params["content"], encoding="utf-8")
-        return {"written": len(params["content"]), "path": str(path.relative_to(WORKSPACE))}
+        root = next((r for r in (CONFIG, STATE, CACHE, WORKSPACE) if str(path).startswith(str(r))), WORKSPACE)
+        return {"written": len(params["content"]), "path": str(path.relative_to(root))}
     except HTTPException:
         raise
     except Exception as e:
@@ -158,13 +238,14 @@ def _file_write(params: dict) -> dict:
 
 def _file_edit(params: dict) -> dict:
     """
-    Replace exactly one occurrence of old_string with new_string in a workspace file.
+    Replace exactly one occurrence of old_string with new_string in a writable file.
+    Routes via the `system/` prefix like file_write; defaults to /workspace.
     Fails if old_string is not found or matches more than once — forces the caller
     to pick an anchor that uniquely identifies the edit site.
-    Workspace only — /project is mounted read-only.
+    /project is mounted read-only and cannot be edited.
     """
     try:
-        path = _safe_path(params["path"], WORKSPACE)
+        path = _resolve_write_path(params["path"])
         old  = params["old_string"]
         new  = params["new_string"]
         if not path.exists():
@@ -202,7 +283,10 @@ def _file_list(params: dict) -> dict:
         for e in sorted(path.iterdir()):
             st = e.stat()
             entries.append({"name": e.name, "is_dir": _stat.S_ISDIR(st.st_mode), "size": st.st_size})
-        root = PROJECT if str(path).startswith(str(PROJECT)) else WORKSPACE
+        root = next(
+            (r for r in (PROJECT, CONFIG, STATE, CACHE, WORKSPACE) if str(path).startswith(str(r))),
+            WORKSPACE,
+        )
         return {"entries": entries, "path": str(path.relative_to(root))}
     except (FileNotFoundError, NotADirectoryError):
         return {"entries": [], "error": f"Path not found: {params.get('path', '.')}"}
@@ -241,21 +325,25 @@ def _directory_tree(params: dict) -> dict:
 
 
 def _file_move(params: dict) -> dict:
-    """Move or rename a file within workspace."""
+    """Move or rename a file within a writable root (workspace or system)."""
     try:
-        src  = _safe_path(params["source"],      WORKSPACE)
-        dest = _safe_path(params["destination"], WORKSPACE)
+        src  = _resolve_write_path(params["source"])
+        dest = _resolve_write_path(params["destination"])
         if not src.exists():
             return {
                 "error": (
-                    f"Source not found in workspace: '{params['source']}'. "
-                    "file_move only operates within /workspace. "
-                    "To move project files, use shell_exec with 'mv' — but note /project is read-only inside the container."
+                    f"Source not found: '{params['source']}'. "
+                    "file_move only operates within writable roots (/workspace, /config, /state, /cache). "
+                    "To move project files, use shell_exec with 'mv' — but note /project is read-only."
                 )
             }
         dest.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dest)
-        return {"ok": True, "destination": str(dest.relative_to(WORKSPACE))}
+        dest_root = next(
+            (r for r in (CONFIG, STATE, CACHE, WORKSPACE) if str(dest).startswith(str(r))),
+            WORKSPACE,
+        )
+        return {"ok": True, "destination": str(dest.relative_to(dest_root))}
     except HTTPException:
         raise
     except Exception as e:
@@ -263,9 +351,9 @@ def _file_move(params: dict) -> dict:
 
 
 def _create_dir(params: dict) -> dict:
-    """Create a directory (and parents) in workspace."""
+    """Create a directory (and parents) in a writable root."""
     try:
-        path = _safe_path(params["path"], WORKSPACE)
+        path = _resolve_write_path(params["path"])
         path.mkdir(parents=True, exist_ok=True)
         return {"ok": True, "path": params["path"]}
     except HTTPException:
@@ -603,25 +691,29 @@ def _diagnostic_check(_params: dict) -> dict:
     def warn(detail):    return {"status": "warn", "detail": detail}
     def fail(detail):    return {"status": "fail", "detail": detail}
 
-    # workspace_readable
-    try:
-        checks["workspace_readable"] = ok() if WORKSPACE.is_dir() else fail("not a directory")
-    except Exception as e:
-        checks["workspace_readable"] = fail(str(e))
-
-    # workspace_writable — write/read/unlink canary
-    probe = WORKSPACE / ".diag_probe"
-    try:
-        probe.write_text("diag-canary")
-        content = probe.read_text()
-        probe.unlink()
-        checks["workspace_writable"] = ok() if content == "diag-canary" else fail("content mismatch")
-    except Exception as e:
-        checks["workspace_writable"] = fail(str(e))
+    # readable + writable probes for all four rw roots
+    for label, root in (
+        ("workspace", WORKSPACE),
+        ("config",    CONFIG),
+        ("state",     STATE),
+        ("cache",     CACHE),
+    ):
         try:
-            probe.unlink(missing_ok=True)
-        except Exception:
-            pass
+            checks[f"{label}_readable"] = ok() if root.is_dir() else fail("not a directory")
+        except Exception as e:
+            checks[f"{label}_readable"] = fail(str(e))
+        probe = root / ".diag_probe"
+        try:
+            probe.write_text("diag-canary")
+            content = probe.read_text()
+            probe.unlink()
+            checks[f"{label}_writable"] = ok() if content == "diag-canary" else fail("content mismatch")
+        except Exception as e:
+            checks[f"{label}_writable"] = fail(str(e))
+            try:
+                probe.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     # mempalace_accessible — open chroma collection and list
     try:
@@ -721,7 +813,7 @@ def _diagnostic_check(_params: dict) -> dict:
         ("research_agent.md",        []),
         ("coding_agent.md",          []),
         ("tool_builder.md",          []),
-        ("skill_builder.md",         [r"/workspace/skills/"]),
+        ("skill_builder.md",         [r"/config/skills/"]),
         ("webfetch_summarizer.md",   []),
         ("prompt_suggester.md",      []),
         ("session_compactor.md",     []),
@@ -731,7 +823,7 @@ def _diagnostic_check(_params: dict) -> dict:
     missing_tpl: list[str] = []
     missing_var: list[str] = []
     for fname, patterns in required_with_checks:
-        path = PROMPTS_DIR / "base" / fname
+        path = PROMPTS_DIR / fname
         if not path.exists():
             missing_tpl.append(fname)
             continue
@@ -790,8 +882,8 @@ def _diagnostic_check(_params: dict) -> dict:
     except Exception as e:
         checks["supervisor_mode_overrides"] = fail(str(e))
 
-    # skills_directory — scan workspace/skills/*/SKILL.md and sanity-check frontmatter
-    skills_root = WORKSPACE / "skills"
+    # skills_directory — scan config/skills/*/SKILL.md and sanity-check frontmatter
+    skills_root = CONFIG / "skills"
     try:
         if not skills_root.is_dir():
             checks["skills_directory"] = ok("no skills directory (0 skills)")
@@ -849,7 +941,7 @@ def _diagnostic_check(_params: dict) -> dict:
     try:
         import glob as _glob
         # /project is the repo bind-mount; sessions/ lives at the repo root
-        candidates = _glob.glob("/project/sessions/*/state.json")
+        candidates = _glob.glob("/project/state/sessions/*/state.json")
         if not candidates:
             checks["session_state_integrity"] = ok("no state files yet")
         else:
@@ -887,6 +979,99 @@ def _diagnostic_check(_params: dict) -> dict:
     except Exception as e:
         checks["session_state_integrity"] = fail(f"integrity probe failed: {e}")
 
+    # ── PR 1 context-compression probes ──────────────────────────────────────
+
+    # compressor_budgets_valid: every budget > 0 and total_soft_cap >= sum(budgets)
+    try:
+        import yaml as _yaml
+        with (CONFIG / "config.yaml").open() as f:
+            _cfg = _yaml.safe_load(f) or {}
+        _ctx = _cfg.get("context", {}) or {}
+        _budgets = _ctx.get("budgets", {}) or {}
+        _bad_keys = [k for k, v in _budgets.items() if not isinstance(v, int) or v < 0]
+        _soft_cap = int(_ctx.get("total_soft_cap", 0) or 0)
+        _sum = sum(int(v or 0) for v in _budgets.values())
+        if _bad_keys:
+            checks["compressor_budgets_valid"] = fail(f"invalid budget values: {_bad_keys}")
+        elif _soft_cap and _sum > _soft_cap:
+            checks["compressor_budgets_valid"] = warn(
+                f"sum of budgets ({_sum}) exceeds total_soft_cap ({_soft_cap})"
+            )
+        else:
+            checks["compressor_budgets_valid"] = ok(
+                f"{len(_budgets)} budgets, sum={_sum}, soft_cap={_soft_cap}"
+            )
+    except Exception as e:
+        checks["compressor_budgets_valid"] = fail(f"budget probe failed: {e}")
+
+    # tokenizer_reachable: llama.cpp /tokenize must return 200 within 2s OR
+    # tiktoken must import cleanly (fallback is acceptable).
+    try:
+        _llama = os.environ.get("LLAMA_URL", "http://llama-api-manager:8081")
+        try:
+            _r = httpx.post(f"{_llama}/tokenize", json={"content": "ping"}, timeout=2.0)
+            _j = _r.json() if _r.status_code == 200 else {}
+            if isinstance(_j, dict) and _j.get("tokens") is not None:
+                checks["tokenizer_reachable"] = ok("llama.cpp /tokenize returns tokens")
+            else:
+                raise RuntimeError(f"HTTP {_r.status_code}, no tokens field")
+        except Exception as _le:
+            try:
+                import tiktoken  # noqa: F401
+                checks["tokenizer_reachable"] = warn(
+                    f"llama /tokenize unreachable ({_le}); tiktoken fallback available"
+                )
+            except Exception:
+                checks["tokenizer_reachable"] = fail(
+                    f"both llama ({_le}) and tiktoken unavailable — using char/4 heuristic only"
+                )
+    except Exception as e:
+        checks["tokenizer_reachable"] = fail(f"tokenizer probe failed: {e}")
+
+    # tool_result_recall_roundtrip: write a synthetic handle, recall it, delete.
+    try:
+        import uuid as _uuid
+        _sid = f"__diag_{_uuid.uuid4().hex[:6]}__"
+        _hid = "rf-" + _uuid.uuid4().hex[:6]
+        _d = STATE / "sessions" / _sid / "tool_results"
+        _d.mkdir(parents=True, exist_ok=True)
+        _payload = "diag-canary-" + _uuid.uuid4().hex
+        (_d / f"{_hid}.txt").write_text(_payload)
+        resp = _tool_result_recall({"id": _hid, "session_id": _sid, "offset": 0, "limit": 200})
+        _ok = resp.get("chunk") == _payload and resp.get("chars_total") == len(_payload)
+        # cleanup
+        try:
+            (_d / f"{_hid}.txt").unlink()
+            _d.rmdir()
+            _d.parent.rmdir()
+        except Exception:
+            pass
+        checks["tool_result_recall_roundtrip"] = ok("handle store/recall round-trips") if _ok \
+            else fail(f"recall mismatch: {resp}")
+    except Exception as e:
+        checks["tool_result_recall_roundtrip"] = fail(f"recall probe failed: {e}")
+
+    # prefix_marker_present: the latest worker_* template must contain <|prefix_end|>
+    try:
+        _tp = CONFIG / "prompts"
+        found: list[str] = []
+        for name in ("worker_full.md", "worker_concise.md"):
+            p = _tp / name
+            if p.exists() and "<|prefix_end|>" in p.read_text(encoding="utf-8", errors="ignore"):
+                found.append(name)
+        if len(found) == 2:
+            checks["prefix_marker_present"] = ok("both worker templates carry <|prefix_end|>")
+        elif found:
+            checks["prefix_marker_present"] = warn(
+                f"only {found} carry <|prefix_end|> — KV cache boundary partial"
+            )
+        else:
+            checks["prefix_marker_present"] = fail(
+                "no worker template contains <|prefix_end|> — prefix cache won't reuse"
+            )
+    except Exception as e:
+        checks["prefix_marker_present"] = fail(f"marker probe failed: {e}")
+
     # Compute overall
     statuses   = [c["status"] for c in checks.values()]
     fail_count = statuses.count("fail")
@@ -900,6 +1085,66 @@ def _diagnostic_check(_params: dict) -> dict:
         "pass_count": pass_count,
         "warn_count": warn_count,
         "fail_count": fail_count,
+    }
+
+
+# ── Handles ────────────────────────────────────────────────────────────────
+
+def _tool_result_recall(params: dict) -> dict:
+    """
+    Read a previously-elided tool-result body by its handle id.
+
+    Bodies are written once by the worker's tool-result append site under
+    `/state/sessions/{sid}/tool_results/{handle_id}.txt`. This handler returns
+    a character-indexed slice so the model can scan a large result in chunks
+    without re-inflating the whole thing into the context window.
+
+    Params:
+      id         — required, e.g. "rf-7c29"
+      session_id — required, owning session (path scoped here)
+      offset     — char offset (default 0)
+      limit      — max chars to return (default 4000, capped at 16000)
+    """
+    hid = str(params.get("id") or "").strip()
+    sid = str(params.get("session_id") or "").strip()
+    if not hid or not sid:
+        raise HTTPException(status_code=400, detail="tool_result_recall requires both 'id' and 'session_id'")
+    if not hid.startswith("rf-") or any(c in hid for c in "/\\.") or len(hid) > 32:
+        raise HTTPException(status_code=400, detail=f"invalid handle id: {hid!r}")
+    # session_id is baked into file-name so we sanity-check shape, too.
+    if any(c in sid for c in "/\\") or len(sid) > 128:
+        raise HTTPException(status_code=400, detail=f"invalid session id: {sid!r}")
+
+    offset = max(0, int(params.get("offset") or 0))
+    limit  = max(1, min(16000, int(params.get("limit") or 4000)))
+
+    target = STATE / "sessions" / sid / "tool_results" / f"{hid}.txt"
+    if not target.exists():
+        return {
+            "id": hid,
+            "session_id": sid,
+            "offset": offset,
+            "limit": limit,
+            "chars_total": 0,
+            "chunk": "",
+            "has_more": False,
+            "error": "handle not found (may have been cleaned up or never stored)",
+        }
+    try:
+        body = target.read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"failed to read handle {hid}: {e}")
+
+    total = len(body)
+    chunk = body[offset:offset + limit]
+    return {
+        "id": hid,
+        "session_id": sid,
+        "offset": offset,
+        "limit": limit,
+        "chars_total": total,
+        "chunk": chunk,
+        "has_more": (offset + len(chunk)) < total,
     }
 
 
@@ -952,6 +1197,8 @@ HANDLERS = {
     "tts_speak":               _tts_speak,
     # Diagnostics
     "diagnostic_check":       _diagnostic_check,
+    # Handles
+    "tool_result_recall":     _tool_result_recall,
 }
 
 
@@ -972,7 +1219,14 @@ def dispatch(req: MCPRequest):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "workspace": str(WORKSPACE), "project": str(PROJECT)}
+    return {
+        "ok": True,
+        "workspace": str(WORKSPACE),
+        "config":    str(CONFIG),
+        "state":     str(STATE),
+        "cache":     str(CACHE),
+        "project":   str(PROJECT),
+    }
 
 
 @app.get("/tools")

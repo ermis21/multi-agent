@@ -15,8 +15,8 @@ from pathlib import Path
 
 import pytest
 
-import app.session_state as ss
-from app.session_state import SessionState, TurnAccumulator, log_approval
+import app.sessions.state as ss
+from app.sessions.state import SessionState, TurnAccumulator, log_approval
 
 
 @pytest.fixture(autouse=True)
@@ -68,28 +68,28 @@ def test_sub_session_add_dedupes():
 
 def test_record_tool_detects_skill_file_read():
     acc = TurnAccumulator()
-    acc.record_tool("file_read", {"path": "/workspace/skills/log-triage/SKILL.md"}, error=False)
-    acc.record_tool("file_read", {"path": "workspace/skills/other/SKILL.md"}, error=False)
+    acc.record_tool("file_read", {"path": "/config/skills/log-triage/SKILL.md"}, error=False)
+    acc.record_tool("file_read", {"path": "config/skills/other/SKILL.md"}, error=False)
     acc.record_tool("file_read", {"path": "/project/app/main.py"}, error=False)
     assert acc.skills_invoked == ["log-triage", "other"]
 
 
 def test_record_tool_skill_is_set_semantic():
     acc = TurnAccumulator()
-    acc.record_tool("file_read", {"path": "/workspace/skills/foo/SKILL.md"}, error=False)
-    acc.record_tool("file_read", {"path": "/workspace/skills/foo/SKILL.md"}, error=False)
+    acc.record_tool("file_read", {"path": "/config/skills/foo/SKILL.md"}, error=False)
+    acc.record_tool("file_read", {"path": "/config/skills/foo/SKILL.md"}, error=False)
     assert acc.skills_invoked == ["foo"]
 
 
 def test_flush_turn_merges_skills_invoked():
     st = SessionState.load_or_create("sid-skills")
     acc = TurnAccumulator()
-    acc.record_tool("file_read", {"path": "/workspace/skills/first/SKILL.md"}, error=False)
+    acc.record_tool("file_read", {"path": "/config/skills/first/SKILL.md"}, error=False)
     st.flush_turn(acc, verdict=None)
 
     acc2 = TurnAccumulator()
-    acc2.record_tool("file_read", {"path": "/workspace/skills/second/SKILL.md"}, error=False)
-    acc2.record_tool("file_read", {"path": "/workspace/skills/first/SKILL.md"}, error=False)  # dup
+    acc2.record_tool("file_read", {"path": "/config/skills/second/SKILL.md"}, error=False)
+    acc2.record_tool("file_read", {"path": "/config/skills/first/SKILL.md"}, error=False)  # dup
     st.flush_turn(acc2, verdict=None)
 
     inv = st.get("skills.invoked")
@@ -99,7 +99,7 @@ def test_flush_turn_merges_skills_invoked():
 def test_log_approval_appends_sidecar(tmp_path):
     log_approval("sid-approvals", "shell_exec", "auto_failed", {"reason": "denied_tools"})
     log_approval("sid-approvals", "shell_exec", "requested", {"approval_id": "abc"})
-    p = tmp_path / "sid-approvals.approvals.jsonl"
+    p = tmp_path / "sid-approvals" / "approvals.jsonl"
     assert p.exists()
     lines = [json.loads(ln) for ln in p.read_text().strip().splitlines()]
     assert [ln["status"] for ln in lines] == ["auto_failed", "requested"]
@@ -113,15 +113,72 @@ def test_migrate_in_place_backfills_pending_injections(tmp_path):
     old = {
         "session_id": "sid-old",
         "stats": {"turn_count": 1},
-        "history": {"full": "sessions/sid-old.jsonl"},
+        "history": {"full": "sessions/sid-old/turns.jsonl"},
     }
-    p = tmp_path / "sid-old.state.json"
+    sdir = tmp_path / "sid-old"
+    sdir.mkdir(parents=True, exist_ok=True)
+    p = sdir / "state.json"
     p.write_text(json.dumps(old))
     ss._CACHE.clear()
     st = SessionState.load_or_create("sid-old")
     assert st.get("pending_injections") == []
     # Existing stats key is preserved.
     assert st.get("stats.turn_count") == 1
+
+
+def test_default_state_has_context_stats_and_tool_results():
+    """PR 1 keys must be present on fresh state."""
+    st = SessionState.load_or_create("sid-ctx-default")
+    assert st.get("context_stats.last_prompt_tokens") == 0
+    assert st.get("context_stats.last_kv_prefix_hash") is None
+    assert st.get("context_stats.soft_cap_exceeded") is False
+    assert st.get("context_stats.section_tokens") == {}
+    # Compression triggers dict is present with all slots at 0.
+    trig = st.get("context_stats.compression_triggers")
+    assert isinstance(trig, dict)
+    for slot in ("soul", "memory", "user", "identity", "tool_docs", "skills", "history", "tool_result"):
+        assert trig[slot] == 0
+    # Handle index is empty dict (not list).
+    assert st.get("tool_results") == {}
+
+
+def test_migrate_in_place_backfills_context_stats(tmp_path):
+    """An old state file missing context_stats/tool_results must get them on load."""
+    old = {
+        "session_id": "sid-ctx-old",
+        "stats": {"turn_count": 3},
+        "history": {"full": "sessions/sid-ctx-old/turns.jsonl"},
+        # deliberately absent: context_stats, tool_results
+    }
+    sdir = tmp_path / "sid-ctx-old"
+    sdir.mkdir(parents=True, exist_ok=True)
+    (sdir / "state.json").write_text(json.dumps(old))
+    ss._CACHE.clear()
+    st = SessionState.load_or_create("sid-ctx-old")
+
+    # New keys backfilled with defaults.
+    assert st.get("context_stats.last_prompt_tokens") == 0
+    assert st.get("context_stats.compression_triggers.soul") == 0
+    assert st.get("tool_results") == {}
+    # Pre-existing data untouched.
+    assert st.get("stats.turn_count") == 3
+
+
+def test_context_stats_round_trip():
+    """Writing telemetry via dotted setters survives save/reload."""
+    st = SessionState.load_or_create("sid-ctx-rt")
+    st.set("context_stats.last_prompt_tokens", 7845)
+    st.set("context_stats.last_kv_prefix_hash", "sha1:8c2f")
+    st.set("context_stats.section_tokens", {"SOUL": 487, "USER": 214})
+    st.set("context_stats.soft_cap_exceeded", True)
+    st.save()
+
+    ss._CACHE.clear()
+    st2 = SessionState.load_or_create("sid-ctx-rt")
+    assert st2.get("context_stats.last_prompt_tokens") == 7845
+    assert st2.get("context_stats.last_kv_prefix_hash") == "sha1:8c2f"
+    assert st2.get("context_stats.section_tokens") == {"SOUL": 487, "USER": 214}
+    assert st2.get("context_stats.soft_cap_exceeded") is True
 
 
 def test_flush_turn_persists_stats_and_verdict():
@@ -148,14 +205,16 @@ def test_flush_turn_persists_stats_and_verdict():
 
 def test_history_active_preferred_for_rebuild(tmp_path, monkeypatch):
     """`_rebuild_session_context` reads from `state.history.active` when it exists."""
-    import app.session_logger as slog
+    import app.sessions.logger as slog
     import app.agents as agents
 
     monkeypatch.setattr(slog, "SESSIONS_DIR", tmp_path)
 
     sid = "sid-compacted"
-    full_jsonl = tmp_path / f"{sid}.jsonl"
-    active_jsonl = tmp_path / f"{sid}.active.jsonl"
+    sdir = tmp_path / sid
+    sdir.mkdir(parents=True, exist_ok=True)
+    full_jsonl = sdir / "turns.jsonl"
+    active_jsonl = sdir / "active.jsonl"
 
     def _turn(user_text: str, response: str) -> str:
         return json.dumps({
@@ -182,13 +241,15 @@ def test_history_active_preferred_for_rebuild(tmp_path, monkeypatch):
 
 def test_history_active_falls_back_to_full(tmp_path, monkeypatch):
     """Without `history.active`, replay uses the full JSONL."""
-    import app.session_logger as slog
+    import app.sessions.logger as slog
     import app.agents as agents
 
     monkeypatch.setattr(slog, "SESSIONS_DIR", tmp_path)
 
     sid = "sid-full-only"
-    full_jsonl = tmp_path / f"{sid}.jsonl"
+    sdir = tmp_path / sid
+    sdir.mkdir(parents=True, exist_ok=True)
+    full_jsonl = sdir / "turns.jsonl"
     full_jsonl.write_text(json.dumps({
         "role": "final",
         "messages": [{"role": "user", "content": "only question"}],

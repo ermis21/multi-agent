@@ -24,10 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/      ./app/
 COPY sandbox/  ./sandbox/
-COPY prompts/  ./prompts/
 COPY config/   ./config/
 
-RUN mkdir -p /workspace /sessions /app/prompts/generated
+RUN mkdir -p /workspace /config /state /cache
 
 # Ensure app is importable as a package
 RUN touch /app/app/__init__.py /app/sandbox/__init__.py

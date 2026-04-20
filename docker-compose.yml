@@ -80,19 +80,20 @@ services:
       start_period: 15s
     volumes:
       # Persistent bot state — session IDs and user modes survive container restarts
-      - ./discord_state:/app/state
+      - ./state/discord:/app/state
       # E2E scenario runner — mounted read-only so `make e2e` works without rebuild
       - ./discord/e2e_scenarios.py:/app/e2e_scenarios.py:ro
       # E2E scenarios need to write a probe SKILL.md to exercise skill-discovery
-      - ./workspace:/workspace
+      - ./config/skills:/config/skills
       # Session state files — read-only hydration source for bot on startup
-      - ./sessions:/sessions:ro
+      - ./state/sessions:/state/sessions:ro
       # Source mounts so bot_worker/bot_config/bot_mod edits don't require a rebuild
       - ./discord/bot_worker.py:/app/bot_worker.py
       - ./discord/bot_config.py:/app/bot_config.py
       - ./discord/bot_mod.py:/app/bot_mod.py
       - ./discord/main.py:/app/main.py
       - ./discord/utils.py:/app/utils.py
+      - ./discord/views.py:/app/views.py
     restart: unless-stopped
     logging: *logging
     depends_on:
@@ -138,9 +139,13 @@ services:
     command: ["uvicorn", "sandbox.mcp_server:app", "--host", "0.0.0.0", "--port", "9000"]
     environment:
       WORKSPACE_DIR: "/workspace"
+      CONFIG_DIR: "/config"
+      STATE_DIR: "/state"
+      CACHE_DIR: "/cache"
       PROJECT_DIR: "/project"
-      MEMPALACE_HOME: "/mempalace"
-      PROMPTS_DIR: "/app/prompts"
+      MEMPALACE_HOME: "/state/chroma"
+      PROMPTS_DIR: "/config/prompts"
+      GENERATED_DIR: "/cache/prompts"
       EXA_API_KEY: "${EXA_API_KEY:-}"
       NOTION_URL: "http://phoebe-notion:3000"
       NOTION_TOKEN: "${NOTION_TOKEN:-}"
@@ -149,7 +154,13 @@ services:
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
       LLAMA_URL: "http://llama-api-manager:8081"
     volumes:
-      # Shared workspace (soul, memory, user files)
+      # User-edited config: identity, skills, prompts, *.yaml (rw — skills are agent-written)
+      - ./config:/config
+      # Agent-written persistent state: soul/, memory/, sessions/, discord/, chroma/
+      - ./state:/state
+      # Regenerable cache: prompts/ (audit trail, cleaned per-session)
+      - ./cache:/cache
+      # Agent scratch (downloads, clones, tool tests, venv)
       - ./workspace:/workspace
       # Full project repo for agent self-inspection — read-only (not a clone)
       - .:/project:ro
@@ -157,9 +168,6 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Live-reload: code changes take effect on next request without rebuild
       - ./sandbox:/app/sandbox
-      - ./prompts:/app/prompts
-      # MemPalace persistent ChromaDB storage
-      - ./mempalace:/mempalace
     network_mode: "service:phoebe-vpn"
     # No ports: section — not exposed to host, internal network only
     mem_limit: 1g
@@ -198,17 +206,24 @@ services:
       # Path overrides (these paths are inside the container)
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
-      SESSIONS_DIR: "/sessions"
+      SESSIONS_DIR: "/state/sessions"
       WORKSPACE_DIR: "/workspace"
-      PROMPTS_DIR: "/app/prompts"
+      CONFIG_DIR: "/config"
+      STATE_DIR: "/state"
+      CACHE_DIR: "/cache"
+      PROMPTS_DIR: "/config/prompts"
+      GENERATED_DIR: "/cache/prompts"
     volumes:
-      # Shared workspace
+      # User-edited config: identity, skills, prompts, *.yaml
+      - ./config:/config
+      # Agent-written persistent state (session logs land here)
+      - ./state:/state
+      # Regenerable cache (generated prompts audit trail)
+      - ./cache:/cache
+      # Agent scratch
       - ./workspace:/workspace
-      # Session logs (JSONL, API only)
-      - ./sessions:/sessions
-      # Live-editable: config, prompts, and app code all reload without restart
+      # Live-editable: code + config reload without restart
       - ./config:/app/config
-      - ./prompts:/app/prompts
       - ./app:/app/app
       # Tests (pure-unit runnable inside the container via `make test-fast`)
       - ./test:/app/test

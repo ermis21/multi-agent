@@ -182,9 +182,34 @@ class DebateConfig(BaseModel):
 class LoggingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    sessions_dir: str = "/sessions"
+    sessions_dir: str = "/state/sessions"
     log_supervisor_turns: bool = True
     verbose_tools: bool = True
+
+
+# ── Context compression (Gemma-aware budgets + elision) ──────────────────────
+
+class ContextBudgets(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    soul: int = Field(512, ge=0)
+    user: int = Field(256, ge=0)
+    memory: int = Field(512, ge=0)
+    identity: int = Field(128, ge=0)
+    tool_docs: int = Field(1500, ge=0)
+    skills: int = Field(800, ge=0)
+    history: int = Field(6000, ge=0)
+    tool_result_inline: int = Field(1500, ge=0)
+
+
+class ContextConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    budgets: ContextBudgets = Field(default_factory=ContextBudgets)
+    total_soft_cap: int = Field(12000, ge=0)
+    tokenizer_backend: Literal["llama", "tiktoken", "heuristic"] = "llama"
+    elision_strategy: Literal["head", "tail", "head_tail", "middle"] = "head_tail"
 
 
 # ── Tools (loose — users extend with new integrations) ────────────────────────
@@ -209,6 +234,7 @@ class RootConfig(BaseModel):
     inflection: InflectionConfig = Field(default_factory=InflectionConfig)
     debate: DebateConfig = Field(default_factory=DebateConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

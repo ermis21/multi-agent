@@ -463,7 +463,7 @@ async def scenario_dispatcher_popup(ctx: ScenarioContext) -> None:
 async def scenario_skill_discovery(ctx: ScenarioContext) -> None:
     """Write a SKILL.md directly, confirm the worker sees it in a subsequent turn."""
     import json, pathlib
-    skill_dir = pathlib.Path("/workspace/skills/e2e-probe")
+    skill_dir = pathlib.Path("/config/skills/e2e-probe")
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
         "---\nname: e2e-probe\ndescription: Temporary E2E test skill.\n"
@@ -477,7 +477,7 @@ async def scenario_skill_discovery(ctx: ScenarioContext) -> None:
         ctx.reset_collector()
         await send(
             ctx,
-            "list the names of skill playbooks from workspace/skills — "
+            "list the names of skill playbooks from config/skills — "
             "name only, one per line",
         )
         final = await wait_for_final_reply(ctx, timeout=90)

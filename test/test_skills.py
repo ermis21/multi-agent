@@ -1,4 +1,4 @@
-"""Tests for workspace/skills/*/SKILL.md auto-discovery."""
+"""Tests for config/skills/*/SKILL.md auto-discovery."""
 
 import textwrap
 from pathlib import Path
@@ -10,9 +10,10 @@ from app import prompt_generator
 
 @pytest.fixture
 def tmp_workspace(tmp_path, monkeypatch):
-    """Redirect WORKSPACE to a tmp dir and clear the skills cache so each test
-    sees a fresh world."""
-    monkeypatch.setattr(prompt_generator, "WORKSPACE", tmp_path)
+    """Redirect CONFIG to a tmp dir and clear the skills cache so each test
+    sees a fresh world. Fixture name kept as ``tmp_workspace`` to minimise
+    test-call-site churn."""
+    monkeypatch.setattr(prompt_generator, "CONFIG", tmp_path)
     # Reset the mtime-cached skills list
     if hasattr(prompt_generator, "_SKILLS_CACHE"):
         prompt_generator._SKILLS_CACHE["mtime"] = 0.0
@@ -59,7 +60,7 @@ def test_discover_skills_single(tmp_workspace):
     assert len(entries) == 1
     entry = entries[0]
     assert entry["name"] == "log-triage"
-    assert "workspace/skills/log-triage/SKILL.md" in entry["path"]
+    assert "config/skills/log-triage/SKILL.md" in entry["path"]
 
 
 def test_discover_skills_multiple_sorted(tmp_workspace):
@@ -100,7 +101,7 @@ def test_skills_block_includes_discovered(tmp_workspace):
     block = prompt_generator._build_skills_block([], {})
     # The skill's name and a pointer to its file should appear in the injected block
     assert "log-triage" in block
-    assert "workspace/skills/log-triage" in block
+    assert "config/skills/log-triage" in block
 
 
 def test_skills_block_without_skills_still_renders(tmp_workspace):

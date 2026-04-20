@@ -126,7 +126,7 @@ curl -X POST http://localhost:8090/v1/chat/completions \
 |---|---|---|
 | `worker` | Primary responder — executes tools and produces responses | 10 |
 | `supervisor` | Grades worker responses (pass/score/feedback JSON) | — |
-| `soul_updater` | Daily cron — rewrites `workspace/SOUL.md` from workspace context | 8 |
+| `soul_updater` | Daily cron — rewrites `state/soul/SOUL.md` from curated context | 8 |
 | `config_agent` | Guides users through config questions, writes `config.yaml` | — |
 | `improvement_agent` | Self-improvement via git + test stack | 20 |
 | `discord_agent` | Discord operations (send/read/manage channels) | 10 |
@@ -199,16 +199,21 @@ Defines each agent role: allowed tools, system prompt reference, and max iterati
 
 ---
 
-## Workspace
+## Project layout (XDG-segregated)
 
-Persistent agent identity and memory live in `workspace/`:
+Five top-level trees, one lifecycle each. Agents address any of them with a matching path prefix; no prefix = `workspace/` (scratch). Mirrors the existing `project/` prefix convention for the read-only repo mount.
 
-| File | Purpose |
-|---|---|
-| `SOUL.md` | Agent personality and operating principles (auto-updated by `soul_updater`) |
-| `IDENTITY.md` | Role, capabilities, and constraints |
-| `MEMORY.md` | Accumulated operational memory |
-| `USER.md` | User preferences and context |
+| Prefix | Host dir | Mount | Lifecycle | Contents |
+|---|---|---|---|---|
+| `config/` | `./config/` | rw | User-edited | `identity/` (IDENTITY, USER, MEMORY files), `skills/` (playbooks), `prompts/` (templates), `*.yaml` |
+| `state/` | `./state/` | rw | Agent persistent | `soul/` (SOUL.md), `memory/` (daily snapshots), `sessions/` (per-session state), `discord/`, `chroma/` (ChromaDB) |
+| `cache/` | `./cache/` | rw | Regenerable | `prompts/` (assembled prompt audit trail) |
+| `workspace/` | `./workspace/` | rw | Agent scratch | `venv/` + anything else agents write; safe to prune |
+| `project/` | `.` | **ro** | Repo source | The checked-out tree itself (`.env*` blocked) |
+
+Writes without a prefix default to `workspace/`. The legacy `system/` prefix is rejected with an explicit pointer to the new roots.
+
+**Owned subpaths:** `config/identity/*` is user-edited; `state/soul/`, `state/memory/`, and `config/skills/` are rewritten only by the `soul_updater` and `skill_builder` roles.
 
 ---
 
@@ -218,7 +223,7 @@ Two cron jobs start automatically with `phoebe-api`:
 
 | Job | Schedule | Description |
 |---|---|---|
-| Soul Update | 05:00 daily | Reads workspace files, rewrites `SOUL.md` |
+| Soul Update | 05:00 daily | Reads curated context, rewrites `state/soul/SOUL.md` |
 | Discord Moderation | 10:00 every 3 days | Organises channels, archives inactive ones |
 
 ---

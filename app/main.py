@@ -31,8 +31,8 @@ from app.agents import run_agent_loop, run_agent_role, run_config_agent, run_sou
 from app.config_loader import get_config, patch_config
 from app.mcp_client import call_tool, resolve_approval
 from app.prompt_generator import cleanup_all_generated
-from app.session_logger import get_session, list_sessions
-from app.session_state import SessionState
+from app.sessions.logger import get_session, list_sessions
+from app.sessions.state import SessionState
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
@@ -84,8 +84,8 @@ async def lifespan(app: FastAPI):
 
     # Migrate flat sessions/{sid}.* layout to sessions/{sid}/{file} (idempotent).
     try:
-        from app.session_migrate import migrate_flat_to_folders
-        from app.session_logger import SESSIONS_DIR
+        from app.sessions.migrate import migrate_flat_to_folders
+        from app.sessions.logger import SESSIONS_DIR
         summary = migrate_flat_to_folders(SESSIONS_DIR)
         if summary["moved"]:
             print(
@@ -325,7 +325,7 @@ async def kill_session(session_id: str):
 @app.get("/v1/sessions/{session_id}/state")
 async def get_state(session_id: str):
     """Full persistent state for a session. Creates a default file if missing."""
-    from app.session_state import SessionState
+    from app.sessions.state import SessionState
     st = SessionState.load_or_create(session_id)
     return JSONResponse(st.data)
 
@@ -337,7 +337,7 @@ async def patch_state(session_id: str, request: Request):
     Lists are replaced wholesale; dicts merge recursively. Use an empty
     dict `{}` for a key to clear it.
     """
-    from app.session_state import SessionState
+    from app.sessions.state import SessionState
     patch = await request.json()
     if not isinstance(patch, dict):
         raise HTTPException(400, "Body must be a JSON object")
@@ -418,7 +418,7 @@ async def trigger_soul_update():
     Manually trigger the soul update job (useful for testing without waiting for 5 AM).
     """
     await run_soul_update()
-    return {"status": "ok", "message": "Soul update completed. Check workspace/SOUL.md."}
+    return {"status": "ok", "message": "Soul update completed. Check state/soul/SOUL.md."}
 
 
 @app.get("/internal/diagnostics")
@@ -519,7 +519,7 @@ async def health():
 @app.get("/sessions")
 async def sessions_list():
     """List all sessions with turn counts and last timestamp, enriched with state metadata."""
-    from app.session_state import SessionState
+    from app.sessions.state import SessionState
     sessions = list_sessions()
     for entry in sessions:
         sid = entry.get("session_id")

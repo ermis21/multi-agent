@@ -20,7 +20,7 @@ from uuid import uuid4
 import httpx
 
 from app.config_loader import get_config, patch_config
-from app.session_state import SessionState, log_approval
+from app.sessions.state import SessionState, log_approval
 
 SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://phoebe-sandbox:9000")
 
