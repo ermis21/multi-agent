@@ -74,6 +74,7 @@ def _default_state(session_id: str) -> dict[str, Any]:
             "full": full,
             "active": None,
             "compaction_covers_up_to_turn": None,
+            "last_compaction_ts": None,
         },
 
         "permissions": {
@@ -324,6 +325,19 @@ class SessionState:
                 return default
             node = node[p]
         return node
+
+    def record_compaction(self, covers_up_to_turn: int, active_rel_path: str) -> None:
+        """Atomically update the three history fields after a successful compaction.
+
+        Called by app.compactor.run_compaction once the compactor role has
+        produced a well-formed body and the pseudo-turn has been appended to
+        active.jsonl. Caller owns the save() — we only mutate in memory so the
+        set is visible as a single flush.
+        """
+        hist = self.data.setdefault("history", {})
+        hist["active"] = active_rel_path
+        hist["compaction_covers_up_to_turn"] = int(covers_up_to_turn)
+        hist["last_compaction_ts"] = _now()
 
     def add_sub_session(self, child_sid: str) -> None:
         sub = self.data["sub_sessions"]

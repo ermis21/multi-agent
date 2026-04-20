@@ -128,16 +128,75 @@ def transform_markdown_tables(text: str) -> str:
     return "\n".join(out)
 
 
+_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)", re.MULTILINE)
+
+
+def _active_fence_tag(text: str) -> str | None:
+    """Return the tag of the fence that is still open at the end of `text`,
+    or None if fences are balanced.
+
+    The tag is whatever followed ``` on the opening line (e.g. 'python',
+    'json', '') — we preserve it so the next chunk re-opens with the same
+    syntax highlighting.
+    """
+    opens = list(_FENCE_OPEN_RE.finditer(text))
+    if len(opens) % 2 == 0:
+        return None
+    return opens[-1].group(1)
+
+
 def split_message(text: str) -> list[str]:
-    """Split text into Discord-safe chunks, breaking at newlines where possible."""
+    """Split text into Discord-safe chunks, breaking at newlines where possible.
+
+    Code-fence-aware: if a chunk ends with an unclosed ```-block, the chunk is
+    closed with ``` and the next chunk is opened with ```<tag> so syntax
+    highlighting survives the boundary. Prevents the "1950-char code block
+    cuts mid-function" bug where msg N ends with an unterminated fence and
+    msg N+1 renders the opener as literal backticks.
+    """
     text = transform_markdown_tables(text)
-    chunks = []
-    while len(text) > MAX_MSG_LEN:
-        split_at = text.rfind("\n", 0, MAX_MSG_LEN)
+    chunks: list[str] = []
+    carry_fence_tag: str | None = None  # tag to re-open at start of next chunk
+
+    while True:
+        # Re-open the previous chunk's still-open fence before measuring length.
+        prefix = f"```{carry_fence_tag}\n" if carry_fence_tag is not None else ""
+        remaining = prefix + text
+        if len(remaining) <= MAX_MSG_LEN:
+            if remaining:
+                chunks.append(remaining)
+            break
+
+        # Hunt for a newline-aligned split inside the budget.
+        # We budget an extra 4 chars for a possible trailing "\n```" close.
+        budget = MAX_MSG_LEN - 4
+        split_at = remaining.rfind("\n", 0, budget)
         if split_at == -1:
-            split_at = MAX_MSG_LEN
-        chunks.append(text[:split_at])
-        text = text[split_at:].lstrip()
-    if text:
-        chunks.append(text)
-    return chunks
+            split_at = budget
+
+        piece = remaining[:split_at]
+        rest  = remaining[split_at:].lstrip("\n")
+
+        # If the piece leaves a fence open, close it and remember the tag for
+        # the next chunk. `_active_fence_tag` sees the prefix we prepended, so
+        # it correctly counts the re-opened carry fence too.
+        open_tag = _active_fence_tag(piece)
+        if open_tag is not None:
+            piece = piece.rstrip() + "\n```"
+            carry_fence_tag = open_tag
+        else:
+            carry_fence_tag = None
+
+        chunks.append(piece)
+
+        # If the rest is only a closing fence we just opened, skip carrying —
+        # the next iteration would emit ```<tag>\n```\n, which is noise.
+        if carry_fence_tag is not None and rest.strip() == "```":
+            chunks[-1] = chunks[-1].rstrip().removesuffix("```").rstrip() + "\n```"
+            carry_fence_tag = None
+            text = ""
+            continue
+
+        text = rest
+
+    return [c for c in chunks if c]

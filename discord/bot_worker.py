@@ -119,11 +119,34 @@ def _sync_session_state(session_id: str) -> None:
 # Set by main.py after both bots are initialised; avoids circular imports.
 _thinking_client: discord.Client | None = None
 _thinking_tasks:  dict[str, asyncio.Task] = {}   # session_id → running task
+_thinking_started_at: dict[str, float] = {}     # session_id → epoch seconds
+_thinking_watchdog_task: asyncio.Task | None = None
+_THINKING_MAX_AGE_S = 15 * 60  # force-cancel after 15 min — catches mod-bot crashes
 
 
 def set_thinking_client(client_ref: discord.Client) -> None:
     global _thinking_client
     _thinking_client = client_ref
+
+
+async def _thinking_watchdog() -> None:
+    """Sweep stale thinking indicators every 60s.
+
+    Protects against mod-bot crashes + orphan tasks — without this, a missed
+    `_stop_thinking` call leaves the nickname stranded as "🧠 thinking" and
+    the typing loop running indefinitely.
+    """
+    while True:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+        now = time.time()
+        for sid, started in list(_thinking_started_at.items()):
+            if now - started > _THINKING_MAX_AGE_S:
+                print(f"[thinking] watchdog force-cancel sid={sid} age={now - started:.0f}s",
+                      flush=True)
+                _stop_thinking(sid)
 
 
 async def _run_thinking_indicator(channel: discord.TextChannel) -> None:
@@ -163,6 +186,7 @@ async def _run_thinking_indicator(channel: discord.TextChannel) -> None:
 
 
 def _start_thinking(session_id: str, channel: discord.TextChannel) -> None:
+    global _thinking_watchdog_task
     if session_id in _thinking_tasks:
         return
     task = asyncio.create_task(
@@ -170,10 +194,17 @@ def _start_thinking(session_id: str, channel: discord.TextChannel) -> None:
         name=f"thinking_{session_id}",
     )
     _thinking_tasks[session_id] = task
+    _thinking_started_at[session_id] = time.time()
+    # Launch the sweeper lazily on first indicator start.
+    if _thinking_watchdog_task is None or _thinking_watchdog_task.done():
+        _thinking_watchdog_task = asyncio.create_task(
+            _thinking_watchdog(), name="thinking_watchdog"
+        )
 
 
 def _stop_thinking(session_id: str) -> None:
     task = _thinking_tasks.pop(session_id, None)
+    _thinking_started_at.pop(session_id, None)
     if task and not task.done():
         task.cancel()
 
@@ -244,11 +275,14 @@ async def _send_via_mod(channel_id: int, embed: discord.Embed) -> None:
 
 async def _render_supervisor_verdict(channel_id: int, data: dict) -> None:
     attempt   = data.get("attempt", 0)
+    max_att   = data.get("max_attempts") or 0
     score     = float(data.get("score", 0.0))
     threshold = float(data.get("pass_threshold", 0.7))
 
+    # "attempt 2/3" reads as progress; bare "attempt 2" reads as a dupe.
+    title_suffix = f"attempt {attempt}/{max_att}" if max_att else f"attempt {attempt}"
     embed = discord.Embed(
-        title=f"⚠ Supervisor flagged retry (attempt {attempt})",
+        title=f"⚠ Supervisor flagged retry ({title_suffix})",
         description=_truncate(data.get("feedback", "(no summary)"), 1500),
         color=_verdict_color(score, threshold),
     )
@@ -613,12 +647,55 @@ async def _auto_rename_channel(channel: discord.TextChannel) -> None:
 
 # ── Approval UI (buttons + embed) ────────────────────────────────────────────
 
+def _approval_intent_summary(tool: str, params: dict) -> str:
+    """One-sentence plain-English intent for an approval prompt.
+
+    Raw JSON params + bare tool name invited misclicks on "Always allow" —
+    this reduces the cognitive load to a single skimmable line. Falls back
+    to tool + short params for tools we don't have a template for.
+    """
+    def _short(v, n=80):
+        s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        return s if len(s) <= n else s[:n - 1] + "…"
+
+    if tool in ("file_write", "file_edit"):
+        return f"Write to `{params.get('path', '?')}`"
+    if tool == "file_move":
+        return f"Move `{params.get('src', '?')}` → `{params.get('dst', '?')}`"
+    if tool in ("shell_exec", "execute_command"):
+        return f"Run shell: `{_short(params.get('command', ''))}`"
+    if tool == "git_commit":
+        return f"Git commit: {_short(params.get('message', 'agent: automated update'), 100)}"
+    if tool == "git_rollback":
+        return "Git rollback: revert HEAD"
+    if tool == "write_config":
+        patch = params.get("patch") or params
+        keys = list(patch.keys()) if isinstance(patch, dict) else []
+        return f"Change config: {', '.join(keys) or 'unspecified'}"
+    if tool == "web_fetch":
+        return f"Fetch web page: {_short(params.get('url', '?'), 100)}"
+    if tool in ("discord_send", "discord_edit_channel", "discord_create_channel",
+                "discord_delete_channel"):
+        return f"Discord: `{tool}` on channel `{params.get('channel_id', '?')}`"
+    if tool == "docker_test_up":
+        return "Start the Docker test stack"
+    if tool == "run_agent":
+        return f"Spawn sub-agent: `{params.get('role', '?')}`"
+    if tool == "deliberate":
+        return "Start a multi-advocate deliberation"
+    # Fallback: tool name + short params preview.
+    short_params = _short(params, 100)
+    return f"Call `{tool}` with {short_params}"
+
+
 def _make_approval_embed(approval: dict, mode: str) -> discord.Embed:
     """Build the orange approval-request embed shown when a tool needs confirmation."""
     tool   = approval["tool"]
     params = approval.get("params", {})
+    intent = _approval_intent_summary(tool, params)
     embed  = discord.Embed(
         title=f"🔐  Approval Required: `{tool}`",
+        description=intent,
         color=discord.Color.orange(),
     )
     embed.add_field(name="Mode", value=f"`{mode}`", inline=True)
@@ -817,6 +894,11 @@ async def cmd_clear(interaction: discord.Interaction):
 
     channel = interaction.channel
 
+    # Bot-created channels share one session across every user in the channel;
+    # legacy channels scope sessions per user. The confirmation copy has to
+    # reflect that so user A doesn't accidentally nuke user B's context
+    # without realising.
+    is_shared = channel.id in _channel_sessions
     reset_channel_session(channel.id, interaction.user.id)
 
     # Delete all messages in THIS channel only
@@ -832,8 +914,22 @@ async def cmd_clear(interaction: discord.Interaction):
         await interaction.followup.send(f"Could not delete messages: {e}", ephemeral=True)
         return
 
-    await channel.send("🔄 Conversation cleared. Fresh start!")
-    await interaction.followup.send(f"Deleted {count} messages and reset the session.", ephemeral=True)
+    if is_shared:
+        await channel.send(
+            "🔄 **Shared session reset.** This channel's context is wiped for everyone — "
+            "fresh start for all users."
+        )
+        await interaction.followup.send(
+            f"Deleted {count} messages and reset the shared channel session. "
+            f"Any other users here are also starting from scratch.",
+            ephemeral=True,
+        )
+    else:
+        await channel.send("🔄 Conversation cleared. Fresh start!")
+        await interaction.followup.send(
+            f"Deleted {count} messages and reset your session.",
+            ephemeral=True,
+        )
 
 
 @tree.command(name="mode", description="Switch agent mode")
@@ -859,20 +955,37 @@ async def cmd_mode(interaction: discord.Interaction, mode: app_commands.Choice[s
     )
 
 
-async def _fetch_model_presets() -> dict[str, dict]:
+# /model is hit repeatedly for "what's current?" checks; each call was a
+# 5–8s cold GET to phoebe-api. 60s TTL is long enough to coalesce bursts and
+# short enough that a config edit shows up on the next tick.
+_model_presets_cache: dict[str, object] = {"data": None, "fetched_at": 0.0}
+_MODEL_PRESETS_TTL_S = 60.0
+
+
+async def _fetch_model_presets(force: bool = False) -> dict[str, dict]:
     """Pull the named-model list from phoebe-api's live config. Filters out
-    internal-use entries (debate/checkpoint helpers with tiny max_tokens)."""
+    internal-use entries (debate/checkpoint helpers with tiny max_tokens).
+
+    Cached for _MODEL_PRESETS_TTL_S seconds; pass force=True to bypass.
+    """
+    now = time.time()
+    cached = _model_presets_cache.get("data")
+    fetched_at = float(_model_presets_cache.get("fetched_at") or 0.0)
+    if not force and cached is not None and now - fetched_at < _MODEL_PRESETS_TTL_S:
+        return cached  # type: ignore[return-value]
     try:
         resp = await _http.get(f"{PHOEBE_API_URL}/config", timeout=5)
         resp.raise_for_status()
         models = resp.json().get("models", {}) or {}
     except Exception:
-        return {}
-    # Drop internal helpers that aren't meaningful as full-session models
-    return {
+        return cached or {}  # type: ignore[return-value]
+    filtered = {
         name: spec for name, spec in models.items()
         if isinstance(spec, dict) and spec.get("max_tokens", 0) >= 1024
     }
+    _model_presets_cache["data"] = filtered
+    _model_presets_cache["fetched_at"] = now
+    return filtered
 
 
 @tree.command(name="model", description="Show or switch the current LLM model")
@@ -900,6 +1013,9 @@ async def cmd_model(
                 json={"llm": patch},
             )
             resp.raise_for_status()
+            # Config just changed — invalidate caches so next /model shows truth.
+            _model_presets_cache["data"] = None
+            _model_presets_cache["fetched_at"] = 0.0
             llm = resp.json().get("config", {}).get("llm", {})
             # For local providers, probe /models to replace any placeholder model id
             if patch.get("provider") == "local":
@@ -1001,6 +1117,13 @@ async def cmd_btw(interaction: discord.Interaction, text: str):
     await interaction.response.send_message(f"-# \U0001f4dd injected: {snippet}")
 
 
+# channel_id → epoch seconds of the last /stop request. Used to upgrade a
+# second /stop within the cooperative-grace window into an immediate hard
+# cancel via /kill, per UX audit item 9.
+_stop_request_ts: dict[int, float] = {}
+_STOP_HARD_CANCEL_WINDOW_S = 15.0  # matches app/main.py _hard_cancel_after
+
+
 @tree.command(name="stop", description="Stop the current worker run in this channel")
 async def cmd_stop(interaction: discord.Interaction):
     if not is_allowed(interaction.user.id):
@@ -1010,27 +1133,55 @@ async def cmd_stop(interaction: discord.Interaction):
     if not sid:
         await interaction.response.send_message("No active run in this channel.", ephemeral=True)
         return
+
+    now = time.time()
+    last_stop = _stop_request_ts.get(interaction.channel_id)
+    if last_stop is not None and now - last_stop < _STOP_HARD_CANCEL_WINDOW_S:
+        # Second /stop within the grace window → escalate to hard cancel.
+        try:
+            resp = await _http.post(f"{PHOEBE_API_URL}/v1/sessions/{sid}/kill", timeout=5)
+            if resp.status_code == 200:
+                await interaction.response.send_message(
+                    "\U0001f6d1 **Hard cancel** — worker terminated immediately."
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Hard cancel returned HTTP {resp.status_code}.", ephemeral=True
+                )
+        except Exception as e:
+            await interaction.response.send_message(f"Hard cancel failed: {e}", ephemeral=True)
+        finally:
+            _stop_request_ts.pop(interaction.channel_id, None)
+        return
+
     result = await _post_injection(sid, "", mode="stop")
     if result is None:
         await interaction.response.send_message("Stop request failed.", ephemeral=True)
         return
-    await interaction.response.send_message("\U0001f6d1 stop requested — worker will exit at the next iteration.")
+    _stop_request_ts[interaction.channel_id] = now
+    await interaction.response.send_message(
+        "\U0001f6d1 Stopping at the next safe point (up to 15s). "
+        "Send `/stop` again within that window to force-kill immediately."
+    )
 
 
 @tree.command(name="help", description="List available slash commands")
 async def cmd_help(interaction: discord.Interaction):
     msg = (
-        "**Available commands:**\n"
+        "**Always available**\n"
         "• `/new` — Start a fresh conversation in a new channel\n"
         "• `/clear` — Reset conversation and delete all messages in this channel\n"
         "• `/mode [plan|build|converse]` — Switch agent mode\n"
         "• `/model` — Show current LLM model and settings\n"
         "• `/speak <prompt>` — Ask the agent a question and get a voice response\n"
-        "• `/btw <text>` — Add context mid-flight without stopping the agent\n"
-        "• `/stop` — Cancel the currently running worker loop in this channel\n"
         "• `/status` — Show your current mode, session, and system status\n"
         "• `/help` — This message\n\n"
-        "**Modes:**\n"
+        "**Only while I'm working on something** (worker run in flight)\n"
+        "• `/btw <text>` — Add context mid-flight without stopping the agent\n"
+        "• `/stop` — Cancel the currently running worker loop in this channel\n"
+        "*Tip:* just sending a normal message during a run pops up a 4-button\n"
+        "popup (Immediate / Not urgent / Clarify / Queue) — usually easier than `/btw`.\n\n"
+        "**Modes**\n"
         "• **plan** — Investigate and produce a structured plan for review\n"
         "• **build** — Execute the active plan step by step with full tools\n"
         "• **converse** — Quick questions and casual chat; suggests plan mode for complex tasks\n\n"
@@ -1305,6 +1456,24 @@ async def on_message(msg: discord.Message):
         )
 
         chunks = split_message(answer)
+        # Discord hard-caps content at 2000 chars. split_message targets
+        # MAX_MSG_LEN (1900) but fence-carry edits can push a chunk slightly
+        # over in pathological inputs — guard so the Last chunk with a View
+        # attached doesn't silently fail on a length violation.
+        DISCORD_CONTENT_HARD_CAP = 2000
+        safe_chunks: list[str] = []
+        for c in chunks:
+            if len(c) > DISCORD_CONTENT_HARD_CAP:
+                print(f"[worker-bot] chunk {len(c)}ch over {DISCORD_CONTENT_HARD_CAP} — splitting",
+                      flush=True)
+                # Hard-split at the cap. Leaves fence mismatch to Discord's
+                # renderer, but at least the message sends.
+                for j in range(0, len(c), DISCORD_CONTENT_HARD_CAP - 20):
+                    safe_chunks.append(c[j:j + DISCORD_CONTENT_HARD_CAP - 20])
+            else:
+                safe_chunks.append(c)
+        chunks = safe_chunks
+
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1
             if is_last and is_plan_output:
@@ -1335,6 +1504,15 @@ async def on_message(msg: discord.Message):
                 await on_message(fake)  # type: ignore[arg-type]
             except Exception as e:
                 print(f"[worker-bot] queued-injection replay failed: {e}", flush=True)
+                # Silent failure was the original sin — user thinks their
+                # queued follow-up was delivered. Tell them to resend.
+                preview = q_text.split("\n", 1)[0][:140]
+                try:
+                    await msg.channel.send(
+                        f"⚠️ Queued follow-up couldn't replay: `{preview}` — please resend."
+                    )
+                except Exception:
+                    pass
 
 
 async def run():

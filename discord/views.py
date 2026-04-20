@@ -276,7 +276,10 @@ class InjectionView(discord.ui.View):
     """
 
     def __init__(self, session_id: str, text: str, author_id: int):
-        super().__init__(timeout=120)
+        # Matches the worker-stream + approval timeouts (660s) so a user who's
+        # thinking through how to route their mid-flight message doesn't lose
+        # the prompt out from under them.
+        super().__init__(timeout=660)
         self.session_id = session_id
         self.text = text
         self.author_id = author_id
@@ -321,6 +324,9 @@ class InjectionView(discord.ui.View):
             try:
                 for item in self.children:
                     item.disabled = True  # type: ignore[attr-defined]
-                await self.message.edit(content="Injection prompt timed out.", view=self)
+                await self.message.edit(
+                    content="⏱️ Prompt expired — resend your message to get the options again.",
+                    view=self,
+                )
             except Exception:
                 pass

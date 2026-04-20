@@ -384,6 +384,7 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
                     "event": "supervisor_verdict",
                     "data": {
                         "attempt":              attempt + 1,
+                        "max_attempts":         total_attempts,
                         "score":                score,
                         "pass_threshold":       effective_threshold,
                         "feedback":             supervisor_result.get("feedback", ""),
