@@ -7,9 +7,48 @@ loop in app.loop injects those arrays as retry feedback.
 """
 
 import json
+import re
 
 from app.llm import _content, _llm_call
 from app.mcp_client import strip_json_fences
+
+
+# Weak supervisor models occasionally claim "no tools were called" even when the
+# trace contains tool calls. Under the plan-mode rubric this directly produces a
+# zero-score fail. `_detect_hallucinated_zero_tool_claim` catches the mismatch so
+# `loop.py` can override the verdict before it reaches the user.
+_HALLUCINATION_PATTERNS = re.compile(
+    r"("
+    r"no tools?(?:\s+\w+){0,4}?\s+called"
+    r"|no tool calls?(?:\s+\w+){0,3}?\s+made"
+    r"|no calls?(?:\s+\w+){0,3}?\s+made"
+    r"|(?:did not|didn't)\s+(?:use|make|call)(?:\s+\w+){0,2}?\s+tools?"
+    r"|tool log shows no calls"
+    r"|zero tools?\s+(?:called|used)"
+    r"|without\s+(?:using|making|calling)(?:\s+\w+){0,2}?\s+tools?"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _detect_hallucinated_zero_tool_claim(verdict: dict, tool_count: int) -> str | None:
+    """Return a mismatch description if the verdict claims zero tools but the
+    trace had at least one; else None. Checks feedback + all issue-array strings.
+    """
+    if tool_count <= 0:
+        return None
+    texts: list[str] = [str(verdict.get("feedback", ""))]
+    for key in ("tool_issues", "source_gaps", "research_gaps",
+                "accuracy_issues", "completeness_issues"):
+        for item in verdict.get(key, []) or []:
+            texts.append(str(item))
+    for text in texts:
+        m = _HALLUCINATION_PATTERNS.search(text)
+        if m:
+            snippet = text.strip().replace("\n", " ")[:140]
+            return (f"supervisor claimed no tools despite trace of "
+                    f"{tool_count} call(s); matched {m.group(0)!r} in: {snippet!r}")
+    return None
 
 
 def _classify_worker_modality(tool_traces: list[dict]) -> tuple[str, float, int]:

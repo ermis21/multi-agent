@@ -123,3 +123,59 @@ def test_threshold_missing_agent_uses_07():
 def test_threshold_bad_override_ignored():
     cfg = {"agent": {"supervisor_pass_threshold": 0.7, "supervisor_mode_overrides": {"plan": "bad"}}}
     assert _effective_threshold(cfg, "plan") == 0.7
+
+
+# ── _detect_hallucinated_zero_tool_claim (hallucination guard) ───────────────
+
+from app.supervisor import _detect_hallucinated_zero_tool_claim  # noqa: E402
+
+
+def test_hallucination_guard_fires_on_feedback():
+    verdict = {
+        "pass": False, "score": 0.0,
+        "feedback": "The worker failed. No tools were actually called.",
+        "tool_issues": [], "source_gaps": [], "research_gaps": [],
+        "accuracy_issues": [], "completeness_issues": [],
+    }
+    reason = _detect_hallucinated_zero_tool_claim(verdict, tool_count=3)
+    assert reason is not None
+    assert "3 call" in reason
+
+
+def test_hallucination_guard_fires_on_issue_array():
+    verdict = {
+        "feedback": "ok",
+        "tool_issues": ["worker did not use any tools"],
+        "accuracy_issues": [],
+    }
+    reason = _detect_hallucinated_zero_tool_claim(verdict, tool_count=2)
+    assert reason is not None
+
+
+def test_hallucination_guard_quiet_when_zero_tools_real():
+    """A genuine zero-tool turn should not trigger the guard."""
+    verdict = {"feedback": "no tools were called", "tool_issues": []}
+    assert _detect_hallucinated_zero_tool_claim(verdict, tool_count=0) is None
+
+
+def test_hallucination_guard_quiet_when_feedback_is_accurate():
+    verdict = {
+        "feedback": "worker used web_search but the result was sparse",
+        "tool_issues": ["web_search query was underspecified"],
+    }
+    assert _detect_hallucinated_zero_tool_claim(verdict, tool_count=1) is None
+
+
+def test_hallucination_guard_matches_various_phrasings():
+    for phrase in (
+        "no tools were called",
+        "no tools actually called",
+        "tool log shows no calls",
+        "did not use any tools",
+        "did not make any tools",
+        "zero tools used",
+        "no tool calls were made",
+        "without using any tools",
+    ):
+        verdict = {"feedback": f"failing because: {phrase}."}
+        assert _detect_hallucinated_zero_tool_claim(verdict, tool_count=1) is not None, phrase

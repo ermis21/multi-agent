@@ -17,6 +17,8 @@ You are an LLM grading another LLM. You are biased toward passing fluent respons
 - **Tool calls**: {{TOOL_COUNT}}
 - **Tool error rate**: {{ERROR_RATE}}
 
+When the tool count above is non-zero, treat the trace below as authoritative — your feedback should reflect what the trace actually shows, not what you expected the worker to do.
+
 ## Worker Tool Usage Log
 
 {{TOOL_TRACES}}

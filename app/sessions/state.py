@@ -395,6 +395,27 @@ def log_tool_error(session_id: str, tool: str, error: str, params_preview: str =
     )
 
 
+def log_supervisor_override(session_id: str, attempt: int, reason: str,
+                            original: dict, overridden: dict) -> None:
+    """Record a programmatic override of a supervisor verdict (e.g. hallucination guard)."""
+    _append_jsonl(
+        _sidecar_path(session_id, "supervisor_overrides"),
+        {
+            "attempt": attempt,
+            "reason": reason,
+            "original": {
+                "pass":  original.get("pass"),
+                "score": original.get("score"),
+                "feedback": original.get("feedback", "")[:500],
+            },
+            "overridden": {
+                "pass":  overridden.get("pass"),
+                "score": overridden.get("score"),
+            },
+        },
+    )
+
+
 # ── Cache control ─────────────────────────────────────────────────────
 
 def drop_from_cache(session_id: str) -> None:

@@ -35,7 +35,9 @@ _RESEARCH_RULE = (
 )
 
 
-def _mode_context_string(mode: str, cfg: dict | None = None, role_cfg: dict | None = None) -> str:
+def _mode_context_string(mode: str, cfg: dict | None = None,
+                         role_cfg: dict | None = None,
+                         plan_file: str | None = None) -> str:
     """Render the {{AGENT_MODE}} block for a worker prompt.
 
     When `cfg` is supplied, the block is config-driven: it lists the tools actually
@@ -43,6 +45,9 @@ def _mode_context_string(mode: str, cfg: dict | None = None, role_cfg: dict | No
     collapsed to one line by setting `prompts.describe_mode_in_system_prompt: false`,
     or per-model via `models.<name>.describe_mode_in_system_prompt` — useful for
     models (e.g. Claude) that already understand plan/build/converse semantics.
+
+    `plan_file` is the session-scoped plan artifact path; shown in plan-mode
+    guidance so the worker knows exactly where to write.
     """
     short = _MODE_SHORT.get(mode, "")
     if cfg is None:
@@ -58,14 +63,15 @@ def _mode_context_string(mode: str, cfg: dict | None = None, role_cfg: dict | No
 
     excluded = (cfg.get("agent", {}).get("mode", {}).get(mode, {}) or {}).get("excluded_tools", []) or []
     excluded_list = ", ".join(f"`{t}`" for t in excluded) if excluded else "_(none)_"
+    plan_target = plan_file or "state/sessions/<sid>/plan.md"
 
     sections = {
         "plan": (
-            "**Mode: PLAN** — research-first; produce a file-anchored plan, no writes or execution.\n\n"
+            "**Mode: PLAN** — research-first; produce a file-anchored plan.\n\n"
             f"**Excluded tools in this mode**: {excluded_list}.\n\n"
+            f"- Your plan output goes in `{plan_target}`. Write it there with `file_write` (or revise with `file_edit`). All other filesystem writes (`create_dir`, `file_move`, writes to other paths) auto-fail in plan mode — do not attempt them.\n"
             "- Your final answer MUST name specific file paths (with extensions like `.py`, `.ts`, `.yaml`, `.md`) and the edits to make.\n"
-            "- Do NOT try to substitute an excluded tool with a similar one — e.g. `file_edit` cannot replace `file_write` because `file_edit` only modifies existing files and will fail on new paths.\n"
-            "- If the task requires excluded tools (writing, executing, committing), produce the plan and ask the user to switch with `/mode build`.\n"
+            "- If the task requires execution (running, committing, docker), finish the plan file and ask the user to switch with `/mode build`.\n"
             f"- {_RESEARCH_RULE}"
         ),
         "build": (

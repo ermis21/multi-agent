@@ -70,7 +70,6 @@ agent:
     temperature_delta: 0.3
     plan:
       excluded_tools:
-      - file_write
       - shell_exec
       - git_commit
       - git_rollback

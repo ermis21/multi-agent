@@ -331,7 +331,8 @@ async def _run_worker(
         t0 = time.time()
         tool_result = await call_tool(tc["tool"], tc.get("params", {}), allowed_tools, mode, approved_tools,
                                       session_id=session_id, spawnable_agents=spawnable,
-                                      extra_auto_allow_paths=extra_auto_allow_paths)
+                                      extra_auto_allow_paths=extra_auto_allow_paths,
+                                      trace_queue=trace_queue)
         tool_result = _promote_shell_error(tc["tool"], tool_result)
         duration = time.time() - t0
 

@@ -14,15 +14,16 @@ from pathlib import Path
 import httpx
 
 from app.config_loader import get_agents_config, get_config
-from app.mcp_client import call_tool
+from app.mcp_client import _session_plan_path, call_tool
 from app.llm import _content  # noqa: F401 — kept for potential downstream use
 from app.mode import _mode_context_string, _mode_temperature, _mode_tools
 from app.prompt_generator import cleanup_generated, generate
 from app.sessions.logger import SessionLogger, get_session
-from app.sessions.state import SessionState, TurnAccumulator
+from app.sessions.state import SessionState, TurnAccumulator, log_supervisor_override
 from app.supervisor import (
     _build_supervisor_rubric,
     _classify_worker_modality,
+    _detect_hallucinated_zero_tool_claim,
     _effective_threshold,
     _run_supervisor,
 )
@@ -168,6 +169,15 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
     if mode == "build" and not plan_context:
         plan_context = "[No active plan. Accept single-action requests. For multi-step tasks, suggest /mode plan.]"
 
+    # Plan mode writes go only to this session-scoped artifact (enforced in
+    # call_tool). Persist on state so restarts / replay can locate it.
+    plan_file = _session_plan_path(session_id) if mode == "plan" else None
+    if plan_file:
+        try:
+            state.set("plan.path", plan_file)
+        except Exception:
+            pass
+
     # Persist any new privileged paths granted by this request back onto state.
     if body.get("privileged_paths"):
         state.set("permissions.privileged_paths", privileged_paths)
@@ -251,7 +261,7 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
                 attempt=attempt,
                 agent_mode=mode,
                 extra={
-                    "{{AGENT_MODE}}": _mode_context_string(mode, cfg=cfg, role_cfg=w_cfg),
+                    "{{AGENT_MODE}}": _mode_context_string(mode, cfg=cfg, role_cfg=w_cfg, plan_file=plan_file),
                     "{{PLAN_CONTEXT}}": plan_context,
                     "{{SUPERVISOR_HANDLER}}": supervisor_handler,
                 },
@@ -354,6 +364,26 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
                 s_cfg.get("include_conversation_history", True),
                 role_cfg=s_cfg,
             )
+
+            # Safety net: if the supervisor hallucinated "no tools were called"
+            # despite the trace showing calls, override to pass. Weak models
+            # routinely make this mistake under the plan-mode rubric, which
+            # punishes zero reads as a hard source-gap.
+            override_reason = _detect_hallucinated_zero_tool_claim(supervisor_result, tool_count)
+            if override_reason:
+                original_verdict = dict(supervisor_result)
+                supervisor_result["pass"] = True
+                supervisor_result["score"] = max(
+                    float(supervisor_result.get("score", 0.0)), effective_threshold
+                )
+                supervisor_result["supervisor_override_reason"] = override_reason
+                try:
+                    log_supervisor_override(
+                        session_id, attempt, override_reason,
+                        original_verdict, supervisor_result,
+                    )
+                except Exception:
+                    pass  # best-effort sidecar; never break the turn
 
             if cfg["logging"]["log_supervisor_turns"]:
                 logger.log_turn(attempt, "supervisor", messages, worker_response, supervisor_result)

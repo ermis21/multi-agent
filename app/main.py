@@ -219,18 +219,20 @@ app = FastAPI(title="phoebe-api", version="0.1.0", lifespan=lifespan, docs_url="
 
 # ── SSE streaming helper ──────────────────────────────────────────────────────
 
-async def _sse_generator(queue: asyncio.Queue, timeout: float = 660.0) -> AsyncIterator[str]:
-    """Yield SSE-formatted events from *queue* until a ``done`` event arrives."""
-    deadline = asyncio.get_event_loop().time() + timeout
+async def _sse_generator(queue: asyncio.Queue, idle_timeout: float = 660.0) -> AsyncIterator[str]:
+    """Yield SSE-formatted events from *queue* until a ``done`` event arrives.
+
+    `idle_timeout` bounds time-since-last-event, not total stream time. Each
+    event yielded resets the window, so long approval waits keep the stream
+    alive as long as a heartbeat ticks. Previously this was an absolute deadline
+    at 660 s, which raced the 660 s approval timeout and killed the stream just
+    as the worker was recovering.
+    """
     while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
-            yield f"event: error\ndata: {json.dumps({'error': 'stream timeout'})}\n\n"
-            return
         try:
-            item = await asyncio.wait_for(queue.get(), timeout=remaining)
+            item = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
         except asyncio.TimeoutError:
-            yield f"event: error\ndata: {json.dumps({'error': 'stream timeout'})}\n\n"
+            yield f"event: error\ndata: {json.dumps({'error': 'stream idle timeout'})}\n\n"
             return
         event_type = item.get("event", "unknown")
         event_data = json.dumps(item.get("data", {}), ensure_ascii=False)

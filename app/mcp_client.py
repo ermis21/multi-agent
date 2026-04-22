@@ -97,13 +97,43 @@ def _path_is_auto_allowed(method: str, params: dict, auto_allow_paths: list[str]
     return any(path.startswith(prefix) for prefix in auto_allow_paths)
 
 
+# Plan-mode write scoping — in plan mode, the only writable target is the session
+# plan file. Everything else auto-fails, so the worker can't wait on approval for
+# ad-hoc paths. See RC3 in /home/homelab/.claude/plans/20-58-lets-recursive-owl.md.
+_PLAN_MODE_WRITE_TOOLS: frozenset[str] = frozenset({
+    "file_write", "file_edit", "create_dir", "file_move", "write_config",
+})
+
+
+def _session_plan_path(session_id: str) -> str:
+    """Canonical plan-file path for a session, in the prefix-form tools expect."""
+    sid = session_id or "unknown"
+    return f"state/sessions/{sid}/plan.md"
+
+
+def _normalize_rel_path(path: str) -> str:
+    """Strip leading slash + normalize separators for prefix comparison."""
+    return str(path or "").lstrip("/").replace("\\", "/")
+
+
 async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | None) -> dict:
     """Handle the run_agent local tool — spawns a sub-agent via run_agent_role."""
+    # Coerce common misspellings silently — weak models reach for `agent_name`
+    # because `run_agent` reads naturally with it. Intent is unambiguous.
+    if not params.get("role"):
+        for alt in ("agent_name", "agent", "sub_agent", "name"):
+            if params.get(alt):
+                params["role"] = params[alt]
+                break
     role = params.get("role", "")
     task = params.get("task", "")
-    if not role or not task:
-        return {"error": "run_agent requires 'role' and 'task' parameters."}
     allowed = spawnable or []
+    if not role or not task:
+        return {"error": (
+            f"run_agent needs 'role' (options: {allowed}) and 'task' (full instruction string). "
+            'Example: {"role": "' + (allowed[0] if allowed else "coding_agent") + '", '
+            '"task": "Draft …"}'
+        )}
     if role not in allowed:
         return {"error": f"Cannot spawn '{role}'. Available sub-agents: {allowed}"}
     child_sid = f"{session_id or 'sub'}_{role}_{uuid4().hex[:6]}"
@@ -141,6 +171,31 @@ async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | 
                 pass
 
 
+async def _approval_heartbeat(trace_queue: "asyncio.Queue | None", tool: str,
+                               approval_id: str, interval: float = 90.0) -> None:
+    """Emit periodic `approval_waiting` events into the trace queue so the SSE
+    stream's idle timer stays armed and the Discord bot can show progress.
+    Cancelled by the caller once `event.wait()` resolves.
+    """
+    if trace_queue is None:
+        return
+    elapsed = 0.0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            try:
+                trace_queue.put_nowait({
+                    "event": "approval_waiting",
+                    "data": {"tool": tool, "approval_id": approval_id,
+                             "elapsed_s": int(elapsed)},
+                })
+            except Exception:
+                return
+    except asyncio.CancelledError:
+        return
+
+
 async def call_tool(
     method: str,
     params: dict,
@@ -150,6 +205,7 @@ async def call_tool(
     session_id: str = "",
     spawnable_agents: list[str] | None = None,
     extra_auto_allow_paths: list[str] | None = None,
+    trace_queue: "asyncio.Queue | None" = None,
 ) -> dict:
     """
     Execute a tool call.
@@ -195,6 +251,26 @@ async def call_tool(
         _safe_log_approval(session_id, method, "auto_failed", {"reason": "mode_auto_fail", "mode": mode})
         return {"error": f"Tool '{method}' is permanently blocked in {mode!r} mode by system policy."}
 
+    # Plan-mode write scoping — writes are limited to the session plan file.
+    # `create_dir` / `file_move` / `write_config` naturally fail this check since
+    # their target paths don't match, so the worker stops asking for them mid-plan.
+    if mode == "plan" and method in _PLAN_MODE_WRITE_TOOLS:
+        plan_file = _session_plan_path(session_id)
+        target = params.get("path") or params.get("destination") or ""
+        if _normalize_rel_path(target) != _normalize_rel_path(plan_file):
+            _safe_log_approval(session_id, method, "auto_failed",
+                               {"reason": "plan_mode_write_scope",
+                                "attempted_path": str(target),
+                                "plan_file": plan_file})
+            return {"error": (
+                f"Plan mode only writes to '{plan_file}'. "
+                f"Put your plan there, or switch to build mode for general writes."
+            )}
+        # Target matches the plan file — bypass the ask_user gate.
+        pre_approved = pre_approved | {method}
+        _safe_log_approval(session_id, method, "auto_allowed",
+                           {"reason": "plan_mode_plan_file", "path": str(target)})
+
     # Ask-user gate — skip if pre-approved or if path is auto-allowed.
     # When approval is needed, POST to Discord and wait for the user's response.
     # call_tool() does NOT return until the tool has been approved+executed or denied.
@@ -217,12 +293,21 @@ async def call_tool(
         except Exception as e:
             _pending_approvals.pop(approval_id, None)
             return {"error": f"Could not request approval: {e}"}
+        # Keep the SSE stream's idle window armed while we wait for the user.
+        hb_task = asyncio.create_task(_approval_heartbeat(trace_queue, method, approval_id))
         try:
-            await asyncio.wait_for(event.wait(), timeout=660)
-        except asyncio.TimeoutError:
-            _pending_approvals.pop(approval_id, None)
-            _safe_log_approval(session_id, method, "timeout", {"approval_id": approval_id})
-            return {"error": f"Approval for '{method}' timed out."}
+            try:
+                await asyncio.wait_for(event.wait(), timeout=660)
+            except asyncio.TimeoutError:
+                _pending_approvals.pop(approval_id, None)
+                _safe_log_approval(session_id, method, "timeout", {"approval_id": approval_id})
+                return {"error": f"Approval for '{method}' timed out."}
+        finally:
+            hb_task.cancel()
+            try:
+                await hb_task
+            except (asyncio.CancelledError, Exception):
+                pass
         result = _pending_approvals.pop(approval_id)
         _safe_log_approval(session_id, method,
                            "approved" if result["approved"] else "denied",
@@ -368,6 +453,17 @@ async def call_tool(
             return await dream_tools.recal_historical_prompt(ts, prompt_name)
         except Exception as e:
             return {"error": f"recal_historical_prompt failed: {e}"}
+
+    # Dream simulator: inject the `_simulate` marker so sandbox handlers route
+    # writes into the per-replay overlay instead of mutating real state.
+    # Contextvars task-propagate, so sub-agents spawned during a sim inherit it.
+    try:
+        from app.dream import sim_context as _sim_context
+        _sim = _sim_context.current()
+    except Exception:
+        _sim = None
+    if _sim is not None and "_simulate" not in params:
+        params = {**params, "_simulate": _sim_context.as_sandbox_marker(_sim)}
 
     timeout = SLOW_TIMEOUT_S if method in SLOW_TOOLS else FAST_TIMEOUT_S
     try:
