@@ -11,18 +11,21 @@ keys exist, return pass/warn/fail status, and carry non-empty `detail` strings.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 # These probes read /project/config/*.yaml and call the live sandbox module.
-# Only phoebe-sandbox mounts /project, so skip gracefully when absent (e.g. when
-# collected inside phoebe-api by `make test-integration`).
+# Both phoebe-sandbox and phoebe-api mount /project:ro, but _diagnostic_check
+# only emits dream probes in the sandbox env — gate on PROJECT_DIR, which is
+# set only in phoebe-sandbox. Run via `make test-dream-live`.
 pytestmark = [
     pytest.mark.live,
     pytest.mark.skipif(
-        not Path("/project/config/config.yaml").exists(),
-        reason="/project not mounted — run via `make test-dream-live` inside phoebe-sandbox",
+        os.environ.get("PROJECT_DIR") != "/project"
+        or not Path("/project/config/config.yaml").exists(),
+        reason="not running inside phoebe-sandbox — use `make test-dream-live`",
     ),
 ]
 
