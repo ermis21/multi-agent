@@ -24,10 +24,12 @@ File path prefixes:
   project/   → /project    (read-only; .env blocked)
 """
 
+import hashlib
 import json
 import os
 import re
 import resource
+import shutil
 import stat as _stat
 import subprocess
 from datetime import datetime, timezone
@@ -43,6 +45,14 @@ from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 from exa_py import Exa
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+
+# sim_overlay lives next to mcp_server.py. In the sandbox container the cwd
+# is /app/sandbox so a bare import works. Tests run from the repo root, where
+# `from sandbox import sim_overlay` is the only form that resolves.
+try:
+    import sim_overlay
+except ImportError:
+    from sandbox import sim_overlay  # type: ignore[no-redef]
 
 app = FastAPI(title="phoebe-sandbox-mcp", docs_url=None, redoc_url=None)
 
@@ -193,6 +203,46 @@ def _set_limits():
     resource.setrlimit(resource.RLIMIT_NPROC, (SHELL_PROC_LIMIT, SHELL_PROC_LIMIT))
 
 
+# ── Simulation overlay wrappers ────────────────────────────────────────────
+
+def _sim_resolve_read(rel: str, params: dict) -> Path:
+    """Resolve a read path with overlay awareness.
+
+    In simulate mode: if the path has been tombstoned within the overlay,
+    raises FileNotFoundError (the caller's existing error branch handles it).
+    If an overlay twin exists, returns the twin. Otherwise falls through to
+    the real path. Outside simulate mode this is identical to
+    `_resolve_read_path(rel)`.
+    """
+    real = _resolve_read_path(rel)
+    marker = sim_overlay.is_sim(params)
+    if marker is None:
+        return real
+    overlay_root = sim_overlay.overlay_root_of(marker)
+    return sim_overlay.resolve_read_with_overlay(real, overlay_root)
+
+
+def _sim_resolve_write(rel: str, params: dict) -> Path:
+    """Resolve a write path with overlay awareness.
+
+    In simulate mode: returns the overlay twin path, with its parent directory
+    already mkdir'd. The real filesystem is not touched. Outside simulate mode
+    this is identical to `_resolve_write_path(rel)`.
+    """
+    real = _resolve_write_path(rel)
+    marker = sim_overlay.is_sim(params)
+    if marker is None:
+        return real
+    overlay_root = sim_overlay.overlay_root_of(marker)
+    twin = sim_overlay.prepare_write(real, overlay_root)
+    if twin is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"overlay: no writable-root match for {rel!r}",
+        )
+    return twin
+
+
 # ── Request / Response models ──────────────────────────────────────────────
 
 class MCPRequest(BaseModel):
@@ -204,7 +254,7 @@ class MCPRequest(BaseModel):
 
 def _file_read(params: dict) -> dict:
     try:
-        path = _resolve_read_path(params["path"])
+        path = _sim_resolve_read(params["path"], params)
         return {"content": path.read_text(encoding="utf-8")}
     except HTTPException:
         raise
@@ -225,11 +275,16 @@ def _file_read(params: dict) -> dict:
 
 def _file_write(params: dict) -> dict:
     try:
-        path = _resolve_write_path(params["path"])
+        path = _sim_resolve_write(params["path"], params)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(params["content"], encoding="utf-8")
-        root = next((r for r in (CONFIG, STATE, CACHE, WORKSPACE) if str(path).startswith(str(r))), WORKSPACE)
-        return {"written": len(params["content"]), "path": str(path.relative_to(root))}
+        if sim_overlay.is_sim(params) is not None:
+            rel_out = params["path"]
+        else:
+            root = next((r for r in (CONFIG, STATE, CACHE, WORKSPACE)
+                         if str(path).startswith(str(r))), WORKSPACE)
+            rel_out = str(path.relative_to(root))
+        return {"written": len(params["content"]), "path": rel_out}
     except HTTPException:
         raise
     except Exception as e:
@@ -245,17 +300,18 @@ def _file_edit(params: dict) -> dict:
     /project is mounted read-only and cannot be edited.
     """
     try:
-        path = _resolve_write_path(params["path"])
+        read_path = _sim_resolve_read(params["path"], params)
+        write_path = _sim_resolve_write(params["path"], params)
         old  = params["old_string"]
         new  = params["new_string"]
-        if not path.exists():
+        if not read_path.exists():
             return {"error": (
                 f"file not found in workspace: {params['path']}. "
                 f"file_edit only modifies existing files — to create a new file, use file_write "
                 f"(excluded in plan mode; ask the user to switch with /mode build). "
                 f"To verify the path, use file_list or directory_tree."
             )}
-        content = path.read_text(encoding="utf-8")
+        content = read_path.read_text(encoding="utf-8")
         count = content.count(old)
         if count == 0:
             return {"error": (
@@ -268,7 +324,8 @@ def _file_edit(params: dict) -> dict:
                 f"old_string matches {count} places in {params['path']} — make it more specific "
                 f"by including surrounding context so it appears exactly once."
             )}
-        path.write_text(content.replace(old, new, 1), encoding="utf-8")
+        write_path.parent.mkdir(parents=True, exist_ok=True)
+        write_path.write_text(content.replace(old, new, 1), encoding="utf-8")
         return {"ok": True, "path": params["path"], "replaced": 1}
     except HTTPException:
         raise
@@ -277,17 +334,33 @@ def _file_edit(params: dict) -> dict:
 
 
 def _file_list(params: dict) -> dict:
-    path = _resolve_read_path(params.get("path", "."))
+    real_root = _resolve_read_path(params.get("path", "."))
+    marker = sim_overlay.is_sim(params)
     try:
         entries = []
-        for e in sorted(path.iterdir()):
-            st = e.stat()
-            entries.append({"name": e.name, "is_dir": _stat.S_ISDIR(st.st_mode), "size": st.st_size})
-        root = next(
-            (r for r in (PROJECT, CONFIG, STATE, CACHE, WORKSPACE) if str(path).startswith(str(r))),
+        if marker is not None:
+            overlay_root = sim_overlay.overlay_root_of(marker)
+            names = sim_overlay.list_merged(real_root, overlay_root)
+            for name in names:
+                child_real = real_root / name
+                try:
+                    child = sim_overlay.resolve_read_with_overlay(child_real, overlay_root)
+                except FileNotFoundError:
+                    continue
+                try:
+                    st = child.stat()
+                except OSError:
+                    continue
+                entries.append({"name": name, "is_dir": _stat.S_ISDIR(st.st_mode), "size": st.st_size})
+        else:
+            for e in sorted(real_root.iterdir()):
+                st = e.stat()
+                entries.append({"name": e.name, "is_dir": _stat.S_ISDIR(st.st_mode), "size": st.st_size})
+        root_mount = next(
+            (r for r in (PROJECT, CONFIG, STATE, CACHE, WORKSPACE) if str(real_root).startswith(str(r))),
             WORKSPACE,
         )
-        return {"entries": entries, "path": str(path.relative_to(root))}
+        return {"entries": entries, "path": str(real_root.relative_to(root_mount))}
     except (FileNotFoundError, NotADirectoryError):
         return {"entries": [], "error": f"Path not found: {params.get('path', '.')}"}
 
@@ -299,37 +372,85 @@ def _file_search(params: dict) -> dict:
     root     = _resolve_read_path(root_rel)
     if not root.is_dir():
         return {"matches": [], "count": 0, "error": f"Not a directory: {root_rel}"}
-    matches = [str(p.relative_to(root)) for p in sorted(root.rglob(pattern))][:200]
+    marker = sim_overlay.is_sim(params)
+    matches: list[str] = []
+    seen: set[str] = set()
+    if marker is not None:
+        overlay_root = sim_overlay.overlay_root_of(marker)
+        overlay_dir = sim_overlay.overlay_path_for(root, overlay_root)
+        if overlay_dir is not None and overlay_dir.exists():
+            for p in sorted(overlay_dir.rglob(pattern)):
+                rel = str(p.relative_to(overlay_dir))
+                if rel not in seen:
+                    seen.add(rel)
+                    matches.append(rel)
+        for p in sorted(root.rglob(pattern)):
+            rel = str(p.relative_to(root))
+            if rel in seen:
+                continue
+            if sim_overlay.is_tombstoned(overlay_root, p):
+                continue
+            matches.append(rel)
+            seen.add(rel)
+    else:
+        matches = [str(p.relative_to(root)) for p in sorted(root.rglob(pattern))]
+    matches = matches[:200]
     return {"matches": matches, "count": len(matches)}
 
 
 def _directory_tree(params: dict) -> dict:
     """Recursive directory tree up to depth N (max 6)."""
-    root  = _resolve_read_path(params.get("path", "."))
+    real_root = _resolve_read_path(params.get("path", "."))
     depth = min(int(params.get("depth", 3)), 6)
+    marker = sim_overlay.is_sim(params)
+    overlay_root = sim_overlay.overlay_root_of(marker) if marker else None
 
-    def _tree(p: Path, d: int) -> dict:
-        node: dict = {"name": p.name, "type": "dir" if p.is_dir() else "file"}
-        if p.is_dir() and d > 0:
+    def _tree(real_p: Path, d: int) -> dict:
+        try:
+            effective = (sim_overlay.resolve_read_with_overlay(real_p, overlay_root)
+                         if overlay_root else real_p)
+        except FileNotFoundError:
+            return {"name": real_p.name, "type": "file", "children": []}
+        node: dict = {"name": real_p.name,
+                      "type": "dir" if effective.is_dir() else "file"}
+        if effective.is_dir() and d > 0:
             try:
-                node["children"] = [
-                    _tree(c, d - 1)
-                    for c in sorted(p.iterdir())
-                    if not c.name.startswith(".")
-                ]
+                if overlay_root is not None:
+                    names = sim_overlay.list_merged(real_p, overlay_root)
+                    children_real = [real_p / n for n in names if not n.startswith(".")]
+                else:
+                    children_real = [c for c in sorted(real_p.iterdir())
+                                     if not c.name.startswith(".")]
+                node["children"] = [_tree(c, d - 1) for c in children_real]
             except PermissionError:
                 node["children"] = []
         return node
 
-    return _tree(root, depth)
+    return _tree(real_root, depth)
 
 
 def _file_move(params: dict) -> dict:
     """Move or rename a file within a writable root (workspace or system)."""
     try:
-        src  = _resolve_write_path(params["source"])
-        dest = _resolve_write_path(params["destination"])
-        if not src.exists():
+        real_src  = _resolve_write_path(params["source"])
+        real_dest = _resolve_write_path(params["destination"])
+        marker = sim_overlay.is_sim(params)
+        if marker is not None:
+            overlay_root = sim_overlay.overlay_root_of(marker)
+            try:
+                src_effective = sim_overlay.resolve_read_with_overlay(real_src, overlay_root)
+            except FileNotFoundError:
+                src_effective = None
+            if src_effective is None or not src_effective.exists():
+                return {"error": f"Source not found: '{params['source']}'."}
+            twin_dest = sim_overlay.prepare_write(real_dest, overlay_root)
+            if twin_dest is None:
+                raise HTTPException(status_code=500,
+                                    detail=f"overlay: no writable-root match for {params['destination']!r}")
+            twin_dest.write_bytes(src_effective.read_bytes())
+            sim_overlay.mark_deleted(overlay_root, real_src)
+            return {"ok": True, "destination": params["destination"]}
+        if not real_src.exists():
             return {
                 "error": (
                     f"Source not found: '{params['source']}'. "
@@ -337,13 +458,13 @@ def _file_move(params: dict) -> dict:
                     "To move project files, use shell_exec with 'mv' — but note /project is read-only."
                 )
             }
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        src.rename(dest)
+        real_dest.parent.mkdir(parents=True, exist_ok=True)
+        real_src.rename(real_dest)
         dest_root = next(
-            (r for r in (CONFIG, STATE, CACHE, WORKSPACE) if str(dest).startswith(str(r))),
+            (r for r in (CONFIG, STATE, CACHE, WORKSPACE) if str(real_dest).startswith(str(r))),
             WORKSPACE,
         )
-        return {"ok": True, "destination": str(dest.relative_to(dest_root))}
+        return {"ok": True, "destination": str(real_dest.relative_to(dest_root))}
     except HTTPException:
         raise
     except Exception as e:
@@ -353,7 +474,7 @@ def _file_move(params: dict) -> dict:
 def _create_dir(params: dict) -> dict:
     """Create a directory (and parents) in a writable root."""
     try:
-        path = _resolve_write_path(params["path"])
+        path = _sim_resolve_write(params["path"], params)
         path.mkdir(parents=True, exist_ok=True)
         return {"ok": True, "path": params["path"]}
     except HTTPException:
@@ -365,7 +486,7 @@ def _create_dir(params: dict) -> dict:
 def _file_info(params: dict) -> dict:
     """Return stat metadata for a file or directory."""
     try:
-        p = _resolve_read_path(params["path"])
+        p = _sim_resolve_read(params["path"], params)
         s = p.stat()
         return {
             "path":     params["path"],
@@ -375,6 +496,8 @@ def _file_info(params: dict) -> dict:
         }
     except HTTPException:
         raise
+    except FileNotFoundError:
+        return {"error": f"file_info failed: {params['path']} not found"}
     except Exception as e:
         return {"error": f"file_info failed: {e}"}
 
@@ -387,6 +510,17 @@ _TMP_HINT = (
 
 
 def _shell_exec(params: dict) -> dict:
+    # Simulate mode: never actually run shell commands — they have unbounded
+    # side effects that the overlay can't intercept. Return a plausible
+    # success so the agent's control flow continues normally.
+    if sim_overlay.is_sim(params) is not None:
+        return {
+            "exit_code": 0,
+            "stdout":    "",
+            "stderr":    "",
+            "_simulated": "shell_exec_faked",
+        }
+
     command     = params["command"]
     timeout_ms  = params.get("timeout_ms", 30_000)
     cwd_rel     = params.get("cwd", ".")
@@ -449,13 +583,29 @@ def _git_status(_params: dict) -> dict:
 
 
 def _git_commit(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        message = params.get("message", "agent: automated update")
+        fake_sha = "sim-" + hashlib.sha1(message.encode("utf-8")).hexdigest()[:7]
+        return {
+            "exit_code": 0,
+            "stdout":    f"[simulated] {fake_sha} {message}",
+            "stderr":    "",
+            "_simulated": "git_commit_faked",
+        }
     message = params.get("message", "agent: automated update")
     _git_run(["add", "-A"])
     return _git_run(["commit", "-m", message])
 
 
-def _git_rollback(_params: dict) -> dict:
+def _git_rollback(params: dict) -> dict:
     """Safe rollback: creates a revert commit rather than destroying history."""
+    if sim_overlay.is_sim(params) is not None:
+        return {
+            "exit_code": 0,
+            "stdout":    "[simulated] revert HEAD",
+            "stderr":    "",
+            "_simulated": "git_rollback_faked",
+        }
     return _git_run(["revert", "HEAD", "--no-edit"])
 
 
@@ -485,16 +635,25 @@ def _docker_compose(args: list[str]) -> dict:
         return {"exit_code": -1, "stdout": "", "stderr": f"docker compose failed: {e}"}
 
 
-def _docker_test_up(_params: dict) -> dict:
+def _docker_test_up(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return {"exit_code": 0, "stdout": "[simulated] docker compose up",
+                "stderr": "", "_simulated": "docker_test_up_faked"}
     return _docker_compose(["up", "-d", "--build"])
 
 
-def _docker_test_down(_params: dict) -> dict:
+def _docker_test_down(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return {"exit_code": 0, "stdout": "[simulated] docker compose down",
+                "stderr": "", "_simulated": "docker_test_down_faked"}
     return _docker_compose(["down", "--remove-orphans"])
 
 
-def _docker_test_health(_params: dict) -> dict:
+def _docker_test_health(params: dict) -> dict:
     """Probe the test stack's health endpoint on host port 8091."""
+    if sim_overlay.is_sim(params) is not None:
+        return {"status_code": 200, "body": {"status": "healthy"},
+                "_simulated": "docker_test_health_faked"}
     try:
         r = httpx.get("http://host.docker.internal:8091/health", timeout=5)
         return {"status_code": r.status_code, "body": r.json()}
@@ -542,20 +701,22 @@ _chroma_client = None  # chromadb.PersistentClient
 _chroma_ef = DefaultEmbeddingFunction()
 
 
-def _get_collection() -> chromadb.Collection:
+def _get_collection(name: str = "memories") -> chromadb.Collection:
     global _chroma_client
     if _chroma_client is None:
         MEMPALACE_HOME.mkdir(parents=True, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=str(MEMPALACE_HOME))
     return _chroma_client.get_or_create_collection(
-        "memories", embedding_function=_chroma_ef
+        name, embedding_function=_chroma_ef
     )
 
 
 def _memory_add(params: dict) -> dict:
     content = params["content"]
     tags    = params.get("tags", [])
-    col     = _get_collection()
+    marker = sim_overlay.is_sim(params)
+    col_name = marker["memory_collection"] if marker else "memories"
+    col = _get_collection(col_name)
     col.add(
         documents=[content],
         ids=[str(uuid.uuid4())],
@@ -567,19 +728,33 @@ def _memory_add(params: dict) -> dict:
 def _memory_search(params: dict) -> dict:
     query = params["query"]
     n     = int(params.get("n", 5))
-    col   = _get_collection()
+    marker = sim_overlay.is_sim(params)
+    hits: list[dict] = []
+
+    def _collect_from(col_name: str, cap: int) -> None:
+        try:
+            col = _get_collection(col_name)
+            results = col.query(query_texts=[query], n_results=cap,
+                                include=["documents", "metadatas", "distances"])
+            for doc, meta, dist in zip(results["documents"][0],
+                                       results["metadatas"][0],
+                                       results["distances"][0]):
+                hits.append({
+                    "content": doc,
+                    "score":   round(1 - dist, 4),
+                    "tags":    [t for t in meta.get("tags", "").split(",") if t],
+                })
+        except Exception:
+            pass
+
     try:
-        results = col.query(query_texts=[query], n_results=n,
-                            include=["documents", "metadatas", "distances"])
-        hits = []
-        for doc, meta, dist in zip(results["documents"][0],
-                                   results["metadatas"][0],
-                                   results["distances"][0]):
-            hits.append({
-                "content": doc,
-                "score":   round(1 - dist, 4),
-                "tags":    [t for t in meta.get("tags", "").split(",") if t],
-            })
+        if marker is not None:
+            _collect_from(marker["memory_collection"], n)
+            _collect_from("memories", max(n - len(hits), 1))
+            hits.sort(key=lambda h: h["score"], reverse=True)
+            hits = hits[:n]
+        else:
+            _collect_from("memories", n)
         return {"results": hits}
     except Exception as e:
         return {"results": [], "error": str(e)}
@@ -587,13 +762,28 @@ def _memory_search(params: dict) -> dict:
 
 def _memory_list(params: dict) -> dict:
     n   = int(params.get("n", 20))
-    col = _get_collection()
+    marker = sim_overlay.is_sim(params)
+    memories: list[dict] = []
+
+    def _collect_from(col_name: str, cap: int) -> None:
+        try:
+            col = _get_collection(col_name)
+            result = col.get(limit=cap, include=["documents", "metadatas"])
+            for doc, meta in zip(result["documents"], result["metadatas"]):
+                memories.append({
+                    "content": doc,
+                    "tags": [t for t in meta.get("tags", "").split(",") if t],
+                })
+        except Exception:
+            pass
+
     try:
-        result = col.get(limit=n, include=["documents", "metadatas"])
-        memories = [
-            {"content": doc, "tags": [t for t in meta.get("tags", "").split(",") if t]}
-            for doc, meta in zip(result["documents"], result["metadatas"])
-        ]
+        if marker is not None:
+            _collect_from(marker["memory_collection"], n)
+            _collect_from("memories", max(n - len(memories), 1))
+            memories = memories[:n]
+        else:
+            _collect_from("memories", n)
         return {"memories": memories}
     except Exception as e:
         return {"memories": [], "error": str(e)}
@@ -610,7 +800,16 @@ _NOTION_METHOD_MAP = {
 }
 
 
+_NOTION_WRITE_TOOLS = frozenset({"notion_create_page", "notion_update_page"})
+
+
 def _notion_call(tool_name: str, params: dict) -> dict:
+    if tool_name in _NOTION_WRITE_TOOLS and sim_overlay.is_sim(params) is not None:
+        return {
+            "ok": True,
+            "id": "sim-" + uuid.uuid4().hex[:12],
+            "_simulated": f"{tool_name}_faked",
+        }
     method = _NOTION_METHOD_MAP[tool_name]
     try:
         r = httpx.post(
@@ -640,7 +839,17 @@ def _discord_proxy(endpoint: str, payload: dict) -> dict:
         return {"error": f"Discord proxy failed: {e}"}
 
 
+def _sim_discord_ok(endpoint: str) -> dict:
+    return {
+        "ok": True,
+        "id": "sim-" + uuid.uuid4().hex[:12],
+        "_simulated": f"discord_{endpoint}_faked",
+    }
+
+
 def _discord_send(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("send")
     return _discord_proxy("send", params)
 
 def _discord_read(params: dict) -> dict:
@@ -652,15 +861,23 @@ def _discord_read(params: dict) -> dict:
         return {"error": f"Discord proxy failed: {e}"}
 
 def _discord_set_nickname(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("set_nickname")
     return _discord_proxy("set_nickname", params)
 
 def _discord_edit_channel(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("edit_channel")
     return _discord_proxy("edit_channel", params)
 
 def _discord_create_channel(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("create_channel")
     return _discord_proxy("create_channel", params)
 
 def _discord_delete_channel(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("delete_channel")
     return _discord_proxy("delete_channel", params)
 
 def _discord_list_channels(params: dict) -> dict:
@@ -672,9 +889,13 @@ def _discord_list_channels(params: dict) -> dict:
         return {"error": f"Discord proxy failed: {e}"}
 
 def _discord_create_category(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("create_category")
     return _discord_proxy("create_category", params)
 
 def _tts_speak(params: dict) -> dict:
+    if sim_overlay.is_sim(params) is not None:
+        return _sim_discord_ok("speak")
     return _discord_proxy("speak", params)
 
 

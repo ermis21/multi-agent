@@ -103,6 +103,10 @@ agent:
       - discord_create_channel
       - discord_delete_channel
       - discord_create_category
+    simulate:
+      excluded_tools:
+      - ask_user
+      - deliberate
 approval:
   plan:
     auto_allow:
@@ -146,6 +150,7 @@ approval:
     - discord_create_channel
     - discord_delete_channel
     - discord_create_category
+    - skill_install
     auto_fail: []
   build:
     auto_allow:
@@ -188,6 +193,7 @@ approval:
     - discord_create_channel
     - discord_delete_channel
     - discord_create_category
+    - skill_install
     auto_fail: []
   converse:
     auto_allow:
@@ -211,6 +217,53 @@ approval:
       paths: []
     ask_user:
     - write_config
+    - skill_install
+    auto_fail: []
+  simulate:
+    auto_allow:
+      tools:
+      - file_read
+      - file_write
+      - file_edit
+      - file_list
+      - file_search
+      - directory_tree
+      - file_move
+      - create_dir
+      - file_info
+      - shell_exec
+      - execute_command
+      - memory_add
+      - memory_search
+      - memory_list
+      - web_search
+      - web_fetch
+      - discord_read
+      - discord_send
+      - discord_set_nickname
+      - discord_edit_channel
+      - discord_create_channel
+      - discord_delete_channel
+      - discord_create_category
+      - discord_list_channels
+      - tts_speak
+      - notion_search
+      - notion_get_page
+      - notion_create_page
+      - notion_update_page
+      - read_config
+      - git_status
+      - git_commit
+      - git_rollback
+      - git_log
+      - docker_test_up
+      - docker_test_down
+      - docker_test_health
+      - diagnostic_check
+      - skill_install
+      - tool_result_recall
+      paths: []
+    ask_user: []
     auto_fail: []
 soul:
   enabled: true
@@ -295,6 +348,19 @@ dream:
     similarity_threshold: 0.85
     max_history: 8
     period_detection_window: 6
+  counterfactual:
+    enabled: true
+    user_sim_model: vpn_local
+    goal_extraction_enabled: true
+    max_replay_history_chars: 3200
+    identical_lex_min: 0.9
+    identical_sem_min: 0.92
+    minor_lex_min: 0.7
+    minor_sem_min: 0.75
+    substantial_lex_min: 0.4
+    substantial_sem_min: 0.45
+    divergent_lex_min: 0.15
+    divergent_sem_min: 0.2
   email:
     enabled: true
     schedule: 0 10 * * *

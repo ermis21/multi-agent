@@ -315,3 +315,15 @@ dreamer:
   max_tool_iterations: 30
   model: null
   spawnable_agents: []
+
+
+# ── Dream user simulator ─────────────────────────────────────────────────────
+# Invoked per replay turn when the new agent response diverges enough from the
+# original that the original user turn would no longer be a plausible reaction.
+# Pure text-generation role — no tools, one iteration, no spawning.
+dream_user_simulator:
+  description: "Rewrites user turns during dream replay as counterfactual reactions to the new agent response."
+  allowed_tools: []
+  max_tool_iterations: 1
+  model: null
+  spawnable_agents: []

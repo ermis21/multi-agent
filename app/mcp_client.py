@@ -36,7 +36,7 @@ SLOW_TOOLS: frozenset[str] = frozenset({
     "shell_exec", "execute_command",
     "git_status", "git_commit", "git_rollback", "git_log",
     "docker_test_up", "docker_test_down", "docker_test_health",
-    "web_search", "web_fetch",
+    "web_search", "web_fetch", "skill_install",
     "memory_add", "memory_search", "memory_list",
     "notion_search", "notion_get_page", "notion_create_page", "notion_update_page",
     "discord_send", "discord_read", "discord_set_nickname", "discord_edit_channel",

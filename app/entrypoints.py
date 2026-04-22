@@ -97,6 +97,14 @@ async def run_agent_role(
     if not role_cfg:
         return {"error": f"Unknown role: {role!r}. Check agents.yaml."}
 
+    # Per-request model override: body.model (when present) overrides the
+    # default role model so the dream simulator can pin its replay to a
+    # specific model without editing agents.yaml. Copy role_cfg so we don't
+    # mutate the shared agents.yaml cache.
+    _body_model = body.get("model")
+    if _body_model:
+        role_cfg = {**role_cfg, "model": _body_model}
+
     # Mode applies to any role that supports it (primarily worker; others use base temp)
     mode_cfg       = cfg.get("agent", {}).get("mode", {})
     mode           = body.get("mode", mode_cfg.get("default", "converse"))

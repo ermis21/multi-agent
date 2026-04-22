@@ -58,6 +58,11 @@ def _cfg() -> dict:
                 "max_turns_replayed": 5,
                 "fallback_local_model": "vpn_local",
             },
+            "counterfactual": {
+                # Skip the one-shot goal-extraction LLM call so tests see only
+                # the replay invocations in their captured-calls list.
+                "goal_extraction_enabled": False,
+            },
         },
     }
 
@@ -416,10 +421,18 @@ def test_run_simulation_defaults_to_worker_without_state_file(sim_env, patched_r
 def test_sim_result_to_payload_shape():
     before = simulator.TranscriptView(transcript=[{"role": "user", "content": "x"}])
     after  = simulator.TranscriptView(transcript=[{"role": "assistant", "content": "y"}])
+    cf_metrics = simulator.CounterfactualMetrics(
+        per_turn=[],
+        avg_lex=0.0, avg_sem=0.0,
+        turns_adjusted=0, turns_verbatim=0,
+        max_band="identical", fidelity="high",
+        cf_aborts=0, goal="",
+    )
     r = simulator.SimResult(
         session_id="s1", original_model="m", simulation_model="n",
         model_match=True, before=before, after=after,
         simulations_remaining=2, can_iterate=True,
+        counterfactual=cf_metrics,
     )
     p = r.to_payload()
     assert p["session_id"] == "s1"
@@ -427,3 +440,4 @@ def test_sim_result_to_payload_shape():
     assert p["before"]["transcript"] == [{"role": "user", "content": "x"}]
     assert p["after"]["transcript"] == [{"role": "assistant", "content": "y"}]
     assert p["simulations_remaining"] == 2 and p["can_iterate"] is True
+    assert p["counterfactual"]["fidelity"] == "high"

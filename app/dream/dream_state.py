@@ -285,18 +285,31 @@ def on_simulation_complete(
     *,
     model_match: bool,
     simulations_cap: int,
+    fidelity: str | None = None,
 ) -> None:
     """Advance the state machine after a simulation finishes.
 
     Rules:
       - Increment counter + stamp timestamps.
-      - If `!model_match` OR `simulations_run >= cap` → `finalize_only`.
+      - If `!model_match` OR `simulations_run >= cap` OR `fidelity == "low"`
+        → `finalize_only`.
       - Else → `post_sim` (dreamer may revise again).
+
+    `fidelity` is the counterfactual fidelity verdict (high / moderate / low).
+    When absent (callers that predate counterfactual wiring), fidelity gating
+    is skipped and only model_match + cap gate the transition.
     """
     batch.data["simulations_run"] = batch.simulations_run + 1
     batch.data["last_sim_model_match"] = bool(model_match)
     batch.data["last_sim_at"] = _now_iso()
-    if not model_match or batch.simulations_run >= simulations_cap:
+    if fidelity is not None:
+        batch.data["last_sim_fidelity"] = fidelity
+    fidelity_low = fidelity == "low"
+    if (
+        not model_match
+        or batch.simulations_run >= simulations_cap
+        or fidelity_low
+    ):
         batch.data["phase"] = PHASE_FINALIZE_ONLY
     else:
         batch.data["phase"] = PHASE_POST_SIM
@@ -309,6 +322,8 @@ def simulations_remaining(batch: PendingBatch, simulations_cap: int) -> int:
 def can_iterate(batch: PendingBatch, simulations_cap: int) -> bool:
     """Convenience for the sim-result payload."""
     if batch.last_sim_model_match is False:
+        return False
+    if batch.data.get("last_sim_fidelity") == "low":
         return False
     return simulations_remaining(batch, simulations_cap) > 0
 

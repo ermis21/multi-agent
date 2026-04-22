@@ -79,6 +79,10 @@ class AgentModeConfig(BaseModel):
     plan: ModeToolsConfig = Field(default_factory=ModeToolsConfig)
     build: ModeToolsConfig = Field(default_factory=ModeToolsConfig)
     converse: ModeToolsConfig = Field(default_factory=ModeToolsConfig)
+    # Simulate mode is entered by the dream simulator to mark calls as being
+    # part of a replay — sandbox handlers then route writes through the
+    # overlay. Tools here are excluded regardless of overlay-ability.
+    simulate: ModeToolsConfig = Field(default_factory=ModeToolsConfig)
 
 
 class AgentConfig(BaseModel):
@@ -117,6 +121,9 @@ class ApprovalConfig(BaseModel):
     plan: ApprovalBucket = Field(default_factory=ApprovalBucket)
     build: ApprovalBucket = Field(default_factory=ApprovalBucket)
     converse: ApprovalBucket = Field(default_factory=ApprovalBucket)
+    # Dream-replay approval bucket — all writes are overlaid by the sandbox,
+    # so no Discord approval ever makes sense under simulate mode.
+    simulate: ApprovalBucket = Field(default_factory=ApprovalBucket)
 
 
 # ── Scheduled jobs ─────────────────────────────────────────────────────────────
@@ -248,6 +255,25 @@ class DreamEmailConfig(BaseModel):
         return v
 
 
+class DreamCounterfactualConfig(BaseModel):
+    """Counterfactual user-simulator settings. Controls the replay's per-turn
+    user-turn rewriting and band-based fidelity gating."""
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    user_sim_model: str = "vpn_local"
+    goal_extraction_enabled: bool = True
+    max_replay_history_chars: int = Field(3200, ge=0)
+    identical_lex_min:   float = Field(0.90, ge=0.0, le=1.0)
+    identical_sem_min:   float = Field(0.92, ge=0.0, le=1.0)
+    minor_lex_min:       float = Field(0.70, ge=0.0, le=1.0)
+    minor_sem_min:       float = Field(0.75, ge=0.0, le=1.0)
+    substantial_lex_min: float = Field(0.40, ge=0.0, le=1.0)
+    substantial_sem_min: float = Field(0.45, ge=0.0, le=1.0)
+    divergent_lex_min:   float = Field(0.15, ge=0.0, le=1.0)
+    divergent_sem_min:   float = Field(0.20, ge=0.0, le=1.0)
+
+
 class DreamConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -268,6 +294,7 @@ class DreamConfig(BaseModel):
     judge_model: str | None = None
     simulation: DreamSimulationConfig = Field(default_factory=DreamSimulationConfig)
     loop_guard: DreamLoopGuardConfig = Field(default_factory=DreamLoopGuardConfig)
+    counterfactual: DreamCounterfactualConfig = Field(default_factory=DreamCounterfactualConfig)
     email: DreamEmailConfig = Field(default_factory=DreamEmailConfig)
 
     @field_validator("schedule")
