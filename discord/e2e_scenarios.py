@@ -42,6 +42,10 @@ DEFAULT_TIMEOUT_S   = float(os.environ.get("PHOEBE_E2E_TIMEOUT_S", "90"))
 # back and see what happened. Set to "0" for CI-style auto-cleanup.
 PERSIST_MESSAGES    = os.environ.get("PHOEBE_E2E_PERSIST_MESSAGES", "1").strip() != "0"
 
+# Tagged on every health-assertion failure so the summary table blames the
+# right scenario rather than the helper that fired the assertion.
+_current_scenario: str = ""
+
 
 # ── Scenario context ─────────────────────────────────────────────────────────
 
@@ -106,6 +110,99 @@ async def wait_for_subtext(ctx: ScenarioContext, substring: str, timeout: float 
     )
 
 
+_HEALTH_TOOL_BREAKAGE = (
+    "unable to execute any tool",
+    "previous inputs were malformed",
+    "malformed tool call",
+    "i could not parse",
+)
+_HEALTH_MISSING_TOOL = (
+    "i do not have a tool named",
+    "not in my tool list",
+    "not among my available tools",
+)
+_HEALTH_PROMISE_ENDINGS = (
+    "i will now synthesize",
+    "i will proceed to",
+    "i will now analyze",
+)
+
+
+def _last_sentence(body: str) -> str:
+    stripped = (body or "").strip()
+    if not stripped:
+        return ""
+    # Grab the last non-blank line as a proxy for the closing sentence.
+    for line in reversed(stripped.splitlines()):
+        line = line.strip()
+        if line:
+            return line
+    return stripped
+
+
+def _assert_worker_healthy(body: str) -> None:
+    """Raise AssertionError with a specific diagnostic when the worker's final
+    reply admits failure to the user rather than delivering an answer. Runs
+    before every scenario's own assertion so we attribute failures correctly.
+    """
+    if not body:
+        return
+    lower = body.lower()
+    preview = body.strip().replace("\n", " ")[:240]
+    scen = f"[{_current_scenario}] " if _current_scenario else ""
+
+    for needle in _HEALTH_TOOL_BREAKAGE:
+        if needle in lower:
+            raise AssertionError(
+                f"{scen}worker admitted tool-call failure to user: {preview}"
+            )
+    for needle in _HEALTH_MISSING_TOOL:
+        if needle in lower:
+            raise AssertionError(
+                f"{scen}worker claims tool missing from its toolbelt "
+                f"(context-compression regression?): {preview}"
+            )
+    # Supervisor-retry framing should have been stripped by _split_peer_review.
+    if lower.startswith("accepted:") or lower.startswith("rejected:"):
+        raise AssertionError(
+            f"{scen}worker reply leaked supervisor-retry framing: {preview}"
+        )
+    if "[supervisor_feedback]" in lower:
+        raise AssertionError(
+            f"{scen}worker reply leaked supervisor-retry framing: {preview}"
+        )
+    # Promise-without-execution: only flag when the last line itself is the
+    # promise. Mid-body "I will now ..." is fine if real content follows.
+    last = _last_sentence(body).lower()
+    for needle in _HEALTH_PROMISE_ENDINGS:
+        if last.startswith(needle):
+            raise AssertionError(
+                f"{scen}worker promised next step instead of delivering: {preview}"
+            )
+
+
+def _describe_filtered_messages(ctx: ScenarioContext) -> str:
+    """Summarise worker messages the is_final predicate rejected, so timeouts
+    can report what actually arrived instead of just 'Timed out'."""
+    skipped: list[str] = []
+    for msg in ctx.collected:
+        if not _is_worker_message(ctx, msg):
+            continue
+        content = (msg.content or "")
+        stripped = content.strip()
+        if not stripped:
+            skipped.append("<empty message>")
+        elif content.startswith("-# "):
+            continue  # subtext is expected; not the reason for timeout
+        elif stripped.startswith("<|tool_call|>") or stripped.startswith("<tool_call"):
+            skipped.append(f"<leaked tool_call: {stripped[:120]}>")
+        # Other filtered variants (command-ack "switched to ...") are
+        # uninteresting for timeout diagnosis.
+    if not skipped:
+        return ""
+    return " | filtered-out worker messages: " + "; ".join(skipped[-3:])
+
+
 async def wait_for_final_reply(ctx: ScenarioContext, timeout: float = DEFAULT_TIMEOUT_S) -> discord.Message:
     """Wait for the first non-subtext, non-embed-only message from the worker bot."""
     def is_final(m: discord.Message) -> bool:
@@ -128,7 +225,15 @@ async def wait_for_final_reply(ctx: ScenarioContext, timeout: float = DEFAULT_TI
         if "no active run" in lower:
             return False
         return True
-    return await wait_for(ctx, is_final, timeout)
+    try:
+        msg = await wait_for(ctx, is_final, timeout)
+    except AssertionError as e:
+        extra = _describe_filtered_messages(ctx)
+        if extra:
+            raise AssertionError(str(e) + extra) from None
+        raise
+    _assert_worker_healthy(msg.content or "")
+    return msg
 
 
 async def wait_for_idle(ctx: ScenarioContext, timeout: float = 180.0) -> None:
@@ -363,8 +468,11 @@ async def scenario_plan_specificity(ctx: ScenarioContext) -> None:
     await send(ctx, "add a logout button to the login page")
     reply = await wait_for_final_reply(ctx, timeout=120)
     body = (reply.content or "")
+    # Health check in wait_for_final_reply has already blocked tool-failure
+    # admissions / retry-echo replies; this check is strictly about plan
+    # quality — a real plan cites concrete files.
     assert any(ext in body for ext in (".py", ".ts", ".md", ".tsx", ".js", ".yaml")), \
-        f"plan lacks concrete file anchors: {body[:200]}"
+        f"[plan-quality] plan lacks concrete file anchors: {body[:200]}"
 
 
 async def scenario_tool_ordering(ctx: ScenarioContext) -> None:
@@ -546,12 +654,211 @@ async def scenario_diagnostic_all_green(ctx: ScenarioContext) -> None:
         "'config_' or 'skills_' or 'inject_'",
     )
     final = await wait_for_final_reply(ctx, timeout=180)
+    # First — did the tool actually get called? Separates "tool pruned from
+    # toolbelt by the context compressor" from "tool ran but output was
+    # summarised away." `wait_for_final_reply`'s health check already catches
+    # explicit "i do not have that tool" admissions; this catches silent drops.
+    tool_fired = any(
+        (m.content or "").startswith("-# ") and "diagnostic_check" in (m.content or "").lower()
+        for m in ctx.collected
+        if _is_worker_message(ctx, m)
+    )
+    assert tool_fired, \
+        "diagnostic_check never fired — worker's toolbelt likely missing it " \
+        "(filter_tool_docs regression? build-mode excluded_tools drift?)"
     body = (final.content or "").lower()
     hits = sum(1 for k in (
         "config_schema", "skills_directory",
         "inject_endpoint_reachable", "supervisor_mode_overrides",
     ) if k in body)
     assert hits >= 2, f"diagnostic summary missing new checks (hits={hits}): {body[:300]}"
+
+
+async def scenario_skills_domain_term(ctx: ScenarioContext) -> None:
+    """Worker must resolve "skills" to Phoebe's internal /config/skills/ system,
+    not drift to Amazon Alexa / AI-skills-for-2026. This pathology burned 9
+    turns in the add-skills session without any e2e coverage."""
+    await send(ctx, "!mode converse")
+    await wait_for_text(ctx, "converse", timeout=15)
+    ctx.reset_collector()
+    await send(
+        ctx,
+        "do we have skills? list them and tell me what format a SKILL.md uses in this system",
+    )
+    final = await wait_for_final_reply(ctx, timeout=120)
+    body = (final.content or "").lower()
+    # Positive: reply references the internal skills system.
+    positive = ("config/skills" in body) or ("skill.md" in body) or ("frontmatter" in body)
+    assert positive, (
+        f"reply does not reference Phoebe's internal skills system "
+        f"(config/skills, SKILL.md, or frontmatter): {body[:300]}"
+    )
+    # Negative: reply did not drift to unrelated "skills" domains.
+    drift_terms = ("amazon alexa", "alexa plus", "alexa skill")
+    drift = [t for t in drift_terms if t in body]
+    assert not drift, (
+        f"reply drifted from internal skills concept to unrelated domain "
+        f"({drift}): {body[:300]}"
+    )
+
+
+async def scenario_ask_user_health(ctx: ScenarioContext) -> None:
+    """The worker must be able to use `ask_user` end-to-end: call the tool,
+    have the Discord gateway render a message with button components, and
+    not error out. Caught nothing in add-skills — user had to tell the agent
+    "the ask_user tool failed" before we noticed.
+    """
+    await send(ctx, "!mode converse")
+    await wait_for_text(ctx, "converse", timeout=15)
+    ctx.reset_collector()
+    await send(
+        ctx,
+        "I want to add a new skill. Use the ask_user tool to ask me one "
+        "multiple-choice question to clarify what kind of skill I mean.",
+    )
+    # Subtext for ask_user must arrive.
+    try:
+        await wait_for_subtext(ctx, "ask_user", timeout=60)
+    except AssertionError:
+        raise AssertionError(
+            "ask_user tool subtext never landed — either the worker refused "
+            "to invoke it or the tool errored before emitting a trace"
+        )
+    # Within the next 30s, a message with action components (buttons) must
+    # appear in the channel (the ask_user popup posted by the Discord gateway).
+    deadline = time.time() + 30.0
+    popup: discord.Message | None = None
+    while time.time() < deadline:
+        for m in ctx.collected:
+            if not _is_worker_message(ctx, m):
+                continue
+            if getattr(m, "components", None):
+                popup = m
+                break
+        if popup:
+            break
+        await asyncio.sleep(0.5)
+    assert popup is not None, (
+        "ask_user tool did not surface a Discord popup — regression on "
+        "the Discord gateway or ask_user handler"
+    )
+    button_count = sum(len(row.children) for row in popup.components)
+    assert button_count >= 2, (
+        f"ask_user popup has too few buttons ({button_count}); "
+        f"expected the question's answer choices"
+    )
+    # Leave the popup unanswered; runner's post-scenario kill_session
+    # tears down the pending ask_user future.
+
+
+@needs_supervisor
+async def scenario_no_retry_echo(ctx: ScenarioContext) -> None:
+    """When the supervisor rejects a worker response, the retry must produce
+    a substantively different reply — not a paraphrase of the critique.
+    Caught nothing in add-skills turns 39–40 / 43–44 where attempt 1 parroted
+    the supervisor's "you should search for X" directive as its answer.
+    """
+    await send(ctx, "!mode converse")
+    await wait_for_text(ctx, "converse", timeout=15)
+    ctx.reset_collector()
+    # Deliberately ambiguous prompt — biases the supervisor to reject the
+    # first attempt as under-specified, forcing a retry.
+    await send(ctx, "tell me about the project in two lines")
+    final = await wait_for_final_reply(ctx, timeout=180)
+    sid = await current_session_id(ctx.channel.id)
+    assert sid, "could not resolve session id after final reply"
+
+    # Pull the session's turn log and compare worker attempts. If no retry
+    # happened this turn, the scenario is a silent pass — that's OK.
+    import json
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        try:
+            r = await http.get(f"{PHOEBE_API_URL}/sessions/{sid}")
+        except Exception as e:
+            raise AssertionError(f"could not fetch session turns: {e}")
+    if r.status_code != 200:
+        # Fallback: read the JSONL directly off the sandbox mount.
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            sr = await http.post(
+                "http://phoebe-sandbox:9000/mcp",
+                json={"method": "file_read",
+                      "params": {"path": f"state/sessions/{sid}/turns.jsonl"}},
+            )
+        if sr.status_code != 200:
+            raise AssertionError(f"session turns unreachable ({r.status_code} / {sr.status_code})")
+        content = sr.json().get("result", {}).get("content", "") or ""
+        turns = [json.loads(l) for l in content.splitlines() if l.strip()]
+    else:
+        turns = r.json().get("turns") or []
+
+    # Find the most recent user-turn's worker attempts.
+    by_attempt: dict[int, str] = {}
+    # Walk backwards to find the last worker attempts belonging to this user turn.
+    for t in reversed(turns):
+        if t.get("role") != "worker":
+            continue
+        attempt = t.get("attempt")
+        if attempt is None:
+            continue
+        if attempt in by_attempt:
+            continue
+        by_attempt[attempt] = t.get("response") or ""
+        if 0 in by_attempt and 1 in by_attempt:
+            break
+
+    if 1 not in by_attempt:
+        # No retry happened — nothing to verify. Common when the supervisor
+        # is disabled or passes on the first attempt.
+        return
+
+    def _tokens(s: str) -> set[str]:
+        return {w for w in s.lower().split() if len(w) > 2}
+
+    a, b = _tokens(by_attempt.get(0, "")), _tokens(by_attempt[1])
+    if not a or not b:
+        return
+    jaccard = len(a & b) / max(len(a | b), 1)
+    assert jaccard <= 0.85, (
+        f"retry attempt duplicates attempt-0 (Jaccard={jaccard:.2f}); "
+        f"worker is echoing prior output rather than revising"
+    )
+
+
+async def scenario_dream_smoke(ctx: ScenarioContext) -> None:
+    """Fire /internal/dream-run and confirm a run.json lands on disk.
+
+    We deliberately pick a date with zero sessions so the run loop short-circuits
+    in the candidate-iter step (no dreamer call, no model cost). The success
+    surface is:
+      - HTTP 200 from /internal/dream-run
+      - `record.date` matches what we asked for
+      - `record.session_ids_seen == []`  (empty directory case)
+      - `run.json` written to `state/dream/runs/<date>/`
+    """
+    probe_date = "1999-12-31"  # ancient; guaranteed no sessions logged
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        r = await http.post(
+            f"{PHOEBE_API_URL}/internal/dream-run",
+            json={"date": probe_date, "meta_enabled": False},
+        )
+    assert r.status_code == 200, f"/internal/dream-run → {r.status_code}: {r.text}"
+    payload = r.json()
+    assert payload["status"] == "ok"
+    assert payload["date"] == probe_date
+    record = payload["result"]
+    assert record["session_ids_seen"] == [], \
+        f"unexpected sessions on ancient date: {record['session_ids_seen']}"
+    assert record["interrupted_at"] is None
+    # Confirm on-disk artifact via sandbox shell (sandbox has /state rw).
+    async with httpx.AsyncClient(timeout=10.0) as http:
+        sr = await http.post(
+            "http://phoebe-sandbox:9000/mcp",
+            json={"method": "file_read",
+                  "params": {"path": f"state/dream/runs/{probe_date}/run.json"}},
+        )
+    assert sr.status_code == 200
+    body = sr.json().get("result", {})
+    assert body.get("content"), f"run.json not written: {sr.text[:200]}"
 
 
 SCENARIOS: list[Callable[[ScenarioContext], Awaitable[None]]] = [
@@ -563,8 +870,12 @@ SCENARIOS: list[Callable[[ScenarioContext], Awaitable[None]]] = [
     scenario_mid_flight_stop,
     scenario_dispatcher_popup,
     scenario_skill_discovery,
+    scenario_skills_domain_term,
+    scenario_ask_user_health,
+    scenario_no_retry_echo,
     scenario_config_schema_reject,
     scenario_diagnostic_all_green,
+    scenario_dream_smoke,
 ]
 
 
@@ -650,6 +961,8 @@ async def _run(selected: list[str] | None) -> int:
                 ctx.reset_collector()
                 # Gate supervisor per scenario: off unless explicitly opted in.
                 await _set_supervisor(getattr(scen, "needs_supervisor", False))
+                global _current_scenario
+                _current_scenario = scen.__name__
                 print(f"→ {scen.__name__}"
                       f"{' [supervisor ON]' if getattr(scen, 'needs_supervisor', False) else ''}",
                       flush=True)

@@ -212,6 +212,72 @@ class ContextConfig(BaseModel):
     elision_strategy: Literal["head", "tail", "head_tail", "middle"] = "head_tail"
 
 
+# ── Dream (nightly prompt self-improvement) ──────────────────────────────────
+
+class DreamSimulationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_context_tokens: int = Field(120000, ge=0)
+    max_turns_replayed: int = Field(5, ge=1)
+    min_turns_to_simulate: int = Field(1, ge=0)
+
+
+class DreamLoopGuardConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    similarity_backend: Literal["fuzzy", "embedding"] = "fuzzy"
+    similarity_threshold: float = Field(0.85, ge=0.0, le=1.0)
+    max_history: int = Field(8, ge=1)
+    period_detection_window: int = Field(6, ge=2)
+
+
+class DreamEmailConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    schedule: str = "0 10 * * *"
+    to: str = ""
+    provider: Literal["gmail", "smtp"] = "gmail"
+    fallback_channel_id: str | None = None
+
+    @field_validator("schedule")
+    @classmethod
+    def _cron_shape(cls, v: str) -> str:
+        if not _CRON_RE.match(v):
+            raise ValueError("schedule must be a 5-field cron expression (min hour dom mon dow)")
+        return v
+
+
+class DreamConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    schedule: str = "0 4 * * *"
+    stop_on_user_activity: bool = True
+    target_prompts: list[str] = Field(default_factory=lambda: ["*"])
+    min_tier: Literal["small", "medium", "large", "frontier"] = "large"
+    min_context_window: int = Field(200000, ge=0)
+    required_capabilities: list[str] = Field(
+        default_factory=lambda: [
+            "destructive_edit_safe",
+            "long_context_reasoning",
+            "prompt_self_critique",
+        ]
+    )
+    model: str | None = None
+    judge_model: str | None = None
+    simulation: DreamSimulationConfig = Field(default_factory=DreamSimulationConfig)
+    loop_guard: DreamLoopGuardConfig = Field(default_factory=DreamLoopGuardConfig)
+    email: DreamEmailConfig = Field(default_factory=DreamEmailConfig)
+
+    @field_validator("schedule")
+    @classmethod
+    def _cron_shape(cls, v: str) -> str:
+        if not _CRON_RE.match(v):
+            raise ValueError("schedule must be a 5-field cron expression (min hour dom mon dow)")
+        return v
+
+
 # ── Tools (loose — users extend with new integrations) ────────────────────────
 
 class ToolsConfig(BaseModel):
@@ -235,6 +301,7 @@ class RootConfig(BaseModel):
     debate: DebateConfig = Field(default_factory=DebateConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
+    dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

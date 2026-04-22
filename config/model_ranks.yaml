@@ -1,0 +1,67 @@
+# Model capability catalog. Canonical source of which models are viable for
+# high-blast-radius roles (currently: dream). Lower `rank` = more capable.
+#
+# Tier ordering: small < medium < large < frontier
+#
+# Default dream floor (see `dream.*` in config.yaml):
+#   tier >= large AND context_window >= 200000 AND all of
+#   {destructive_edit_safe, long_context_reasoning, prompt_self_critique}
+# ⇒ Sonnet 4.6 is the effective floor; Opus 4.7 auto-selected when present.
+#
+# To adjust the floor, edit `config.yaml:dream.{min_tier,min_context_window,required_capabilities}`.
+# To add a new model: append an entry and (optionally) declare the same name in
+# `config.yaml:models.<name>` to override endpoint/url details. If you only add
+# it here, the dream runner auto-constructs an LLM override from `provider` and
+# `model_id` — no second edit needed for Anthropic-hosted models.
+
+models:
+  - name: claude-opus-4-7
+    provider: anthropic
+    model_id: claude-opus-4-7
+    tier: frontier
+    context_window: 200000
+    rank: 1
+    capabilities:
+      - destructive_edit_safe
+      - long_context_reasoning
+      - prompt_self_critique
+      - simulation_judge
+
+  - name: claude-sonnet-4-6
+    provider: anthropic
+    model_id: claude-sonnet-4-6
+    tier: large
+    context_window: 200000
+    rank: 2
+    capabilities:
+      - destructive_edit_safe
+      - long_context_reasoning
+      - prompt_self_critique
+      - simulation_judge
+
+  - name: claude-haiku-4-5
+    provider: anthropic
+    model_id: claude-haiku-4-5-20251001
+    tier: medium
+    context_window: 200000
+    rank: 5
+    capabilities:
+      - long_context_reasoning
+
+  - name: gpt-4o
+    provider: openai
+    model_id: gpt-4o
+    tier: medium
+    context_window: 128000
+    rank: 7
+    capabilities:
+      - long_context_reasoning
+
+  - name: vpn_local
+    provider: local
+    model_id: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+    tier: medium
+    context_window: 131072
+    rank: 10
+    capabilities:
+      - long_context_reasoning

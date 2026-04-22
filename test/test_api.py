@@ -13,7 +13,7 @@ import uuid
 import httpx
 import pytest
 
-from conftest import BASE_URL, answer, chat
+from conftest import BASE_URL, answer, chat, with_config_patch
 
 # Every test in this file hits the running stack — mark the whole module live.
 pytestmark = pytest.mark.live
@@ -70,7 +70,12 @@ def test_tool_file_roundtrip(client):
     filename = f"test_{uuid.uuid4().hex[:6]}.txt"
     content  = "phoebe-test-content-xyz"
 
-    resp = chat(client, f"Write the text '{content}' to the file '{filename}' in the workspace, then read it back and tell me what it says.")
+    # file_write is excluded in converse mode (the default) — force build.
+    resp = chat(
+        client,
+        f"Write the text '{content}' to the file '{filename}' in the workspace, then read it back and tell me what it says.",
+        mode="build",
+    )
     text = answer(resp)
     assert content in text or "phoebe-test-content-xyz" in text.lower()
 
@@ -127,13 +132,19 @@ def test_soul_update_trigger(client):
 # ── Direct role endpoint ───────────────────────────────────────────────────────
 
 def test_direct_role_config_agent(client):
-    r = client.post(
-        "/v1/agents/config_agent",
-        json={"messages": [{"role": "user", "content": "What is the current prompt mode?"}]},
-    )
-    assert r.status_code == 200
-    text = answer(r.json())
-    assert len(text) > 0
+    # The config_agent prompt nudges proactive writes even for read-only questions.
+    # In the test env there's no Discord approver, so every `write_config` call
+    # hangs ~11 min on approval timeout. Hard-block writes here so the agent
+    # pivots and answers from `read_config` alone.
+    patch = {"approval": {"converse": {"auto_fail": ["write_config"]}}}
+    with with_config_patch(client, patch):
+        r = client.post(
+            "/v1/agents/config_agent",
+            json={"messages": [{"role": "user", "content": "What is the current prompt mode?"}]},
+        )
+        assert r.status_code == 200
+        text = answer(r.json())
+        assert len(text) > 0
 
 
 def test_direct_role_unknown(client):

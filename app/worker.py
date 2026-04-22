@@ -131,6 +131,7 @@ async def _run_worker(
     inflection_mode: str = "none",
     session_state:  dict | None = None,
     turn_acc:       TurnAccumulator | None = None,
+    after_iteration_hook = None,
 ) -> tuple[str, list[dict], list[dict]]:
     """
     Run the worker agent with its inner tool-call loop.
@@ -231,6 +232,20 @@ async def _run_worker(
         if tc is None:
             # Explicit end-of-turn marker: worker is done.
             if END_MARKER in content:
+                # Guard: model sometimes emits just `<|end|>` with no content
+                # for short conversational prompts. Treat as malformed
+                # termination and re-prompt — same pattern as the malformed
+                # tool-call correction below. Bounded by max_tool_iterations.
+                if content.replace(END_MARKER, "").strip() == "":
+                    full_messages.append({"role": "assistant", "content": content})
+                    full_messages.append({
+                        "role": "user",
+                        "content": (
+                            "You ended the turn with no content. Provide your "
+                            "final answer in plain text, then end with <|end|>."
+                        ),
+                    })
+                    continue
                 # Before exiting, sweep up any injections that arrived mid-LLM-call
                 # (still in session_state["pending"], never drained to deferred)
                 # plus any already-deferred notes that never got stapled to a
@@ -256,6 +271,15 @@ async def _run_worker(
                     full_messages.append({"role": "assistant", "content": content})
                     full_messages.append({"role": "user", "content": "\n\n".join(notes)})
                     continue
+                # Dream auto-sim splice: if the hook returns a synthetic tool-result
+                # (e.g. sim result), keep looping instead of returning so the
+                # dreamer can react.
+                if after_iteration_hook is not None:
+                    hook_msg = await after_iteration_hook(full_messages)
+                    if hook_msg:
+                        full_messages.append({"role": "assistant", "content": content})
+                        full_messages.append({"role": "user", "content": hook_msg})
+                        continue
                 clean = content.replace(END_MARKER, "").rstrip()
                 return clean, full_messages, tool_traces
             # If the content *looks* like a malformed tool call, correct the
@@ -399,6 +423,13 @@ async def _run_worker(
         if inflection_nudge:
             nudge_count += 1
             full_messages.append({"role": "user", "content": inflection_nudge})
+
+        # Dream auto-sim splice: fires when the tool just called was not
+        # dream_submit / edit_revise and a submit-phase batch is staged.
+        if after_iteration_hook is not None:
+            hook_msg = await after_iteration_hook(full_messages)
+            if hook_msg:
+                full_messages.append({"role": "user", "content": hook_msg})
 
     # Exhausted iterations without a final answer — ask for a plain-text summary.
     # Also sweep up any injections that arrived mid-LLM-call (still in

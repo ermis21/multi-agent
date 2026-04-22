@@ -154,3 +154,64 @@ def test_context_disabled_toggle_accepted(real_config):
     """The master feature flag must accept `false` for rollback."""
     out = validate_patch(real_config, {"context": {"enabled": False}})
     assert out["context"]["enabled"] is False
+
+
+# ── Dream (nightly prompt self-improvement) ──────────────────────────────────
+
+def test_dream_defaults_valid():
+    cfg = RootConfig.model_validate({})
+    assert cfg.dream.enabled is False
+    assert cfg.dream.min_tier == "large"
+    assert cfg.dream.min_context_window == 200000
+    assert "destructive_edit_safe" in cfg.dream.required_capabilities
+    assert cfg.dream.loop_guard.similarity_backend == "fuzzy"
+    assert cfg.dream.simulation.min_turns_to_simulate == 1
+    assert cfg.dream.email.provider == "gmail"
+
+
+def test_dream_unknown_key_rejected(real_config):
+    with pytest.raises(ConfigPatchError) as exc:
+        validate_patch(real_config, {"dream": {"enabeld": True}})
+    assert "enabeld" in str(exc.value)
+
+
+def test_dream_min_tier_literal(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"dream": {"min_tier": "godlike"}})
+
+
+def test_dream_schedule_shape():
+    with pytest.raises(Exception):
+        RootConfig.model_validate({"dream": {"enabled": True, "schedule": "0 4"}})
+
+
+def test_dream_email_schedule_shape():
+    with pytest.raises(Exception):
+        RootConfig.model_validate({"dream": {"email": {"schedule": "not-a-cron"}}})
+
+
+def test_dream_email_provider_literal(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"dream": {"email": {"provider": "postmark"}}})
+
+
+def test_dream_loop_guard_backend_literal(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"dream": {"loop_guard": {"similarity_backend": "levenshtein"}}})
+
+
+def test_dream_similarity_threshold_range(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"dream": {"loop_guard": {"similarity_threshold": 1.5}}})
+
+
+def test_dream_simulation_unknown_key_rejected(real_config):
+    with pytest.raises(ConfigPatchError):
+        validate_patch(real_config, {"dream": {"simulation": {"mystery_knob": 1}}})
+
+
+def test_dream_email_fallback_channel_nullable(real_config):
+    out = validate_patch(real_config, {"dream": {"email": {"fallback_channel_id": None}}})
+    assert out["dream"]["email"]["fallback_channel_id"] is None
+    out2 = validate_patch(real_config, {"dream": {"email": {"fallback_channel_id": "12345"}}})
+    assert out2["dream"]["email"]["fallback_channel_id"] == "12345"

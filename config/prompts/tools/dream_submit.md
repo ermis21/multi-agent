@@ -1,0 +1,3 @@
+### dream_submit
+Submit a rewritten prompt. The system diffs it against the current file paragraph-by-paragraph and returns every edit annotated with `ok | possible_conflict | possible_loop`, plus a narrative for flagged items. A fresh submission replaces any prior pending batch wholesale — start over if you want to abandon in-progress edits. Do not call `simulate_conversation` yourself; the system auto-runs it when you stop revising. Params: `path` (prompt filename e.g. `worker_full`), `new_full_text` (entire new prompt as a single string), `rationale` (short explanation of the change).
+<|tool_call|>call: dream_submit, {"path": "worker_full", "new_full_text": "# Worker\n\n...", "rationale": "tighten tool-call grammar guidance"}<|tool_call|>

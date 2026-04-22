@@ -24,7 +24,11 @@ from app.sessions.state import SessionState, log_approval
 
 SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://phoebe-sandbox:9000")
 
-LOCAL_TOOLS: frozenset[str] = frozenset({"read_config", "write_config", "run_agent", "deliberate", "ask_user"})
+LOCAL_TOOLS: frozenset[str] = frozenset({
+    "read_config", "write_config", "run_agent", "deliberate", "ask_user",
+    "phrase_history_recall",
+    "dream_submit", "edit_revise", "dream_finalize", "recal_historical_prompt",
+})
 
 FAST_TIMEOUT_S = 10
 SLOW_TIMEOUT_S = 130
@@ -272,6 +276,98 @@ async def call_tool(
             context=params.get("context", ""),
             session_id=session_id,
         )
+
+    if method == "phrase_history_recall":
+        from app.dream import phrase_store
+        pid = str(params.get("phrase_id") or "").strip()
+        if not pid:
+            return {"error": "phrase_history_recall requires 'phrase_id'"}
+        try:
+            k = int(params.get("k") or 3)
+        except (TypeError, ValueError):
+            k = 3
+        try:
+            rec = phrase_store._read_index(pid)
+            excerpt = phrase_store.get_history_excerpt(pid, k=k)
+            return {
+                "phrase_id": pid,
+                "current_text": rec.get("current_text", ""),
+                "rev": rec.get("rev", 0),
+                "section_path": rec.get("section_path", ""),
+                "path": rec.get("path", ""),
+                "history": excerpt,
+                "history_total": len(phrase_store.get_history(pid)),
+            }
+        except phrase_store.LocateFailure as e:
+            return {"error": str(e), "unknown_phrase_id": True}
+        except Exception as e:
+            return {"error": f"phrase_history_recall failed: {e}"}
+
+    if method == "dream_submit":
+        from app.dream import dream_tools
+        path = str(params.get("path") or "").strip()
+        new_full_text = params.get("new_full_text")
+        rationale = str(params.get("rationale") or "").strip()
+        if not path or not isinstance(new_full_text, str):
+            return {"error": "dream_submit requires 'path' and 'new_full_text' (str)"}
+        try:
+            return await dream_tools.dream_submit(
+                path=path,
+                new_full_text=new_full_text,
+                rationale=rationale,
+                conversation_sid=session_id,
+                session_id=session_id,
+                cfg=cfg,
+            )
+        except Exception as e:
+            return {"error": f"dream_submit failed: {e}"}
+
+    if method == "edit_revise":
+        from app.dream import dream_tools
+        pid = str(params.get("phrase_id") or "").strip()
+        new_text = params.get("new_text")
+        rationale = str(params.get("rationale") or "").strip()
+        if not pid or not isinstance(new_text, str):
+            return {"error": "edit_revise requires 'phrase_id' and 'new_text' (str)"}
+        try:
+            return await dream_tools.edit_revise(
+                phrase_id=pid,
+                new_text=new_text,
+                rationale=rationale,
+                conversation_sid=session_id,
+                session_id=session_id,
+                cfg=cfg,
+            )
+        except Exception as e:
+            return {"error": f"edit_revise failed: {e}"}
+
+    if method == "dream_finalize":
+        from app.dream import dream_tools
+        keep = params.get("keep") or []
+        drop = params.get("drop") or []
+        if not isinstance(keep, list) or not isinstance(drop, list):
+            return {"error": "dream_finalize requires 'keep' and 'drop' as lists of phrase_ids"}
+        try:
+            return await dream_tools.dream_finalize(
+                keep=[str(p) for p in keep],
+                drop=[str(p) for p in drop],
+                conversation_sid=session_id,
+                session_id=session_id,
+                cfg=cfg,
+            )
+        except Exception as e:
+            return {"error": f"dream_finalize failed: {e}"}
+
+    if method == "recal_historical_prompt":
+        from app.dream import dream_tools
+        ts = str(params.get("timestamp") or "").strip()
+        prompt_name = str(params.get("prompt_name") or "").strip()
+        if not ts or not prompt_name:
+            return {"error": "recal_historical_prompt requires 'timestamp' and 'prompt_name'"}
+        try:
+            return await dream_tools.recal_historical_prompt(ts, prompt_name)
+        except Exception as e:
+            return {"error": f"recal_historical_prompt failed: {e}"}
 
     timeout = SLOW_TIMEOUT_S if method in SLOW_TOOLS else FAST_TIMEOUT_S
     try:

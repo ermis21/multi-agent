@@ -74,11 +74,21 @@ async def run_config_agent(body: dict) -> dict:
     return await run_agent_role("config_agent", body, session_id)
 
 
-async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
+async def run_agent_role(
+    role: str,
+    body: dict,
+    session_id: str,
+    *,
+    prompts_dir: Path | None = None,
+) -> dict:
     """
     Run any agent role from agents.yaml directly.
     Used by POST /v1/agents/{role} and run_config_agent.
     Includes session continuity: prior turns are reconstructed from "final" logs.
+
+    `prompts_dir` overrides the prompt template directory — the dream simulator
+    uses this to replay a conversation under a candidate prompt without mutating
+    `/config/prompts/`.
     """
     cfg        = get_config()
     agents_cfg = get_agents_config()
@@ -125,10 +135,17 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
             "{{AGENT_MODE}}": _mode_context_string(mode, cfg=cfg, role_cfg=role_cfg),
             "{{PLAN_CONTEXT}}": plan_context,
         },
+        prompts_dir=prompts_dir,
     )
 
     verbose_tools = cfg["logging"].get("verbose_tools", False)
     tool_traces: list[dict] = []
+
+    # Dream role: inject auto-sim hook + rollback unfinalized batches on exit.
+    after_iteration_hook = None
+    if role == "dreamer":
+        from app.dream import runner_hook as _dream_hook
+        after_iteration_hook = _dream_hook.make_dream_hook(session_id, cfg)
 
     try:
         try:
@@ -137,6 +154,7 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
                 role_cfg=role_cfg,
                 session_id=session_id,
                 extra_auto_allow_paths=privileged_paths or None,
+                after_iteration_hook=after_iteration_hook,
             )
         except Exception as e:
             response = f"[{role} error: {e or type(e).__name__}]"
@@ -148,3 +166,9 @@ async def run_agent_role(role: str, body: dict, session_id: str) -> dict:
         return result
     finally:
         cleanup_generated(session_id)
+        if role == "dreamer":
+            try:
+                from app.dream import runner_hook as _dream_hook
+                _dream_hook.rollback_if_unfinalized(session_id)
+            except Exception:
+                pass

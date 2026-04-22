@@ -932,26 +932,80 @@ async def cmd_clear(interaction: discord.Interaction):
         )
 
 
-@tree.command(name="mode", description="Switch agent mode")
-@app_commands.describe(mode="plan (investigate + create plan), build (execute plan), converse (casual chat)")
+_MODE_DESCRIPTIONS = {
+    "plan":     "Investigation mode — investigates, then produces a structured plan for review.",
+    "build":    "Execution mode — follows the active plan step by step with full tool access.",
+    "converse": "Conversational — answers questions, quick lookups. Suggests plan mode for complex tasks.",
+}
+
+
+def _apply_mode(channel_id: int, user_id: int, mode: str) -> None:
+    """Persist a mode switch. Routes through the channel session if one exists,
+    so every user in that channel sees the same mode."""
+    sid = _channel_sessions.get(channel_id)
+    if sid:
+        _set_mode_for_session(sid, mode)
+    else:
+        _user_modes[_session_key(channel_id, user_id)] = mode
+        _save_state()
+
+
+@tree.command(name="mode", description="Show or switch agent mode")
+@app_commands.describe(mode="Leave blank to show current; otherwise: plan, build, or converse")
 @app_commands.choices(mode=[
     app_commands.Choice(name="plan",     value="plan"),
     app_commands.Choice(name="build",    value="build"),
     app_commands.Choice(name="converse", value="converse"),
 ])
-async def cmd_mode(interaction: discord.Interaction, mode: app_commands.Choice[str]):
+async def cmd_mode(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str] | None = None,
+):
     if not is_allowed(interaction.user.id):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-    _user_modes[_session_key(interaction.channel_id, interaction.user.id)] = mode.value
-    _save_state()
-    descriptions = {
-        "plan":     "Investigation mode — investigates, then produces a structured plan for review.",
-        "build":    "Execution mode — follows the active plan step by step with full tool access.",
-        "converse": "Conversational — answers questions, quick lookups. Suggests plan mode for complex tasks.",
-    }
+    if mode is None:
+        current = _get_mode(interaction.channel_id, interaction.user.id)
+        await interaction.response.send_message(
+            f"**Current mode**: `{current}`. {_MODE_DESCRIPTIONS.get(current, '')}"
+        )
+        return
+    _apply_mode(interaction.channel_id, interaction.user.id, mode.value)
     await interaction.response.send_message(
-        f"Switched to **{mode.value}** mode. {descriptions[mode.value]}"
+        f"Switched to **{mode.value}** mode. {_MODE_DESCRIPTIONS[mode.value]}"
+    )
+
+
+@tree.command(name="plan", description="Switch to plan mode (investigate + create plan)")
+async def cmd_plan(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    _apply_mode(interaction.channel_id, interaction.user.id, "plan")
+    await interaction.response.send_message(
+        f"Switched to **plan** mode. {_MODE_DESCRIPTIONS['plan']}"
+    )
+
+
+@tree.command(name="build", description="Switch to build mode (execute active plan)")
+async def cmd_build(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    _apply_mode(interaction.channel_id, interaction.user.id, "build")
+    await interaction.response.send_message(
+        f"Switched to **build** mode. {_MODE_DESCRIPTIONS['build']}"
+    )
+
+
+@tree.command(name="converse", description="Switch to converse mode (quick chat)")
+async def cmd_converse(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    _apply_mode(interaction.channel_id, interaction.user.id, "converse")
+    await interaction.response.send_message(
+        f"Switched to **converse** mode. {_MODE_DESCRIPTIONS['converse']}"
     )
 
 
@@ -1099,6 +1153,95 @@ async def cmd_status(interaction: discord.Interaction):
     await interaction.response.send_message(msg)
 
 
+@tree.command(name="context", description="Show context-window stats for this channel's session")
+async def cmd_context(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    if interaction.channel_id in _channel_sessions:
+        session_id = _channel_sessions[interaction.channel_id]
+    else:
+        session_id = _get_session_id(interaction.channel_id, interaction.user.id)
+
+    try:
+        state_resp, cfg_resp = await asyncio.gather(
+            _http.get(f"{PHOEBE_API_URL}/v1/sessions/{session_id}/state", timeout=5),
+            _http.get(f"{PHOEBE_API_URL}/config", timeout=5),
+        )
+        state_resp.raise_for_status()
+        cfg_resp.raise_for_status()
+    except Exception as e:
+        await interaction.response.send_message(
+            f"Could not fetch session state: {e}", ephemeral=True
+        )
+        return
+
+    state = state_resp.json()
+    cfg = cfg_resp.json()
+    ctx = cfg.get("context", {}) or {}
+    budgets = ctx.get("budgets", {}) or {}
+    soft_cap = ctx.get("total_soft_cap")
+
+    cs = state.get("context_stats", {}) or {}
+    last_tokens = cs.get("last_prompt_tokens") or 0
+    pre_comp    = cs.get("last_prompt_tokens_pre_compression") or 0
+    ratio       = cs.get("last_compression_ratio")
+    sections    = cs.get("section_tokens") or {}
+    handles     = cs.get("handles_created") or 0
+    triggers    = cs.get("compression_triggers") or {}
+    soft_over   = bool(cs.get("soft_cap_exceeded"))
+    prefix_hash = cs.get("last_kv_prefix_hash") or "—"
+
+    stats = state.get("stats", {}) or {}
+    turn_count = stats.get("turn_count") or 0
+    usage = stats.get("token_usage") or {}
+
+    tool_results = state.get("tool_results") or {}
+    handle_bytes = sum(int(meta.get("bytes") or 0) for meta in tool_results.values())
+
+    def fmt_tok(n: int | float | None) -> str:
+        return f"{int(n):,}" if n else "0"
+
+    # Build section-token breakdown vs budgets, stable ordering
+    section_order = ["soul", "user", "memory", "identity", "tool_docs",
+                     "skills", "history", "tool_result"]
+    section_lines: list[str] = []
+    for name in section_order:
+        used = sections.get(name)
+        budget = budgets.get(name if name != "tool_result" else "tool_result_inline")
+        if used is None and budget is None:
+            continue
+        used_s = fmt_tok(used) if used is not None else "—"
+        budget_s = fmt_tok(budget) if budget is not None else "—"
+        marker = " ⚠" if (used and budget and used > budget) else ""
+        section_lines.append(f"  • `{name}`: {used_s} / {budget_s}{marker}")
+
+    # Compression triggers (only show non-zero)
+    trig_active = [f"{k}×{v}" for k, v in triggers.items() if v]
+    triggers_s = ", ".join(trig_active) if trig_active else "none"
+
+    cap_marker = " ⚠ over soft cap" if soft_over else ""
+    ratio_s = f"{ratio:.2f}" if isinstance(ratio, (int, float)) and ratio else "—"
+
+    msg = (
+        f"**Session**: `{session_id}` (turn {turn_count})\n"
+        f"**Last prompt**: {fmt_tok(last_tokens)} tok"
+        f" / soft cap {fmt_tok(soft_cap)}{cap_marker}\n"
+        f"**Pre-compression**: {fmt_tok(pre_comp)} tok · ratio {ratio_s}\n"
+        f"**Prefix hash**: `{prefix_hash}`\n"
+        f"**Section tokens** (used / budget):\n"
+        + ("\n".join(section_lines) if section_lines else "  _(no telemetry yet — send a message first)_")
+        + "\n"
+        f"**Compression triggers**: {triggers_s}\n"
+        f"**Tool-result handles**: {handles} created, "
+        f"{len(tool_results)} live ({fmt_tok(handle_bytes)} B on disk)\n"
+        f"**Cumulative usage**: in={fmt_tok(usage.get('input'))} "
+        f"out={fmt_tok(usage.get('output'))} "
+        f"thinking={fmt_tok(usage.get('thinking'))}"
+    )
+    await interaction.response.send_message(msg)
+
+
 @tree.command(name="btw", description="Add context to the current run without stopping it")
 @app_commands.describe(text="The note to pass to the agent (stapled onto the next tool result)")
 async def cmd_btw(interaction: discord.Interaction, text: str):
@@ -1171,10 +1314,12 @@ async def cmd_help(interaction: discord.Interaction):
         "**Always available**\n"
         "• `/new` — Start a fresh conversation in a new channel\n"
         "• `/clear` — Reset conversation and delete all messages in this channel\n"
-        "• `/mode [plan|build|converse]` — Switch agent mode\n"
+        "• `/mode [plan|build|converse]` — Show current mode (blank) or switch\n"
+        "• `/plan`, `/build`, `/converse` — One-shot mode switches\n"
         "• `/model` — Show current LLM model and settings\n"
         "• `/speak <prompt>` — Ask the agent a question and get a voice response\n"
         "• `/status` — Show your current mode, session, and system status\n"
+        "• `/context` — Show context-window usage and compression stats\n"
         "• `/help` — This message\n\n"
         "**Only while I'm working on something** (worker run in flight)\n"
         "• `/btw <text>` — Add context mid-flight without stopping the agent\n"

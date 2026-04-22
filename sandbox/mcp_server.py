@@ -1072,6 +1072,140 @@ def _diagnostic_check(_params: dict) -> dict:
     except Exception as e:
         checks["prefix_marker_present"] = fail(f"marker probe failed: {e}")
 
+    # ── Dream-system probes ─────────────────────────────────────────────────
+    _dream_enabled = False
+    try:
+        import yaml as _yaml
+        with (CONFIG / "config.yaml").open() as f:
+            _cfg = _yaml.safe_load(f) or {}
+        _dream_cfg = (_cfg.get("dream") or {})
+        _dream_enabled = bool(_dream_cfg.get("enabled", False))
+    except Exception:
+        _dream_cfg = {}
+
+    # dream_model_viable: at least one model in model_ranks.yaml meets the
+    # dream floor (min_tier + min_context_window + required_capabilities).
+    # We read files directly — sandbox has /project:ro but not /app/app.
+    try:
+        import yaml as _yaml
+        _ranks_path = Path("/project/config/model_ranks.yaml")
+        if not _ranks_path.exists():
+            checks["dream_model_viable"] = warn("model_ranks.yaml missing")
+        else:
+            _ranks = _yaml.safe_load(_ranks_path.read_text(encoding="utf-8")) or {}
+            _tier_order = ["small", "medium", "large", "frontier"]
+            _min_tier = (_dream_cfg.get("min_tier") or "large").lower()
+            _min_ctx = int(_dream_cfg.get("min_context_window") or 0)
+            _req_caps = set(_dream_cfg.get("required_capabilities") or [])
+            try:
+                _min_ordinal = _tier_order.index(_min_tier)
+            except ValueError:
+                _min_ordinal = 2  # default to large
+            _viable: list[str] = []
+            _model_list = _ranks.get("models", []) if isinstance(_ranks, dict) else []
+            for _spec in _model_list:
+                if not isinstance(_spec, dict):
+                    continue
+                _name = _spec.get("name") or _spec.get("model_id") or "?"
+                _tier = str(_spec.get("tier") or "").lower()
+                if _tier not in _tier_order or _tier_order.index(_tier) < _min_ordinal:
+                    continue
+                _ctx = int(_spec.get("context_window") or 0)
+                if _ctx < _min_ctx:
+                    continue
+                _caps = set(_spec.get("capabilities") or [])
+                if not _req_caps.issubset(_caps):
+                    continue
+                _viable.append(_name)
+            if _viable:
+                checks["dream_model_viable"] = ok(
+                    f"{len(_viable)} viable: {', '.join(_viable[:3])}"
+                )
+            else:
+                _status = warn if not _dream_enabled else fail
+                checks["dream_model_viable"] = _status(
+                    f"no model matches tier>={_min_tier}, ctx>={_min_ctx}, caps={sorted(_req_caps)}"
+                )
+    except Exception as e:
+        checks["dream_model_viable"] = fail(f"dream-model probe failed: {e}")
+
+    # dream_state_writable: each of runs/, phrase_index/, phrase_history/ writable.
+    try:
+        _roots = {
+            "runs":           STATE / "dream" / "runs",
+            "phrase_index":   STATE / "dream" / "phrase_index",
+            "phrase_history": STATE / "dream" / "phrase_history",
+        }
+        _bad: list[str] = []
+        for label, d in _roots.items():
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+                _probe = d / ".diag_probe"
+                _probe.write_text("diag-canary")
+                _read = _probe.read_text()
+                _probe.unlink()
+                if _read != "diag-canary":
+                    _bad.append(f"{label}:content mismatch")
+            except Exception as e:
+                _bad.append(f"{label}:{e}")
+        if not _bad:
+            checks["dream_state_writable"] = ok("runs/, phrase_index/, phrase_history/ all writable")
+        else:
+            checks["dream_state_writable"] = fail("; ".join(_bad))
+    except Exception as e:
+        checks["dream_state_writable"] = fail(f"dream-state probe failed: {e}")
+
+    # phrase_index_consistent: every phrase_index/*.json points to a live prompt.
+    try:
+        _idx_dir = STATE / "dream" / "phrase_index"
+        if not _idx_dir.exists():
+            checks["phrase_index_consistent"] = ok("no phrase_index yet (expected pre-dream)")
+        else:
+            _total = 0
+            _bad: list[str] = []
+            for f in sorted(_idx_dir.glob("*.json")):
+                _total += 1
+                try:
+                    _rec = json.loads(f.read_text(encoding="utf-8"))
+                except Exception as e:
+                    _bad.append(f"{f.stem}:unparseable ({e})")
+                    continue
+                _role = _rec.get("role_template_name") or ""
+                if not _role:
+                    _bad.append(f"{f.stem}:missing role_template_name")
+                    continue
+                _prompt_path = CONFIG / "prompts" / f"{_role}.md"
+                if not _prompt_path.exists():
+                    _bad.append(f"{f.stem}:prompt {_role}.md missing")
+            if _total == 0:
+                checks["phrase_index_consistent"] = ok("phrase_index empty")
+            elif not _bad:
+                checks["phrase_index_consistent"] = ok(f"{_total} entries, all coherent")
+            else:
+                checks["phrase_index_consistent"] = warn(
+                    f"{len(_bad)}/{_total} inconsistent: " + "; ".join(_bad[:3])
+                )
+    except Exception as e:
+        checks["phrase_index_consistent"] = fail(f"phrase_index probe failed: {e}")
+
+    # dream_cron_scheduled: when dream enabled, /internal/dream-run must be routed.
+    try:
+        _r = httpx.post(
+            "http://localhost:8090/internal/dream-run",
+            json={"date": "__diag_probe__"},
+            timeout=5.0,
+        )
+        _reachable = _r.status_code in (200, 400, 404, 422, 500)
+        if not _dream_enabled:
+            checks["dream_cron_scheduled"] = ok("dream disabled; routing probe skipped") \
+                if _reachable else warn("dream disabled; /internal/dream-run not mounted")
+        else:
+            checks["dream_cron_scheduled"] = ok("dream enabled; /internal/dream-run mounted") \
+                if _reachable else fail(f"/internal/dream-run unreachable (HTTP {_r.status_code})")
+    except Exception as e:
+        _status = warn if not _dream_enabled else fail
+        checks["dream_cron_scheduled"] = _status(f"api probe failed: {e}")
+
     # Compute overall
     statuses   = [c["status"] for c in checks.values()]
     fail_count = statuses.count("fail")

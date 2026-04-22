@@ -126,6 +126,23 @@ async def lifespan(app: FastAPI):
             replace_existing=True,
         )
 
+    dream_cfg = cfg.get("dream", {})
+    if dream_cfg.get("enabled", False):
+        scheduler.add_job(
+            _run_dream_cron,
+            CronTrigger.from_crontab(dream_cfg["schedule"]),
+            id="dream",
+            replace_existing=True,
+        )
+        email_cfg = dream_cfg.get("email", {}) or {}
+        if email_cfg.get("enabled", False):
+            scheduler.add_job(
+                _run_dream_digest_cron,
+                CronTrigger.from_crontab(email_cfg["schedule"]),
+                id="dream_report",
+                replace_existing=True,
+            )
+
     if scheduler.get_jobs():
         scheduler.start()
 
@@ -148,6 +165,51 @@ async def _run_discord_moderation() -> None:
         print(f"[phoebe-api] discord moderation completed: {session_id}", flush=True)
     except Exception as e:
         print(f"[phoebe-api] discord moderation failed: {e}", flush=True)
+
+
+async def _run_dream_cron() -> None:
+    """Cron wrapper: sweep yesterday's sessions via the dreamer."""
+    from app.dream import interrupt, runner
+    # "Yesterday" in UTC — the run commits edits reviewed against prior-day turns.
+    target_date = (datetime.now(timezone.utc).date().toordinal() - 1)
+    from datetime import date as _date
+    date_iso = _date.fromordinal(target_date).isoformat()
+
+    watcher = interrupt.UserActivityWatcher(
+        poll_interval_s=2.0,
+        active_sessions_source=lambda: _active_sessions,
+    )
+    try:
+        await watcher.start()
+        result = await runner.run_dream(date_iso, interrupt_event=watcher.event)
+        print(
+            f"[phoebe-api] dream run {date_iso}: "
+            f"seen={len(result.get('session_ids_seen') or [])} "
+            f"completed={len(result.get('session_ids_completed') or [])} "
+            f"interrupted={'yes' if result.get('interrupted_at') else 'no'}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[phoebe-api] dream run {date_iso} failed: {e}", flush=True)
+    finally:
+        await watcher.stop()
+
+
+async def _run_dream_digest_cron() -> None:
+    """Cron wrapper: email/post yesterday's dream digest."""
+    from app.dream import mailer
+    from datetime import date as _date
+    target_date = datetime.now(timezone.utc).date().toordinal() - 1
+    date_iso = _date.fromordinal(target_date).isoformat()
+    try:
+        result = await mailer.send_digest(date_iso, get_config())
+        print(
+            f"[phoebe-api] dream digest {date_iso}: "
+            f"transport={result.get('transport')} ok={result.get('ok')}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[phoebe-api] dream digest {date_iso} failed: {e}", flush=True)
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -419,6 +481,60 @@ async def trigger_soul_update():
     """
     await run_soul_update()
     return {"status": "ok", "message": "Soul update completed. Check state/soul/SOUL.md."}
+
+
+@app.post("/internal/dream-run")
+async def trigger_dream_run(request: Request):
+    """
+    Manually trigger a dream run for a given date (default: yesterday UTC).
+
+    Body (optional): {"date": "YYYY-MM-DD", "meta_enabled": bool}
+    """
+    from app.dream import interrupt, runner
+    from datetime import date as _date
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    date_iso = body.get("date")
+    if not date_iso:
+        target_date = datetime.now(timezone.utc).date().toordinal() - 1
+        date_iso = _date.fromordinal(target_date).isoformat()
+    meta_enabled = bool(body.get("meta_enabled", True))
+
+    watcher = interrupt.UserActivityWatcher(
+        poll_interval_s=2.0,
+        active_sessions_source=lambda: _active_sessions,
+    )
+    await watcher.start()
+    try:
+        result = await runner.run_dream(
+            date_iso, interrupt_event=watcher.event, meta_enabled=meta_enabled,
+        )
+    finally:
+        await watcher.stop()
+    return {"status": "ok", "date": date_iso, "result": result}
+
+
+@app.post("/internal/dream-digest")
+async def trigger_dream_digest(request: Request):
+    """
+    Manually send the dream digest for a given date (default: yesterday UTC).
+    """
+    from app.dream import mailer
+    from datetime import date as _date
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    date_iso = body.get("date")
+    if not date_iso:
+        target_date = datetime.now(timezone.utc).date().toordinal() - 1
+        date_iso = _date.fromordinal(target_date).isoformat()
+    result = await mailer.send_digest(date_iso, get_config())
+    return {"status": "ok", "date": date_iso, "result": result}
 
 
 @app.get("/internal/diagnostics")

@@ -290,7 +290,8 @@ def _strip_frontmatter(text: str) -> str:
     return text[body_start:]
 
 
-def _load_base_template(role: str, mode: str, agent_mode: str = "") -> str:
+def _load_base_template(role: str, mode: str, agent_mode: str = "",
+                        prompts_dir: Path | None = None) -> str:
     """
     Load the base prompt template for `role`.
 
@@ -304,8 +305,11 @@ def _load_base_template(role: str, mode: str, agent_mode: str = "") -> str:
     A role is "dedicated" iff `{role}.md` exists. No hardcoded allowlist — drop
     a new `{role}.md` into `config/prompts/` and it Just Works. Optional
     `kind: dedicated|worker|supervisor` frontmatter is documentation only.
+
+    `prompts_dir` overrides the root the loader reads from; used by the dream
+    simulator to swap in shadow prompts without mutating the live directory.
     """
-    base = PROMPTS_DIR
+    base = Path(prompts_dir) if prompts_dir is not None else PROMPTS_DIR
 
     def _load(p: Path) -> str:
         return _strip_frontmatter(p.read_text(encoding="utf-8"))
@@ -350,6 +354,7 @@ def generate(
     attempt: int = 0,
     extra: dict | None = None,
     agent_mode: str = "converse",
+    prompts_dir: Path | None = None,
 ) -> tuple[str, str]:
     """
     Generate a prompt for the given agent role.
@@ -376,7 +381,8 @@ def generate(
 
     agent_id = f"{role}_{session_id[:8]}_{attempt}_{uuid.uuid4().hex[:6]}"
 
-    template = _load_base_template(role, mode, agent_mode=agent_mode)
+    template = _load_base_template(role, mode, agent_mode=agent_mode,
+                                   prompts_dir=prompts_dir)
 
     # Build substitution map
     soul_max = cfg["soul"]["max_chars"]

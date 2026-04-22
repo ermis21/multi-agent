@@ -90,6 +90,9 @@ make doctor      # Full subsystem diagnostics
 | `make test` | Run `pytest` on `test/` |
 | `make eval` | Run `test/eval.py` |
 | `make test-full` | `test-up` → `test` → `eval` in sequence |
+| `make test-dream` | Focused dream-system unit suite (phrase store, model ranks, runner, mailer, state machine) |
+| `make test-dream-live` | Sandbox-side live probes in `test/test_dream_diagnostics.py` |
+| `make e2e-dream` | Run only the `dream_smoke` Discord e2e scenario |
 
 ---
 
@@ -225,6 +228,8 @@ Two cron jobs start automatically with `phoebe-api`:
 |---|---|---|
 | Soul Update | 05:00 daily | Reads curated context, rewrites `state/soul/SOUL.md` |
 | Discord Moderation | 10:00 every 3 days | Organises channels, archives inactive ones |
+| Dream Run | 04:00 daily (off by default) | Nightly prompt self-improvement; edits `config/prompts/` via phrase-level provenance. Requires `cfg.dream.enabled: true` and all four dream diagnostic probes green |
+| Dream Digest | 10:00 daily (off by default) | Emails yesterday's dream report to `cfg.dream.email.to`; Discord fallback on SMTP failure |
 
 ---
 

@@ -291,3 +291,27 @@ webfetch_summarizer:
 prompt_suggester:
   allowed_tools: []
   max_tool_iterations: 1
+
+
+# ── Dreamer ───────────────────────────────────────────────────────────────────
+# Nightly prompt-self-improvement agent. Reads the day's conversations, proposes
+# edits to config/prompts/*.md via dream_submit, reacts to system-mediated
+# history/loop annotations, and either iterates (edit_revise / dream_submit)
+# based on the auto-simulation result or abandons the batch via dream_finalize.
+# simulate_conversation is runner-triggered — not in allowed_tools.
+dreamer:
+  description: "Reads past conversations and rewrites prompts to improve them."
+  allowed_tools:
+    - file_read
+    - file_list
+    - file_search
+    - directory_tree
+    - memory_search
+    - phrase_history_recall
+    - recal_historical_prompt
+    - dream_submit
+    - edit_revise
+    - dream_finalize
+  max_tool_iterations: 30
+  model: null
+  spawnable_agents: []

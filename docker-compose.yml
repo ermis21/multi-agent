@@ -199,6 +199,11 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       GLM_API_KEY: "${GLM_API_KEY:-}"
+      # Mirrored from the sandbox only so the live test suite (which runs inside
+      # phoebe-api) can detect they're configured. The actual tool calls hit the
+      # sandbox, not the api — keys here are gate-only.
+      EXA_API_KEY: "${EXA_API_KEY:-}"
+      NOTION_TOKEN: "${NOTION_TOKEN:-}"
       # phoebe-sandbox shares this container's network namespace (via phoebe-vpn),
       # so it is reachable on localhost rather than by hostname.
       SANDBOX_URL: "http://localhost:9000"
@@ -228,6 +233,10 @@ services:
       # Tests (pure-unit runnable inside the container via `make test-fast`)
       - ./test:/app/test
       - ./pytest.ini:/app/pytest.ini:ro
+      # Full project repo (ro) — lets the in-container test suite reach sibling
+      # sources (e.g. discord/utils.py for fence-aware split_message tests).
+      # Mirrors the mount on phoebe-sandbox.
+      - .:/project:ro
       # Claude Code OAuth credentials — read-only, for Anthropic provider auth
       - /home/homelab/.claude/.credentials.json:/app/.claude_credentials.json:ro
     network_mode: "service:phoebe-vpn"

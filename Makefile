@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs soul-update test-up test-down config-agent test eval test-full doctor e2e e2e-one
+.PHONY: up down build restart logs soul-update test-up test-down config-agent test eval test-full doctor e2e e2e-one test-dream test-dream-live e2e-dream
 
 # ── Production stack ─────────────────────────────────────────────────────────
 
@@ -83,6 +83,14 @@ eval:
 
 test-full: up test-fast test-integration eval
 
+# Focused dream-system suite. Unit tests run inside phoebe-api (fast);
+# live diagnostics run inside phoebe-sandbox (needs /project and /state mounts).
+test-dream:
+	docker exec phoebe-api pytest /app/test -m "not live" -k "dream or phrase_store or model_ranks"
+
+test-dream-live:
+	docker exec phoebe-sandbox pytest -m live /project/test/test_dream_diagnostics.py
+
 # ── Discord end-to-end scenarios ─────────────────────────────────────────────
 # Drives the worker bot from the config bot. Requires:
 #   DISCORD_TEST_CHANNEL_ID, DISCORD_TEST_DRIVER_USER_ID, PHOEBE_ENABLE_TEXT_COMMANDS=1
@@ -94,6 +102,9 @@ e2e:
 e2e-one:
 	@if [ -z "$(SCENARIO)" ]; then echo "usage: make e2e-one SCENARIO=<name>"; exit 2; fi
 	docker exec phoebe-discord python /app/e2e_scenarios.py --scenario $(SCENARIO)
+
+e2e-dream:
+	docker exec phoebe-discord python /app/e2e_scenarios.py --scenario dream_smoke
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────
 
