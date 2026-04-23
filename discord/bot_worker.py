@@ -791,9 +791,10 @@ async def _handle_text_command(msg: discord.Message) -> bool:
             await msg.channel.send(f"Unknown preset '{preset}'. Known: {', '.join(_MODEL_PRESETS)}.")
             return True
         try:
-            resp = await _http.patch(f"{PHOEBE_API_URL}/config", json={"llm": dict(_MODEL_PRESETS[preset])})
+            spec = dict(_MODEL_PRESETS[preset])
+            resp = await _http.patch(f"{PHOEBE_API_URL}/config", json={"llm": spec})
             resp.raise_for_status()
-            await msg.channel.send(f"Switched to **{preset}**.")
+            await msg.channel.send(f"Switched to **{preset}**.{_format_pricing_line(spec)}")
         except Exception as e:
             await msg.channel.send(f"Model switch failed: {e}")
         return True
@@ -1016,6 +1017,17 @@ _model_presets_cache: dict[str, object] = {"data": None, "fetched_at": 0.0}
 _MODEL_PRESETS_TTL_S = 60.0
 
 
+def _format_pricing_line(spec: dict) -> str:
+    """Returns `\\n**Price**: $X in / $Y out per 1M tokens` or `""` if no price."""
+    p_in = spec.get("price_input")
+    p_out = spec.get("price_output")
+    if p_in is None and p_out is None:
+        return ""
+    in_s = f"${p_in:.2f}" if isinstance(p_in, (int, float)) else "?"
+    out_s = f"${p_out:.2f}" if isinstance(p_out, (int, float)) else "?"
+    return f"\n**Price**: `{in_s} in / {out_s} out per 1M tokens`"
+
+
 async def _fetch_model_presets(force: bool = False) -> dict[str, dict]:
     """Pull the named-model list from phoebe-api's live config. Filters out
     internal-use entries (debate/checkpoint helpers with tiny max_tokens).
@@ -1087,6 +1099,7 @@ async def cmd_model(
                 f"Switched to **{preset}**.\n"
                 f"**Provider**: `{llm.get('provider', 'local')}`\n"
                 f"**Model**: `{llm.get('model', '?')}`"
+                f"{_format_pricing_line(llm)}"
             )
         except Exception as e:
             msg = f"Failed to switch model: {e}"
@@ -1101,6 +1114,7 @@ async def cmd_model(
                 f"**Temperature**: `{llm.get('temperature', '?')}`\n"
                 f"**Max tokens**: `{llm.get('max_tokens', '?')}`\n"
                 f"**Thinking**: `{llm.get('enable_thinking', False)}`"
+                f"{_format_pricing_line(llm)}"
             )
         except Exception as e:
             msg = f"Could not fetch config: {e}"
@@ -1117,6 +1131,10 @@ async def _model_autocomplete(interaction: discord.Interaction, current: str):
         if cur and cur not in name.lower() and cur not in str(spec.get("model", "")).lower():
             continue
         label = f"{name} — {spec.get('provider', '?')} / {spec.get('model', '?')}"
+        p_in = spec.get("price_input")
+        p_out = spec.get("price_output")
+        if isinstance(p_in, (int, float)) and isinstance(p_out, (int, float)):
+            label += f"  (${p_in:.2f}/${p_out:.2f} per 1M)"
         items.append(app_commands.Choice(name=label[:100], value=name))
         if len(items) >= 25:  # Discord caps autocomplete at 25 entries
             break

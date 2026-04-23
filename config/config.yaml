@@ -15,12 +15,56 @@ models:
     temperature: 1.0
     max_tokens: 8192
     top_p: 0.95
+    price_input: 0.60
+    price_output: 2.20
   gpt_4o:
     provider: openai
     model: gpt-4o
     temperature: 1.0
     max_tokens: 16384
     top_p: 0.95
+    price_input: 2.50
+    price_output: 10.00
+  gpt_5:
+    provider: openai
+    model: gpt-5
+    temperature: 1.0
+    max_tokens: 16384
+    top_p: 0.95
+    price_input: 1.25
+    price_output: 10.00
+  gpt_5_mini:
+    provider: openai
+    model: gpt-5-mini
+    temperature: 1.0
+    max_tokens: 16384
+    top_p: 0.95
+    price_input: 0.25
+    price_output: 2.00
+  gpt_5_nano:
+    provider: openai
+    model: gpt-5-nano
+    temperature: 1.0
+    max_tokens: 16384
+    top_p: 0.95
+    price_input: 0.05
+    price_output: 0.40
+  gpt_4_1:
+    provider: openai
+    model: gpt-4.1
+    temperature: 1.0
+    max_tokens: 16384
+    top_p: 0.95
+    price_input: 2.00
+    price_output: 8.00
+  gpt_4_1_mini:
+    provider: openai
+    model: gpt-4.1-mini
+    temperature: 1.0
+    max_tokens: 16384
+    top_p: 0.95
+    price_input: 0.40
+    price_output: 1.60
   vpn_local:
     provider: local
     url: http://10.64.82.60:8000
