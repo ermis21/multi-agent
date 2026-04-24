@@ -148,6 +148,14 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
     state.set("mode", mode)
     if body.get("model"):
         state.set("model", body.get("model"))
+    else:
+        # No explicit per-request override → snapshot the config default so
+        # retroactive tools (the dreamer) can show "which model handled this
+        # session". Last-writer-wins if the default changes mid-session; that
+        # is acceptable — the dreamer wants a rough attribution, not a ledger.
+        _default_model = (cfg.get("llm") or {}).get("model")
+        if _default_model and not state.get("model"):
+            state.set("model", _default_model)
     if body.get("channel_id") is not None:
         state.set("channel_id", body.get("channel_id"))
     if body.get("user_id") is not None:
@@ -155,6 +163,25 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
     if body.get("_source_trigger") is not None and state.get("source_trigger") == {"type": "user", "ref": None}:
         # Only overwrite the default; never clobber a previously-set trigger.
         state.set("source_trigger", body.get("_source_trigger"))
+
+    # Register the Discord user message that seeded this turn, so a later
+    # /rewind (triggered by native Discord message-edit) can locate the turn
+    # index by discord_msg_id. Idempotent; safe across retries. turn_count has
+    # not yet been incremented for this turn — flush_turn() in the finally
+    # block does that — so it equals the ordinal of the final we are about to
+    # produce.
+    _disc_msg_id = body.get("discord_msg_id")
+    _chan_id = body.get("channel_id")
+    if _disc_msg_id:
+        try:
+            state.append_user_msg(
+                turn_index=int(state.get("stats.turn_count", 0) or 0),
+                discord_msg_id=str(_disc_msg_id),
+                channel_id=str(_chan_id) if _chan_id is not None else None,
+            )
+        except Exception as e:
+            print(f"[message_index] append_user_msg failed for {session_id}: {e}", flush=True)
+
     turn_acc = TurnAccumulator()
 
     # Plan/approval/privileged-path context — state is authoritative, body overlays.
@@ -489,16 +516,46 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
         result_holder = _with_traces(_format_response(clean_body, session_id))
         return result_holder
     finally:
-        # Attach any queued mid-flight messages so the bot can replay them as a new turn.
-        if session_state is not None and result_holder is not None:
-            queued = [p for p in (session_state.get("pending") or []) if p.get("mode") == "queue"]
-            if queued:
-                result_holder["queued_injections"] = [q.get("text", "") for q in queued]
+        # Collect any queued mid-flight messages so the bot can replay them as a new turn.
+        queued_texts: list[str] = []
+        if session_state is not None:
+            queued_texts = [
+                (p.get("text") or "")
+                for p in (session_state.get("pending") or [])
+                if p.get("mode") == "queue"
+            ]
+        # If a hard-cancel (task.cancel) tore us down before result_holder was
+        # built, synthesize a minimal "stopped" response so queued injections
+        # still ride the SSE done event back to the bot. Without this, a user
+        # who clicks "Immediate" while the LLM is mid-call would lose their
+        # redirected message entirely.
+        if result_holder is None and queued_texts:
+            result_holder = _with_traces({
+                "id": f"chatcmpl-{session_id}",
+                "object": "chat.completion",
+                "model": (cfg.get("llm") or {}).get("model", "unknown"),
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "[stopped by user]"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "session_id": session_id,
+                "stopped": True,
+            })
+        if result_holder is not None and queued_texts:
+            result_holder["queued_injections"] = queued_texts
         # Flush the turn accumulator + latest verdict to the persistent state file.
         try:
             state.flush_turn(turn_acc, verdict=last_verdict)
         except Exception as e:
             print(f"[session_state] flush_turn failed for {session_id}: {e}", flush=True)
+        # Stamp the final turn's 0-based index onto the result so the Discord
+        # bot can bind its rendered message_ids to this turn for edit-rewind.
+        if isinstance(result_holder, dict):
+            result_holder["turn_index"] = max(
+                0, int(state.get("stats.turn_count", 0) or 0) - 1
+            )
         if trace_queue is not None:
             trace_queue.put_nowait({"event": "done", "data": result_holder or {"error": "agent loop failed"}})
         cleanup_generated(session_id)

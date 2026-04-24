@@ -68,10 +68,10 @@ def _seed_session(rootfs, sid: str, *, role: str = "worker",
 # ── run_dream behavior ───────────────────────────────────────────────────────
 
 def test_run_dream_no_candidates_writes_empty_run_json(rootfs, monkeypatch):
-    async def _noop_agent(role, body, session_id, *, prompts_dir=None):
+    async def _noop_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
         return {"choices": [{"message": {"content": "ok"}}]}
 
-    async def _noop_meta(record, *, cfg=None, session_id=None, top_k=3):
+    async def _noop_meta(record, *, cfg=None, session_id=None, top_k=3, **_kwargs):
         return {"status": "no_conflicts"}
 
     import app.entrypoints as ep_mod
@@ -89,16 +89,16 @@ def test_run_dream_no_candidates_writes_empty_run_json(rootfs, monkeypatch):
 
 
 def test_run_dream_dispatches_per_candidate(rootfs, monkeypatch):
-    _seed_session(rootfs, "conv-1")
-    _seed_session(rootfs, "conv-2")
+    _seed_session(rootfs, "discord_100_111")
+    _seed_session(rootfs, "discord_100_222")
 
     calls: list[dict] = []
 
-    async def fake_agent(role, body, session_id, *, prompts_dir=None):
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
         calls.append({"role": role, "sid": session_id, "body": body})
         return {"choices": [{"message": {"content": "ok"}}]}
 
-    async def fake_meta(record, *, cfg=None, session_id=None, top_k=3):
+    async def fake_meta(record, *, cfg=None, session_id=None, top_k=3, **_kwargs):
         return {"status": "no_conflicts", "seen": len(record.get("conversations", []))}
 
     import app.entrypoints as ep_mod
@@ -110,25 +110,25 @@ def test_run_dream_dispatches_per_candidate(rootfs, monkeypatch):
     assert all(c["role"] == "dreamer" for c in calls)
     # dreamer session ids are prefixed with the run date and original sid.
     assert all(c["sid"].startswith("dreamer_2026-04-20_") for c in calls)
-    assert set(record["session_ids_completed"]) == {"conv-1", "conv-2"}
+    assert set(record["session_ids_completed"]) == {"discord_100_111", "discord_100_222"}
     assert record["meta"]["status"] == "no_conflicts"
     assert record["meta"]["seen"] == 2
 
 
 def test_run_dream_interrupt_short_circuits(rootfs, monkeypatch):
-    _seed_session(rootfs, "conv-a")
-    _seed_session(rootfs, "conv-b")
+    _seed_session(rootfs, "discord_200_aaa")
+    _seed_session(rootfs, "discord_200_bbb")
 
     ev = asyncio.Event()
 
-    async def fake_agent(role, body, session_id, *, prompts_dir=None):
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
         # After the first session, flip the interrupt.
         ev.set()
         return {"choices": [{"message": {"content": "ok"}}]}
 
     called_meta = {"n": 0}
 
-    async def fake_meta(record, *, cfg=None, session_id=None, top_k=3):
+    async def fake_meta(record, *, cfg=None, session_id=None, top_k=3, **_kwargs):
         called_meta["n"] += 1
         return {"status": "no_conflicts"}
 
@@ -145,11 +145,11 @@ def test_run_dream_interrupt_short_circuits(rootfs, monkeypatch):
 
 
 def test_run_dream_surfaces_per_session_error_without_aborting(rootfs, monkeypatch):
-    _seed_session(rootfs, "conv-good")
-    _seed_session(rootfs, "conv-bad")
+    _seed_session(rootfs, "discord_300_good")
+    _seed_session(rootfs, "discord_300_bad")
 
-    async def fake_agent(role, body, session_id, *, prompts_dir=None):
-        if "conv-bad" in session_id:
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
+        if "discord_300_bad" in session_id:
             raise RuntimeError("kaboom")
         return {"choices": [{"message": {"content": "ok"}}]}
 
@@ -163,16 +163,70 @@ def test_run_dream_surfaces_per_session_error_without_aborting(rootfs, monkeypat
     record = asyncio.run(runner.run_dream("2026-04-20"))
     # Find the error row.
     statuses = {c["conversation_sid"]: c["status"] for c in record["conversations"]}
-    assert statuses.get("conv-bad") == "error"
+    assert statuses.get("discord_300_bad") == "error"
     # Good session still completes — session_ids_completed includes it.
-    assert "conv-good" in record["session_ids_completed"]
-    assert "conv-bad" not in record["session_ids_completed"]
+    assert "discord_300_good" in record["session_ids_completed"]
+    assert "discord_300_bad" not in record["session_ids_completed"]
+
+
+def test_run_dream_honors_explicit_conversation_sids(rootfs, monkeypatch):
+    """When sids are passed explicitly, skip the window scan and dream exactly those."""
+    _seed_session(rootfs, "discord_500_aa")
+    _seed_session(rootfs, "discord_500_bb")
+    _seed_session(rootfs, "discord_500_cc")
+
+    dispatched: list[str] = []
+
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
+        dispatched.append(session_id)
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    async def fake_meta(record, **_):
+        return {"status": "no_conflicts"}
+
+    import app.entrypoints as ep_mod
+    monkeypatch.setattr(ep_mod, "run_agent_role", fake_agent)
+    monkeypatch.setattr(meta_dreamer, "run_meta_dreamer", fake_meta)
+
+    record = asyncio.run(runner.run_dream(
+        conversation_sids=["discord_500_aa", "discord_500_cc"],
+    ))
+    # Only the two picked sids show up in the dreamer spawn names.
+    assert len(dispatched) == 2
+    assert all("discord_500_aa" in s or "discord_500_cc" in s for s in dispatched)
+    assert set(record["session_ids_completed"]) == {"discord_500_aa", "discord_500_cc"}
+    # skipped list is empty for explicit mode (user's choice, no prefix filter).
+    assert record.get("session_ids_skipped") == []
+
+
+def test_run_dream_honors_dreamer_model_override(rootfs, monkeypatch):
+    """`dreamer_model_override` reaches run_agent_role via body['model']."""
+    _seed_session(rootfs, "discord_600_aa")
+
+    captured: dict = {}
+
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
+        captured["model"] = body.get("model")
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    async def fake_meta(record, **_):
+        return {"status": "no_conflicts"}
+
+    import app.entrypoints as ep_mod
+    monkeypatch.setattr(ep_mod, "run_agent_role", fake_agent)
+    monkeypatch.setattr(meta_dreamer, "run_meta_dreamer", fake_meta)
+
+    asyncio.run(runner.run_dream(
+        conversation_sids=["discord_600_aa"],
+        dreamer_model_override="claude_opus_4_7",
+    ))
+    assert captured["model"] == "claude_opus_4_7"
 
 
 def test_run_dream_survives_meta_dreamer_failure(rootfs, monkeypatch):
-    _seed_session(rootfs, "conv-x")
+    _seed_session(rootfs, "discord_400_x")
 
-    async def fake_agent(role, body, session_id, *, prompts_dir=None):
+    async def fake_agent(role, body, session_id, *, prompts_dir=None, **_kwargs):
         return {"choices": [{"message": {"content": "ok"}}]}
 
     async def explode_meta(record, **_):

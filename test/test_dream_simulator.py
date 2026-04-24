@@ -243,8 +243,39 @@ def test_materialize_shadow_copies_tree_and_overwrites_target(sim_env, tmp_path)
 def test_materialize_shadow_missing_target_raises(sim_env, tmp_path):
     _write_prompt_template(sim_env, "worker_full", "# LIVE\n")
     batch = _make_pending(sim_env, "s1", target_prompt="nonexistent")
-    with pytest.raises(simulator.SimulatorError, match="target_prompt"):
+    with pytest.raises(simulator.SimulatorError, match="nonexistent"):
         simulator.materialize_shadow(batch, root=tmp_path / "shadows")
+
+
+def test_materialize_shadow_multi_target_overlays_all(sim_env, tmp_path):
+    """Multi-target batches overlay EVERY listed prompt in the shadow so
+    one simulation validates the combined effect (conserves sim budget)."""
+    _write_prompt_template(sim_env, "worker_full", "# WORKER LIVE\n")
+    _write_prompt_template(sim_env, "supervisor_full", "# SUPER LIVE\n")
+    _write_prompt_template(sim_env, "soul_updater", "# UNTOUCHED\n")  # control
+    batch = dream_state.create_or_replace_pending(
+        conversation_sid="s-mt",
+        target_prompts=["worker_full", "supervisor_full"],
+        new_prompt_texts={
+            "worker_full": "# WORKER SHADOW\n",
+            "supervisor_full": "# SUPER SHADOW\n",
+        },
+        rationale="multi-target sim smoke",
+        edits=[
+            {"idx": 0, "phrase_id": "ph-w", "target_prompt": "worker_full",
+             "old_text": "", "new_text": "x", "section_path": "",
+             "kind": "replace", "status": "ok"},
+            {"idx": 1, "phrase_id": "ph-s", "target_prompt": "supervisor_full",
+             "old_text": "", "new_text": "y", "section_path": "",
+             "kind": "replace", "status": "ok"},
+        ],
+    )
+    shadow = simulator.materialize_shadow(batch, root=tmp_path / "shadows")
+
+    assert (shadow / "worker_full.md").read_text() == "# WORKER SHADOW\n"
+    assert (shadow / "supervisor_full.md").read_text() == "# SUPER SHADOW\n"
+    # Unrelated sibling copies unchanged.
+    assert (shadow / "soul_updater.md").read_text() == "# UNTOUCHED\n"
 
 
 def test_materialize_shadow_missing_live_dir_raises(sim_env, tmp_path, monkeypatch):

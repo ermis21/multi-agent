@@ -61,6 +61,17 @@ def _iter_date_from_iso(ts: str) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _parse_ts(ts: str) -> datetime | None:
+    """Return a UTC-aware datetime from an ISO string, or None if unparseable."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _read_state(sid_dir: Path) -> dict:
     """Return the session's state.json as a dict, or `{}` when absent/unreadable.
 
@@ -130,6 +141,44 @@ def _scan_turns_for_date(turns_path: Path, date_iso: str) -> tuple[int, str]:
     return count, latest
 
 
+def _scan_turns_in_window(
+    turns_path: Path,
+    start_ts: datetime,
+    end_ts: datetime,
+) -> tuple[int, str]:
+    """Scan turns.jsonl for `final` turns within [start_ts, end_ts).
+
+    Returns `(count, latest_iso)`. `latest_iso` is the newest ISO timestamp of
+    any final turn inside the window, or `""` when no match.
+    """
+    if not turns_path.exists():
+        return 0, ""
+    count = 0
+    latest = ""
+    try:
+        with turns_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("role") != "final":
+                    continue
+                ts_raw = row.get("timestamp") or ""
+                dt = _parse_ts(ts_raw)
+                if dt is None or dt < start_ts or dt >= end_ts:
+                    continue
+                count += 1
+                if ts_raw > latest:
+                    latest = ts_raw
+    except OSError:
+        return 0, ""
+    return count, latest
+
+
 def iter_sessions_for_date(date_iso: str) -> list[SessionCandidate]:
     """Return candidates with `≥1 final turn on `date_iso`, sorted by recency.
 
@@ -170,3 +219,97 @@ def iter_yesterday_sessions() -> list[SessionCandidate]:
     # date subtraction; avoid dateutil
     yesterday = today.fromordinal(today.toordinal() - 1)
     return iter_sessions_for_date(yesterday.strftime("%Y-%m-%d"))
+
+
+def load_candidate(session_id: str) -> SessionCandidate | None:
+    """Build a SessionCandidate for a specific sid without a window scan.
+
+    Used when the user (via CLI / Discord picker) explicitly names which
+    conversations to dream about — we still need the metadata record that
+    the runner + briefing depend on. Returns None if the session directory
+    is missing or the role is excluded.
+    """
+    if not SESSIONS_ROOT.exists():
+        return None
+    sid_dir = SESSIONS_ROOT / session_id
+    if not sid_dir.is_dir():
+        return None
+    state = _read_state(sid_dir)
+    if _is_excluded(state):
+        return None
+    turns_path = sid_dir / "turns.jsonl"
+    # Count + latest final turn across all time (not filtered by a window —
+    # the caller picked this sid deliberately).
+    count = 0
+    latest = ""
+    if turns_path.exists():
+        try:
+            with turns_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if row.get("role") != "final":
+                        continue
+                    ts = row.get("timestamp") or ""
+                    count += 1
+                    if ts > latest:
+                        latest = ts
+        except OSError:
+            return None
+    role = (state.get("agent_role") or "worker").strip() or "worker"
+    return SessionCandidate(
+        session_id=session_id,
+        agent_role=role,
+        mode=state.get("mode"),
+        model=state.get("model"),
+        final_turn_count=count,
+        last_final_ts=latest,
+        turns_path=turns_path,
+    )
+
+
+def iter_sessions_in_window(
+    start_ts: datetime,
+    end_ts: datetime,
+) -> list[SessionCandidate]:
+    """Return candidates with ≥1 final turn inside [start_ts, end_ts).
+
+    Rolling-window variant of `iter_sessions_for_date`. Used by the default
+    dream-run path so "dream about the last 24h" is a rolling window instead
+    of a UTC calendar slice. Same exclusion rules (sub-agents, dreamer's own,
+    infrastructure roles).
+    """
+    if not SESSIONS_ROOT.exists():
+        return []
+    if start_ts.tzinfo is None:
+        start_ts = start_ts.replace(tzinfo=timezone.utc)
+    if end_ts.tzinfo is None:
+        end_ts = end_ts.replace(tzinfo=timezone.utc)
+    out: list[SessionCandidate] = []
+    for sid_dir in sorted(SESSIONS_ROOT.iterdir()):
+        if not sid_dir.is_dir():
+            continue
+        state = _read_state(sid_dir)
+        if _is_excluded(state):
+            continue
+        turns_path = sid_dir / "turns.jsonl"
+        count, latest = _scan_turns_in_window(turns_path, start_ts, end_ts)
+        if count == 0:
+            continue
+        role = (state.get("agent_role") or "worker").strip() or "worker"
+        out.append(SessionCandidate(
+            session_id=sid_dir.name,
+            agent_role=role,
+            mode=state.get("mode"),
+            model=state.get("model"),
+            final_turn_count=count,
+            last_final_ts=latest,
+            turns_path=turns_path,
+        ))
+    out.sort(key=lambda c: c.last_final_ts, reverse=True)
+    return out

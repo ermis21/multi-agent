@@ -254,3 +254,63 @@ def test_finalize_coverage_overlap_rejected(state_root):
     )
     assert cov.ok is False
     assert "both keep and drop" in cov.reason
+
+
+# ── Multi-target schema + legacy loader ──────────────────────────────────────
+
+def test_create_pending_with_plural_targets_round_trips(state_root):
+    """Batches created with the new `target_prompts` + `new_prompt_texts`
+    signature round-trip through save/load with all targets intact."""
+    batch = dream_state.create_or_replace_pending(
+        conversation_sid="c-mt",
+        target_prompts=["worker_full", "supervisor_full"],
+        new_prompt_texts={
+            "worker_full": "# W\n",
+            "supervisor_full": "# S\n",
+        },
+        rationale="mt",
+        edits=[
+            _edit("ph-w", target_prompt="worker_full"),
+            _edit("ph-s", target_prompt="supervisor_full"),
+        ],
+    )
+    loaded = dream_state.load_pending("c-mt")
+    assert loaded.target_prompts == ["worker_full", "supervisor_full"]
+    assert loaded.new_prompt_texts == {
+        "worker_full": "# W\n", "supervisor_full": "# S\n",
+    }
+    # Legacy singular accessors still work for back-compat callers.
+    assert loaded.target_prompt == "worker_full"
+
+
+def test_legacy_single_target_batch_loads_through_migration(state_root, tmp_path):
+    """A pending file written by an older dreamer (singular target_prompt +
+    new_prompt_text, no per-edit target_prompt) loads into the new shape
+    via `_migrate_pending_data`, with edits auto-stamped."""
+    import json as _json
+    from datetime import datetime, timezone as _tz
+    run_dir = state_root / datetime.now(_tz.utc).strftime("%Y-%m-%d")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    legacy = {
+        "pending_batch_id": "pb-legacy00",
+        "conversation_sid": "c-legacy",
+        "target_prompt": "worker_full",
+        "new_prompt_text": "# LEGACY BODY\n",
+        "rationale": "r",
+        "submitted_at": "2026-04-24T00:00:00+00:00",
+        "phase": PHASE_SUBMIT,
+        "edits": [
+            {"idx": 0, "phrase_id": "ph-old1", "old_text": "a", "new_text": "b",
+             "section_path": "R", "status": "ok", "kind": "replace"},
+        ],
+        "simulations_run": 0,
+        "last_sim_model_match": None,
+        "last_sim_at": None,
+    }
+    (run_dir / "pending_c-legacy.json").write_text(_json.dumps(legacy), encoding="utf-8")
+
+    loaded = dream_state.load_pending("c-legacy")
+    assert loaded.target_prompts == ["worker_full"]
+    assert loaded.new_prompt_texts == {"worker_full": "# LEGACY BODY\n"}
+    # Edits without target_prompt get the legacy target stamped.
+    assert all(e.get("target_prompt") == "worker_full" for e in loaded.edits)

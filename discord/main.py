@@ -328,22 +328,33 @@ async def delete_channel(req: DeleteChannelRequest):
 
 
 @app.get("/discord/list_channels")
-async def list_channels(guild_id: int | None = None, bot: str = "mod"):
+async def list_channels(
+    guild_id: int | None = None,
+    bot: str = "mod",
+    names_only: bool = False,
+):
+    """List guild channels. `names_only=true` skips the per-channel
+    history(limit=1) probe used to compute `last_message_ts` — cuts latency
+    from ~N round-trips to Discord down to zero. Cheap-to-call consumers like
+    the dream-candidates preview use this fast path."""
     bot_client = _get_bot_client(bot)
     gid = guild_id or bot_worker.GUILD_ID
     try:
         guild = bot_client.get_guild(gid) or await bot_client.fetch_guild(gid)
 
-        async def _last_ts(ch) -> str | None:
-            try:
-                msgs = [m async for m in ch.history(limit=1)]
-                return msgs[0].created_at.isoformat() if msgs else None
-            except Exception:
-                return None
+        if names_only:
+            ts_map: dict[int, str | None] = {}
+        else:
+            async def _last_ts(ch) -> str | None:
+                try:
+                    msgs = [m async for m in ch.history(limit=1)]
+                    return msgs[0].created_at.isoformat() if msgs else None
+                except Exception:
+                    return None
 
-        text_channels = [c for c in guild.channels if c.type == discord.ChannelType.text]
-        timestamps    = await asyncio.gather(*[_last_ts(c) for c in text_channels])
-        ts_map        = {c.id: ts for c, ts in zip(text_channels, timestamps)}
+            text_channels = [c for c in guild.channels if c.type == discord.ChannelType.text]
+            timestamps    = await asyncio.gather(*[_last_ts(c) for c in text_channels])
+            ts_map        = {c.id: ts for c, ts in zip(text_channels, timestamps)}
 
         channels = []
         for ch in guild.channels:
@@ -404,7 +415,7 @@ async def ask_question(req: AskQuestionRequest):
     for i, opt in enumerate(req.options):
         embed.add_field(name=f"{letters[i]}", value=opt, inline=False)
 
-    await channel.send(embed=embed, view=view)
+    view.message = await channel.send(embed=embed, view=view)
     bot_worker._stop_thinking(req.session_id)
     return {"ok": True}
 

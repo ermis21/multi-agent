@@ -141,6 +141,9 @@ async def run_meta_dreamer(
     cfg: dict | None = None,
     session_id: str | None = None,
     top_k: int = 3,
+    trace_queue: "asyncio.Queue | None" = None,
+    review_required: bool = False,
+    dreamer_model_override: str | None = None,
 ) -> dict[str, Any]:
     """Spawn a meta-dreamer session targeting `dreamer.md`.
 
@@ -155,14 +158,29 @@ async def run_meta_dreamer(
 
     briefing = build_meta_briefing(phrases)
     sid = session_id or _meta_session_id()
-    body = {
+    body: dict = {
         "messages": [{"role": "user", "content": briefing}],
         "_source_trigger": {"type": "cron", "ref": "meta_dreamer"},
     }
+    if dreamer_model_override:
+        body["model"] = dreamer_model_override
     # Lazy import — entrypoints pulls agent/loop which is heavy.
     from app.entrypoints import run_agent_role
+    from app.dream import review_bus
+
+    if trace_queue is not None:
+        try:
+            trace_queue.put_nowait({
+                "event": "dream_meta_briefing",
+                "data": {"session_id": sid, "head": briefing[:1024]},
+            })
+        except Exception:
+            pass
+
+    if review_required and trace_queue is not None:
+        review_bus.register(sid, trace_queue)
     try:
-        result = await run_agent_role("dreamer", body, sid)
+        result = await run_agent_role("dreamer", body, sid, trace_queue=trace_queue)
         return {
             "status": "ok",
             "session_id": sid,
@@ -176,3 +194,6 @@ async def run_meta_dreamer(
             "top_phrases": phrases,
             "error": f"{type(e).__name__}: {e}",
         }
+    finally:
+        if review_required and trace_queue is not None:
+            review_bus.unregister(sid)

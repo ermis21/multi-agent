@@ -1,13 +1,15 @@
 llm:
-  provider: local
+  provider: openai
   url: null
-  model: gemma-4-E4B-it-Q8_0.gguf
+  model: gpt-5-nano
   temperature: 1.0
-  max_tokens: 131072
+  max_tokens: 16384
   top_p: 0.95
   top_k: 64
   enable_thinking: false
   base_url: http://llama-api-manager:8081
+  price_input: 0.05
+  price_output: 0.4
 models:
   glm_5_1:
     provider: glm
@@ -15,16 +17,16 @@ models:
     temperature: 1.0
     max_tokens: 8192
     top_p: 0.95
-    price_input: 0.60
-    price_output: 2.20
+    price_input: 0.6
+    price_output: 2.2
   gpt_4o:
     provider: openai
     model: gpt-4o
     temperature: 1.0
     max_tokens: 16384
     top_p: 0.95
-    price_input: 2.50
-    price_output: 10.00
+    price_input: 2.5
+    price_output: 10.0
   gpt_5:
     provider: openai
     model: gpt-5
@@ -32,7 +34,7 @@ models:
     max_tokens: 16384
     top_p: 0.95
     price_input: 1.25
-    price_output: 10.00
+    price_output: 10.0
   gpt_5_mini:
     provider: openai
     model: gpt-5-mini
@@ -40,7 +42,7 @@ models:
     max_tokens: 16384
     top_p: 0.95
     price_input: 0.25
-    price_output: 2.00
+    price_output: 2.0
   gpt_5_nano:
     provider: openai
     model: gpt-5-nano
@@ -48,23 +50,53 @@ models:
     max_tokens: 16384
     top_p: 0.95
     price_input: 0.05
-    price_output: 0.40
+    price_output: 0.4
   gpt_4_1:
     provider: openai
     model: gpt-4.1
     temperature: 1.0
     max_tokens: 16384
     top_p: 0.95
-    price_input: 2.00
-    price_output: 8.00
+    price_input: 2.0
+    price_output: 8.0
   gpt_4_1_mini:
     provider: openai
     model: gpt-4.1-mini
     temperature: 1.0
     max_tokens: 16384
     top_p: 0.95
-    price_input: 0.40
-    price_output: 1.60
+    price_input: 0.4
+    price_output: 1.6
+  claude_opus_4_7:
+    provider: anthropic
+    model: claude-opus-4-7
+    temperature: 1.0
+    max_tokens: 8192
+    top_p: 0.95
+    enable_thinking: false
+    thinking_budget_tokens: 8000
+    price_input: 5.0
+    price_output: 25.0
+  claude_sonnet_4_6:
+    provider: anthropic
+    model: claude-sonnet-4-6
+    temperature: 1.0
+    max_tokens: 8192
+    top_p: 0.95
+    enable_thinking: false
+    thinking_budget_tokens: 8000
+    price_input: 3.0
+    price_output: 15.0
+  claude_haiku_4_5:
+    provider: anthropic
+    model: claude-haiku-4-5-20251001
+    temperature: 1.0
+    max_tokens: 8192
+    top_p: 0.95
+    enable_thinking: false
+    thinking_budget_tokens: 8000
+    price_input: 1.0
+    price_output: 5.0
   vpn_local:
     provider: local
     url: http://10.64.82.60:8000
@@ -77,7 +109,7 @@ models:
   local_llama:
     provider: local
     base_url: http://llama-api-manager:8081
-    model: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+    model: gemma-4-E4B-it-Q8_0.gguf
     temperature: 1.0
     max_tokens: 131072
     top_p: 0.95
@@ -324,6 +356,11 @@ discord_moderator:
   - 💬 Chat
   - 🐛 Debugging
   - 📋 Planning
+local_models_refresh:
+  enabled: true
+  schedule: 30 4 * * *
+  auto_patch: true
+  timeout_s: 8.0
 tools:
   discord:
     default_guild_id: '1492979119011397833'

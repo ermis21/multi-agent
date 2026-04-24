@@ -91,7 +91,9 @@ def test_lower_min_tier_admits_haiku(real_catalog):
 
 
 def test_higher_context_floor_rejects_everything(real_catalog):
-    cfg = _dream_cfg(min_context_window=999999)
+    # Ceiling must sit above the largest context in the catalog — Claude 1M
+    # plus headroom for whatever replaces it next.
+    cfg = _dream_cfg(min_context_window=10_000_000)
     with pytest.raises(ModelNotViableError) as exc:
         select_model_for("dream", cfg, catalog=real_catalog)
     assert "meets dream floor" in str(exc.value)

@@ -170,18 +170,33 @@ def _copy_prompts_tree(dst: Path) -> None:
 
 
 def materialize_shadow(batch: dream_state.PendingBatch, root: Path | None = None) -> Path:
+    """Clone the prompts tree + overlay every target prompt in `batch`.
+
+    Multi-target batches (e.g. edits across both `worker_full.md` and
+    `supervisor_full.md`) get ALL their files rewritten in the shadow so
+    the replay sees the combined effect — one simulation validates the
+    whole batch instead of burning budget per-file.
+    """
     root = root or DREAM_SIM_CACHE_ROOT
     root.mkdir(parents=True, exist_ok=True)
     shadow = root / f"shadow-{uuid4().hex[:12]}"
     shadow.mkdir()
     _copy_prompts_tree(shadow)
-    target = shadow / f"{batch.target_prompt}.md"
-    if not target.exists():
-        raise SimulatorError(
-            f"batch.target_prompt={batch.target_prompt!r} not found in shadow tree "
-            f"(expected {target})"
-        )
-    target.write_text(batch.data["new_prompt_text"], encoding="utf-8")
+    target_names = batch.target_prompts or ([batch.target_prompt] if batch.target_prompt else [])
+    if not target_names:
+        raise SimulatorError("batch has no target prompts to overlay")
+    new_texts = batch.new_prompt_texts
+    for name in target_names:
+        target = shadow / f"{name}.md"
+        if not target.exists():
+            raise SimulatorError(
+                f"batch target {name!r} not found in shadow tree (expected {target})"
+            )
+        body = new_texts.get(name)
+        if body is None:
+            # Legacy single-target fallback path
+            body = batch.data.get("new_prompt_text", "")
+        target.write_text(body, encoding="utf-8")
     return shadow
 
 

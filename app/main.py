@@ -19,7 +19,7 @@ import json
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -143,6 +143,15 @@ async def lifespan(app: FastAPI):
                 replace_existing=True,
             )
 
+    lmr_cfg = cfg.get("local_models_refresh", {}) or {}
+    if lmr_cfg.get("enabled", False):
+        scheduler.add_job(
+            _run_local_models_refresh_cron,
+            CronTrigger.from_crontab(lmr_cfg["schedule"]),
+            id="local_models_refresh",
+            replace_existing=True,
+        )
+
     if scheduler.get_jobs():
         scheduler.start()
 
@@ -168,12 +177,13 @@ async def _run_discord_moderation() -> None:
 
 
 async def _run_dream_cron() -> None:
-    """Cron wrapper: sweep yesterday's sessions via the dreamer."""
+    """Cron wrapper: sweep the last 24h of sessions via the dreamer.
+
+    Rolling window ending at cron fire time — "dream about what just happened"
+    rather than a UTC calendar slice that misses the late-night activity of the
+    most recent local day.
+    """
     from app.dream import interrupt, runner
-    # "Yesterday" in UTC — the run commits edits reviewed against prior-day turns.
-    target_date = (datetime.now(timezone.utc).date().toordinal() - 1)
-    from datetime import date as _date
-    date_iso = _date.fromordinal(target_date).isoformat()
 
     watcher = interrupt.UserActivityWatcher(
         poll_interval_s=2.0,
@@ -181,18 +191,39 @@ async def _run_dream_cron() -> None:
     )
     try:
         await watcher.start()
-        result = await runner.run_dream(date_iso, interrupt_event=watcher.event)
+        result = await runner.run_dream(
+            window_hours=24,
+            interrupt_event=watcher.event,
+        )
+        label = result.get("date", "?")
         print(
-            f"[phoebe-api] dream run {date_iso}: "
+            f"[phoebe-api] dream run {label} (last 24h): "
             f"seen={len(result.get('session_ids_seen') or [])} "
             f"completed={len(result.get('session_ids_completed') or [])} "
             f"interrupted={'yes' if result.get('interrupted_at') else 'no'}",
             flush=True,
         )
     except Exception as e:
-        print(f"[phoebe-api] dream run {date_iso} failed: {e}", flush=True)
+        print(f"[phoebe-api] dream run (cron) failed: {e}", flush=True)
     finally:
         await watcher.stop()
+
+
+async def _run_local_models_refresh_cron() -> None:
+    """Cron wrapper: probe every local endpoint and reconcile model_ranks.yaml."""
+    from app.model_refresh import refresh_local_models
+    try:
+        result = await refresh_local_models(get_config())
+        print(
+            f"[phoebe-api] local_models_refresh: "
+            f"drifted={result.get('drifted') or []} "
+            f"unchanged={result.get('unchanged') or []} "
+            f"errors={result.get('errors') or []} "
+            f"patched={result.get('patched')}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[phoebe-api] local_models_refresh failed: {e}", flush=True)
 
 
 async def _run_dream_digest_cron() -> None:
@@ -252,6 +283,9 @@ async def chat_completions(request: Request):
     Optional extra fields:
       - "session_id": session log uses this ID.
       - "stream": true → return SSE stream with real-time tool traces.
+      - "discord_msg_id" + "channel_id": when set (by the Discord bot), the
+        user message is indexed against the resulting final turn so a native
+        Discord edit can later resolve it via POST /v1/sessions/{sid}/rewind.
     """
     body = await request.json()
     session_id = body.pop("session_id", None) or (
@@ -384,6 +418,176 @@ async def kill_session(session_id: str):
     return {"ok": True, "session_id": session_id}
 
 
+@app.post("/v1/sessions/{session_id}/message_index/bot_msgs")
+async def append_bot_msg_index(session_id: str, request: Request):
+    """Record Discord message IDs the bot posted while rendering one turn.
+
+    Body: {"turn_index": int, "discord_msg_ids": [str, ...], "channel_id": str (optional)}
+
+    Idempotent on (turn_index, msg_id) pairs. Used by the Discord worker bot
+    so a later native-edit event can resolve which channel messages to delete.
+    """
+    from app.sessions.state import SessionState
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    try:
+        turn_index = int(body["turn_index"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "turn_index (int) is required")
+    raw_ids = body.get("discord_msg_ids") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(400, "discord_msg_ids must be a list")
+    msg_ids = [str(m) for m in raw_ids]
+    channel_id = body.get("channel_id")
+
+    st = SessionState.load_or_create(session_id)
+    st.append_bot_msgs(
+        turn_index=turn_index,
+        discord_msg_ids=msg_ids,
+        channel_id=str(channel_id) if channel_id is not None else None,
+    )
+    st.save()
+    return {"ok": True, "count": len(msg_ids), "turn_index": turn_index}
+
+
+@app.post("/v1/sessions/{session_id}/rewind")
+async def rewind_session(session_id: str, request: Request):
+    """Rewind a session to just before its `target_turn_index`-th final turn.
+
+    Body: {"target_turn_index": int, "reason": str (optional)}
+
+    Drops the target final + all subsequent turns from `turns.jsonl`, rewinds
+    `state.json` stats/supervisor/message_index, and invalidates
+    `active.jsonl` if the rewind crosses the compaction boundary.
+
+    Returns `{dropped_bot_msg_ids, dropped_user_msg_ids, ...}` so the Discord
+    bot knows which channel messages to delete. Rejects (409) if the session
+    is currently in-flight — caller must POST /kill first.
+
+    Telemetry fields that can't be accurately reconstructed from the log
+    (`tools.invoked`, `context_audit.*`, `skills.invoked`, token usage) are
+    reset to defaults; they re-accumulate from the next turn. Sidecar logs
+    (approvals.jsonl, tool_errors.jsonl) and ChromaDB auto-memories are NOT
+    rewound — acceptable audit-trail / orphan debt.
+    """
+    from pathlib import Path
+
+    from app.sessions.logger import SessionLogger
+    from app.sessions.state import SESSIONS_DIR, SessionState, _default_state
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Body must be a JSON object")
+    try:
+        target = int(body["target_turn_index"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(400, "target_turn_index (int) is required")
+
+    if session_id in _active_sessions:
+        raise HTTPException(
+            409,
+            "Session is in-flight — POST /v1/sessions/{id}/kill first",
+        )
+
+    st = SessionState.load_or_create(session_id)
+    cur_turn_count = int((st.get("stats.turn_count") or 0))
+    if target < 0 or target >= cur_turn_count:
+        raise HTTPException(
+            400,
+            f"target_turn_index={target} out of range (session has {cur_turn_count} turn(s))",
+        )
+
+    # Invalidate compacted active.jsonl if rewind crosses its boundary.
+    compaction_invalidated = False
+    comp = st.get("history.compaction_covers_up_to_turn")
+    if comp is not None and int(comp) >= target:
+        active_path = SESSIONS_DIR / session_id / "active.jsonl"
+        try:
+            if active_path.exists():
+                active_path.unlink()
+        except OSError as e:
+            print(f"[rewind] failed to unlink active.jsonl for {session_id}: {e}", flush=True)
+        hist = st.data.setdefault("history", {})
+        hist["active"] = None
+        hist["compaction_covers_up_to_turn"] = None
+        hist["last_compaction_ts"] = None
+        compaction_invalidated = True
+
+    # Truncate the turn log.
+    logger = SessionLogger(session_id)
+    try:
+        surviving_turns, dropped_turns = logger.truncate_to_final(target)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except OSError as e:
+        raise HTTPException(500, f"Failed to rewrite turns.jsonl: {e}")
+
+    # Recompute stats from surviving log (lower bound; token usage + duration
+    # aren't recoverable from log alone, so reset).
+    surviving_finals = [t for t in surviving_turns if t.get("role") == "final"]
+    surviving_llm   = [t for t in surviving_turns if t.get("role") in ("worker", "supervisor")]
+    surviving_sups  = [t for t in surviving_turns if t.get("role") == "supervisor"]
+
+    defaults = _default_state(session_id)
+    stats = st.data.setdefault("stats", {})
+    stats["turn_count"]        = len(surviving_finals)
+    stats["llm_call_count"]    = len(surviving_llm)
+    stats["tool_error_count"]  = 0
+    stats["total_duration_ms"] = 0
+    stats["token_usage"]       = dict(defaults["stats"]["token_usage"])
+
+    # Telemetry reset — not recoverable from log alone, re-accumulates naturally.
+    st.data["tools"]         = dict(defaults["tools"])
+    st.data["context_audit"] = dict(defaults["context_audit"])
+    st.data["skills"]        = dict(defaults["skills"])
+
+    # Supervisor — last verdict from the final surviving supervisor entry
+    # (if log_supervisor_turns was on); fail_count from log; else reset.
+    sup = st.data.setdefault("supervisor", {})
+    sup["last_verdict"] = None
+    sup["fail_count"] = 0
+    for t in surviving_sups:
+        v = t.get("supervisor") or {}
+        if v and not bool(v.get("pass", False)):
+            sup["fail_count"] = int(sup.get("fail_count", 0)) + 1
+    if surviving_sups:
+        v = surviving_sups[-1].get("supervisor") or {}
+        if v:
+            sup["last_verdict"] = {
+                "pass": bool(v.get("pass", False)),
+                "score": float(v.get("score", 0.0)),
+                "feedback": v.get("feedback", ""),
+                "attempt": int(v.get("attempt", 0)),
+                "ts": surviving_sups[-1].get("timestamp"),
+            }
+
+    # Truncate message_index; collect the dropped ids for the Discord bot.
+    mi = st.data.setdefault("message_index", {"user_msgs": [], "bot_msgs": []})
+    kept_users = [m for m in mi.get("user_msgs", []) if int(m.get("turn_index", -1)) < target]
+    drop_users = [m for m in mi.get("user_msgs", []) if int(m.get("turn_index", -1)) >= target]
+    kept_bots  = [m for m in mi.get("bot_msgs", [])  if int(m.get("turn_index", -1)) < target]
+    drop_bots  = [m for m in mi.get("bot_msgs", [])  if int(m.get("turn_index", -1)) >= target]
+    mi["user_msgs"] = kept_users
+    mi["bot_msgs"]  = kept_bots
+
+    # Clear any queued injections — they belong to the dropped tail.
+    st.data["pending_injections"] = []
+
+    st.save()
+
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "truncated_to_turn": target,
+        "compaction_invalidated": compaction_invalidated,
+        "dropped_turn_count": len([t for t in dropped_turns if t.get("role") == "final"]),
+        "dropped_user_msg_ids": [m.get("discord_msg_id") for m in drop_users],
+        "dropped_bot_msg_ids":  [m.get("discord_msg_id") for m in drop_bots],
+    }
+
+
 # ── Persistent session state (sessions/{sid}.state.json) ──────────────────────
 
 @app.get("/v1/sessions/{session_id}/state")
@@ -488,35 +692,272 @@ async def trigger_soul_update():
 @app.post("/internal/dream-run")
 async def trigger_dream_run(request: Request):
     """
-    Manually trigger a dream run for a given date (default: yesterday UTC).
+    Manually trigger a dream run. Default scope = last 24 hours (rolling).
 
-    Body (optional): {"date": "YYYY-MM-DD", "meta_enabled": bool}
+    Body (optional):
+      - date: "YYYY-MM-DD"             UTC calendar-day scope (back-compat); if
+                                        omitted we use a rolling window instead
+      - window_hours: float             window size for rolling mode (default 24)
+      - conversation_sids: list[str]    explicit sid list (overrides date/window)
+      - dreamer_model: str              override cfg.dream.model for this run
+      - meta_enabled: bool             default true
+      - verbose: bool                  default true — manual trigger wants transparency
+      - review: bool                   default same as verbose — gate dream_finalize
+                                        on user decisions
+
+    When `verbose=true`, returns an SSE stream. When false, blocking JSON.
+    Cron hits `_run_dream_cron` directly.
     """
     from app.dream import interrupt, runner
-    from datetime import date as _date
 
     try:
         body = await request.json()
     except Exception:
         body = {}
     date_iso = body.get("date")
-    if not date_iso:
-        target_date = datetime.now(timezone.utc).date().toordinal() - 1
-        date_iso = _date.fromordinal(target_date).isoformat()
+    window_hours = body.get("window_hours")
+    if window_hours is not None:
+        try:
+            window_hours = float(window_hours)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="window_hours must be a number")
+    conversation_sids = body.get("conversation_sids") or None
+    if conversation_sids is not None:
+        if not isinstance(conversation_sids, list) or not all(isinstance(s, str) for s in conversation_sids):
+            raise HTTPException(status_code=400, detail="conversation_sids must be a list of strings")
+    dreamer_model = body.get("dreamer_model") or None
+    if dreamer_model is not None and not isinstance(dreamer_model, str):
+        raise HTTPException(status_code=400, detail="dreamer_model must be a string")
     meta_enabled = bool(body.get("meta_enabled", True))
+    verbose = bool(body.get("verbose", True))
+    review = bool(body.get("review", verbose))
 
-    watcher = interrupt.UserActivityWatcher(
-        poll_interval_s=2.0,
-        active_sessions_source=lambda: _active_sessions,
-    )
-    await watcher.start()
-    try:
-        result = await runner.run_dream(
-            date_iso, interrupt_event=watcher.event, meta_enabled=meta_enabled,
+    # Build the run_dream kwargs once so both branches stay in sync.
+    run_kwargs: dict = {"meta_enabled": meta_enabled}
+    if conversation_sids:
+        run_kwargs["conversation_sids"] = conversation_sids
+    elif date_iso:
+        run_kwargs["date_iso"] = date_iso
+    else:
+        run_kwargs["window_hours"] = window_hours if window_hours is not None else 24.0
+    if dreamer_model:
+        run_kwargs["dreamer_model_override"] = dreamer_model
+
+    if not verbose:
+        watcher = interrupt.UserActivityWatcher(
+            poll_interval_s=2.0,
+            active_sessions_source=lambda: _active_sessions,
         )
-    finally:
-        await watcher.stop()
-    return {"status": "ok", "date": date_iso, "result": result}
+        await watcher.start()
+        try:
+            result = await runner.run_dream(interrupt_event=watcher.event, **run_kwargs)
+        finally:
+            await watcher.stop()
+        return {"status": "ok", "date": result.get("date"), "result": result}
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _run_and_signal() -> None:
+        watcher = interrupt.UserActivityWatcher(
+            poll_interval_s=2.0,
+            active_sessions_source=lambda: _active_sessions,
+        )
+        await watcher.start()
+        try:
+            result = await runner.run_dream(
+                interrupt_event=watcher.event,
+                trace_queue=queue,
+                review_required=review,
+                **run_kwargs,
+            )
+            done_label = (result or {}).get("date")
+        except Exception as e:
+            queue.put_nowait({
+                "event": "error",
+                "data": {"error": f"{type(e).__name__}: {e}"},
+            })
+            done_label = date_iso
+        finally:
+            await watcher.stop()
+            queue.put_nowait({
+                "event": "done",
+                "data": {"date": done_label},
+            })
+
+    asyncio.create_task(_run_and_signal(), name=f"dream_run_{date_iso or 'window'}")
+    return StreamingResponse(
+        _sse_generator(queue),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/internal/dream-candidates")
+async def dream_candidates(request: Request):
+    """Preview dream candidates without running. Used by the CLI/Discord
+    picker to let the user trim the list before launch.
+
+    Body (optional, all defaulted):
+      - date: "YYYY-MM-DD"      UTC calendar-day scope
+      - window_hours: float     rolling-window size in hours (default 24)
+
+    Returns `{scope, candidates: [...], skipped: [...]}`. Each candidate
+    carries everything the picker needs to render: session_id, agent_role,
+    mode, worker_model, channel_id (parsed from sid), final_turn_count,
+    last_final_ts.
+    """
+    from app.dream import runner as dream_runner
+    from app.dream import session_iter
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    date_iso = body.get("date")
+    window_hours = body.get("window_hours")
+    if window_hours is not None:
+        try:
+            window_hours = float(window_hours)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="window_hours must be a number")
+
+    now_utc = datetime.now(timezone.utc)
+    if date_iso:
+        raw = session_iter.iter_sessions_for_date(date_iso)
+        scope = {"mode": "date", "date": date_iso}
+    else:
+        hours = float(window_hours) if window_hours is not None else 24.0
+        end = now_utc
+        start = end - timedelta(hours=hours)
+        raw = session_iter.iter_sessions_in_window(start, end)
+        scope = {"mode": "window", "hours": hours,
+                 "start": start.isoformat(), "end": end.isoformat()}
+
+    def _shape(c) -> dict:
+        channel_id = None
+        parts = c.session_id.split("_")
+        if parts[:1] == ["discord"] and len(parts) >= 2 and parts[1].isdigit():
+            channel_id = parts[1]
+        return {
+            "session_id": c.session_id,
+            "agent_role": c.agent_role,
+            "mode": c.mode,
+            "worker_model": c.model,
+            "channel_id": channel_id,
+            "channel_name": None,  # filled in below if Discord reachable
+            "final_turn_count": c.final_turn_count,
+            "last_final_ts": c.last_final_ts,
+            "dreamable": dream_runner._is_dreamable_sid(c.session_id),
+        }
+
+    shaped = [_shape(c) for c in raw]
+
+    # Best-effort channel-name resolution via the Discord gateway's fast
+    # `names_only` path. Skip silently if Discord is unreachable — the CLI
+    # falls back to showing raw ids.
+    wanted_ids = {x["channel_id"] for x in shaped if x["channel_id"]}
+    if wanted_ids:
+        try:
+            import httpx as _httpx
+            async with _httpx.AsyncClient(timeout=5.0) as _http:
+                _r = await _http.get(
+                    "http://phoebe-discord:4000/discord/list_channels",
+                    params={"names_only": "true"},
+                )
+                _r.raise_for_status()
+                id_to_name: dict[str, str] = {
+                    ch.get("id"): ch.get("name")
+                    for ch in (_r.json().get("channels") or [])
+                    if ch.get("id") and ch.get("name")
+                }
+            for x in shaped:
+                cid = x.get("channel_id")
+                if cid and cid in id_to_name:
+                    x["channel_name"] = id_to_name[cid]
+        except Exception:
+            pass  # CLI will just show channel_id
+
+    return {
+        "scope": scope,
+        "candidates": [x for x in shaped if x["dreamable"]],
+        "skipped":    [x for x in shaped if not x["dreamable"]],
+    }
+
+
+@app.get("/internal/dream-models")
+async def dream_models():
+    """List models the dreamer can be pointed at.
+
+    Pulls from `cfg.dream.model`, `cfg.llm.model`, and every named override in
+    `cfg.models.*`. The CLI / Discord picker shows these; the user's choice is
+    passed back as `dreamer_model` on `/internal/dream-run`.
+    """
+    cfg = get_config()
+    default = (cfg.get("dream") or {}).get("model") or (cfg.get("llm") or {}).get("model")
+    options: list[dict] = []
+    seen: set[str] = set()
+
+    def _add(name: str, label: str, source: str) -> None:
+        if not name or name in seen:
+            return
+        seen.add(name)
+        options.append({"name": name, "label": label, "source": source})
+
+    if default:
+        _add(default, f"{default} (current default)", "cfg.dream.model or cfg.llm.model")
+    for alias, spec in sorted((cfg.get("models") or {}).items()):
+        if not isinstance(spec, dict):
+            continue
+        resolved = spec.get("model") or alias
+        _add(alias, f"{alias} → {resolved}", "cfg.models")
+    base = (cfg.get("llm") or {}).get("model")
+    if base:
+        _add(base, f"{base} (base llm default)", "cfg.llm.model")
+    return {"default": default, "options": options}
+
+
+@app.post("/v1/dream/review_response")
+async def dream_review_response(request: Request):
+    """Resolve a pending dream_finalize_review for a given dreamer session.
+
+    Body requires `dreamer_sid` and `decisions` (a `{phrase_id: "keep"|"drop"}`
+    map). The UI client (CLI or Discord) is responsible for expanding
+    "accept all" / "reject all" buttons into explicit per-edit decisions; it
+    already has the phrase_id list from the `dream_finalize_review` event.
+
+    Returns 404 if no review is pending for that session (stale call or already
+    resolved). The review_bus timeout (660 s) also resolves the waiter if the
+    reviewer never replies.
+    """
+    from app.dream import review_bus
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sid = (body or {}).get("dreamer_sid")
+    if not sid:
+        raise HTTPException(status_code=400, detail="dreamer_sid required")
+    if not review_bus.is_active(sid):
+        raise HTTPException(status_code=404, detail=f"no pending review for {sid!r}")
+
+    raw = body.get("decisions") or {}
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="decisions must be an object")
+    decisions = {
+        str(k): ("keep" if str(v).lower() == "keep" else "drop")
+        for k, v in raw.items()
+    }
+
+    unblocked = review_bus.resolve(sid, decisions)
+    if not unblocked:
+        raise HTTPException(status_code=409, detail=f"review for {sid!r} already resolved")
+    return {
+        "ok": True,
+        "dreamer_sid": sid,
+        "n_keep": sum(1 for v in decisions.values() if v == "keep"),
+        "n_drop": sum(1 for v in decisions.values() if v == "drop"),
+    }
 
 
 @app.post("/internal/dream-digest")
@@ -537,6 +978,24 @@ async def trigger_dream_digest(request: Request):
         date_iso = _date.fromordinal(target_date).isoformat()
     result = await mailer.send_digest(date_iso, get_config())
     return {"status": "ok", "date": date_iso, "result": result}
+
+
+@app.post("/internal/local-models-refresh")
+async def trigger_local_models_refresh(request: Request):
+    """
+    Manually probe every `provider=local` endpoint in model_ranks.yaml and
+    reconcile catalog metadata. Body (optional): `{"auto_patch": bool}` to
+    override the config flag for a one-off dry run.
+    """
+    from app.model_refresh import refresh_local_models
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    auto_patch = body.get("auto_patch") if isinstance(body, dict) else None
+    result = await refresh_local_models(get_config(), auto_patch=auto_patch)
+    return {"status": "ok", "result": result}
 
 
 @app.get("/internal/diagnostics")
@@ -577,6 +1036,31 @@ async def _probe_llm(cfg: dict) -> dict:
         return {"status": status, "detail": f"HTTP {r.status_code} from {base_url}"}
     except Exception as e:
         return {"status": "fail", "detail": str(e)}
+
+
+@app.post("/internal/compact/{session_id}")
+async def internal_compact(session_id: str):
+    """Force-run the rolling compactor for a session. Returns telemetry dict."""
+    from app.compactor import run_compaction
+    return await run_compaction(session_id)
+
+
+@app.get("/internal/memory_search")
+async def internal_memory_search(q: str, n: int = 5):
+    """Thin wrapper over the sandbox memory_search tool — no LLM involved."""
+    return await call_tool("memory_search", {"query": q, "n": n}, ["memory_search"])
+
+
+@app.get("/internal/soul")
+async def internal_soul():
+    """Return the current SOUL.md contents (for clients without the state mount)."""
+    from pathlib import Path
+    p = Path("/state/soul/SOUL.md")
+    return {
+        "content": p.read_text() if p.exists() else "",
+        "path":    str(p),
+        "exists":  p.exists(),
+    }
 
 
 # ── Tool approval callback ────────────────────────────────────────────────────

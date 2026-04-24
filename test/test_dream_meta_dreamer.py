@@ -184,7 +184,7 @@ def test_run_meta_dreamer_dispatches_to_run_agent_role(phrase_state, monkeypatch
     _write_index("ph-aaaaaaaaaa", "canonical")
     captured: dict = {}
 
-    async def fake_run_agent_role(role, body, session_id, *, prompts_dir=None):
+    async def fake_run_agent_role(role, body, session_id, *, prompts_dir=None, **_kwargs):
         captured["role"] = role
         captured["body"] = body
         captured["session_id"] = session_id
@@ -215,7 +215,7 @@ def test_run_meta_dreamer_dispatches_to_run_agent_role(phrase_state, monkeypatch
 def test_run_meta_dreamer_surfaces_dispatch_error(phrase_state, monkeypatch):
     _write_index("ph-aaaaaaaaaa", "txt")
 
-    async def boom(role, body, session_id, *, prompts_dir=None):
+    async def boom(role, body, session_id, *, prompts_dir=None, **_kwargs):
         raise RuntimeError("api down")
 
     import app.entrypoints as entrypoints_mod
@@ -233,7 +233,7 @@ def test_run_meta_dreamer_surfaces_dispatch_error(phrase_state, monkeypatch):
 def test_run_meta_dreamer_uses_custom_session_id(phrase_state, monkeypatch):
     _write_index("ph-aaaaaaaaaa", "txt")
 
-    async def ok(role, body, session_id, *, prompts_dir=None):
+    async def ok(role, body, session_id, *, prompts_dir=None, **_kwargs):
         return {"choices": [{"message": {"content": "ok"}}]}
 
     import app.entrypoints as entrypoints_mod

@@ -18,6 +18,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from app.config_loader import get_config, get_agents_config
 from app.context_compressor import (
     compress_section,
@@ -191,21 +193,52 @@ def _build_skills_block(spawnable_agents: list[str], agents_cfg: dict,
 
     skills = skill_entries if skill_entries is not None else _discover_skills()
     if skills:
-        rows = []
-        for s in skills:
-            trig = s.get("when", "").strip().replace("\n", " ")
-            if len(trig) > 90:
-                trig = trig[:89] + "…"
-            rows.append(f"| `{s['name']}` | {trig or '_(no trigger listed)_'} | `{s['path']}` |")
-        table = "| Skill | Trigger | Path |\n|-------|---------|------|\n" + "\n".join(rows)
+        lines = [_format_skill_line(s) for s in skills]
         parts.append(
-            "## Available skill playbooks\n\n"
-            "These are procedures saved under `config/skills/*/SKILL.md`.\n"
-            "Read the full file with `file_read` when the trigger matches what you're doing.\n\n"
-            f"{table}\n"
+            "## Skills\n\n"
+            "Each entry below is the metadata (name + description) of a skill stored "
+            "at `config/skills/<name>/SKILL.md`. When a task matches a description, "
+            "activate the skill by reading its `SKILL.md` with "
+            "`file_read config/skills/<name>/SKILL.md` — the body contains the full "
+            "procedure. Only read a `SKILL.md` when you intend to follow it.\n\n"
+            + "\n".join(lines)
+            + "\n"
         )
 
     return "\n".join(parts)
+
+
+# Per-skill max chars for the metadata line rendered into the system prompt.
+# The Agent Skills spec allows `description` up to 1024 chars, but targets
+# ~100 tokens of *startup* context per skill — we cap at ~400 chars so a
+# 20-skill catalog stays within the default 800-token skills budget.
+_SKILL_DESC_MAX_CHARS = 400
+
+
+def _format_skill_line(entry: dict) -> str:
+    """Render one skill as a single bullet: `- **name**: description [; Use when …; Skip when …]`.
+
+    Follows the Agent Skills spec "progressive disclosure" convention — only
+    the metadata is surfaced in the system prompt; the SKILL.md body is
+    loaded on activation. Phoebe-extended fields (`when-to-trigger`,
+    `when-not-to-trigger`) are appended inline when present so the richer
+    Phoebe skill format still earns its cost.
+    """
+    name = entry.get("name") or "(unnamed)"
+    description = (entry.get("description") or "").strip()
+    when        = (entry.get("when_to_trigger") or "").strip()
+    skip        = (entry.get("when_not_to_trigger") or "").strip()
+
+    body = description
+    if when:
+        body = f"{body}. Use when {when}" if body else f"Use when {when}"
+    if skip:
+        body = f"{body}. Skip when {skip}" if body else f"Skip when {skip}"
+    if not body:
+        body = "(no description provided)"
+    if len(body) > _SKILL_DESC_MAX_CHARS:
+        body = body[: _SKILL_DESC_MAX_CHARS - 1].rstrip() + "…"
+    return f"- **{name}**: {body}"
 
 
 # ── Skill discovery ───────────────────────────────────────────────────────────
@@ -216,13 +249,23 @@ _SKILLS_CACHE: dict = {"mtime": 0.0, "entries": []}
 def _discover_skills() -> list[dict]:
     """Scan config/skills/*/SKILL.md and return a list of skill metadata dicts.
 
-    Each SKILL.md may start with YAML frontmatter:
+    Every SKILL.md must carry YAML frontmatter per the Agent Skills spec
+    (https://agentskills.io/specification):
         ---
-        name: log-triage
-        description: One-line summary
-        when-to-trigger: When the user asks about error logs
+        name: log-triage                    # required, kebab-case
+        description: What it does + when    # required, up to 1024 chars
         ---
-    Fields we extract: name (fallback: directory name), description, when (trigger line).
+    Phoebe-extended optional fields `when-to-trigger` and `when-not-to-trigger`
+    are preserved when present — they feed the progressive-disclosure render
+    in the system prompt. Returned entry shape:
+
+        {
+            "name": str,
+            "description": str,              # spec canonical field
+            "when_to_trigger": str | None,   # Phoebe extension (may be multi-line)
+            "when_not_to_trigger": str | None,
+            "path": str,                     # relative, e.g. "config/skills/x/SKILL.md"
+        }
     """
     skills_root = CONFIG / "skills"
     try:
@@ -242,39 +285,58 @@ def _discover_skills() -> list[dict]:
             continue
         meta = _parse_frontmatter(text)
         name = meta.get("name") or skill_md.parent.name
-        when = (
-            meta.get("when-to-trigger")
-            or meta.get("when_to_trigger")
-            or meta.get("description")
-            or ""
+        description = _coerce_meta_scalar(meta.get("description"))
+        when_to     = _coerce_meta_scalar(
+            meta.get("when-to-trigger") or meta.get("when_to_trigger")
+        )
+        when_not    = _coerce_meta_scalar(
+            meta.get("when-not-to-trigger") or meta.get("when_not_to_trigger")
         )
         rel_path = f"config/skills/{skill_md.parent.name}/SKILL.md"
-        entries.append({"name": name, "when": when, "path": rel_path})
+        entries.append({
+            "name":                name,
+            "description":         description,
+            "when_to_trigger":     when_to or None,
+            "when_not_to_trigger": when_not or None,
+            "path":                rel_path,
+        })
 
     _SKILLS_CACHE["mtime"] = mtime
     _SKILLS_CACHE["entries"] = entries
     return entries
 
 
+def _coerce_meta_scalar(value) -> str:
+    """Normalise a frontmatter scalar-ish value to a single-line string.
+
+    YAML allows lists and multiline blocks (``key: |``). We collapse lists with
+    ``; `` and whitespace-normalise multiline blocks so the result drops into a
+    one-line bullet without mangling the system prompt.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "; ".join(str(x).strip() for x in value if str(x).strip())
+    return " ".join(str(value).split())
+
+
 def _parse_frontmatter(text: str) -> dict:
-    """Minimal `key: value` YAML frontmatter parser — avoids a yaml dependency here."""
+    """Parse the YAML frontmatter block (between leading `---` markers).
+
+    Returns `{}` if the block is absent, malformed, or not a mapping. Values
+    may be any YAML type — callers that need scalars (e.g. `_discover_skills`'s
+    trigger field) are responsible for normalising.
+    """
     if not text.startswith("---"):
         return {}
     end = text.find("\n---", 3)
     if end == -1:
         return {}
-    block = text[3:end].strip()
-    out: dict[str, str] = {}
-    for line in block.splitlines():
-        line = line.rstrip()
-        if not line or ":" not in line or line.lstrip().startswith("#"):
-            continue
-        key, _, value = line.partition(":")
-        key = key.strip().lower()
-        value = value.strip().strip('"').strip("'")
-        if key:
-            out[key] = value
-    return out
+    try:
+        data = yaml.safe_load(text[3:end])
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -343,6 +405,32 @@ def _load_base_template(role: str, mode: str, agent_mode: str = "",
         f"Expected one of: {role}.md, {role}_{agent_mode}_{mode}.md, {role}_{agent_mode}.md, "
         f"{role}_{mode}.md, {role}_full.md."
     )
+
+
+def resolve_prompt_file_for_role(
+    role: str, mode: str, agent_mode: str = "",
+    prompts_dir: Path | None = None,
+) -> str | None:
+    """Return the bare filename (e.g. `worker_full.md`) the 3-tier loader
+    would pick for (role, mode, agent_mode), or None if nothing resolves.
+
+    Same resolution order as `_load_base_template`, but pure — no I/O on the
+    file body, just a stat to find the first match. Used by the dream
+    runner's briefing to tell the dreamer which prompt files drove each
+    role in the conversation being dreamed about.
+    """
+    base = Path(prompts_dir) if prompts_dir is not None else PROMPTS_DIR
+    dedicated = base / f"{role}.md"
+    if dedicated.exists():
+        return dedicated.name
+    if agent_mode and role in ("worker", "supervisor"):
+        for cand in (f"{role}_{agent_mode}_{mode}.md", f"{role}_{agent_mode}.md"):
+            if (base / cand).exists():
+                return cand
+    for cand in (f"{role}_{mode}.md", f"{role}_full.md"):
+        if (base / cand).exists():
+            return cand
+    return None
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

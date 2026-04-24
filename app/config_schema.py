@@ -161,6 +161,26 @@ class DiscordModeratorConfig(BaseModel):
         return v
 
 
+class LocalModelsRefreshConfig(BaseModel):
+    """Nightly sweep that queries every provider=local endpoint declared in
+    `config/model_ranks.yaml`, records observed `model_id` and `context_window`
+    to `/state/model_metadata/local_models.json`, and (optionally) patches the
+    ranks file in place when catalog metadata has drifted."""
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    schedule: str = "30 4 * * *"
+    auto_patch: bool = True
+    timeout_s: float = Field(8.0, ge=0.1)
+
+    @field_validator("schedule")
+    @classmethod
+    def _cron_shape(cls, v: str) -> str:
+        if not _CRON_RE.match(v):
+            raise ValueError("schedule must be a 5-field cron expression (min hour dom mon dow)")
+        return v
+
+
 # ── Misc ───────────────────────────────────────────────────────────────────────
 
 class InflectionConfig(BaseModel):
@@ -323,6 +343,7 @@ class RootConfig(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     soul: SoulConfig = Field(default_factory=SoulConfig)
     discord_moderator: DiscordModeratorConfig = Field(default_factory=DiscordModeratorConfig)
+    local_models_refresh: LocalModelsRefreshConfig = Field(default_factory=LocalModelsRefreshConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     inflection: InflectionConfig = Field(default_factory=InflectionConfig)
     debate: DebateConfig = Field(default_factory=DebateConfig)

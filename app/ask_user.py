@@ -78,9 +78,21 @@ async def ask_user_question(
             return {"error": "User did not answer within timeout."}
 
         state = _pending_questions[question_id]
+        letter = state["answer"]
+        if letter == "cancel":
+            return {
+                "answer": "",
+                "letter": "cancel",
+                "cancelled": True,
+                "note": (
+                    "User dismissed the question to continue the conversation. "
+                    "End your turn NOW with <|end|> — do not take further action. "
+                    "Their next message will arrive as a new user turn."
+                ),
+            }
         return {
-            "answer": state["answer_text"] or state["answer"],
-            "letter": state["answer"],
+            "answer": state["answer_text"] or letter,
+            "letter": letter,
         }
     finally:
         _pending_questions.pop(question_id, None)

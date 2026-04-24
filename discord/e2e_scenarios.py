@@ -836,10 +836,13 @@ async def scenario_dream_smoke(ctx: ScenarioContext) -> None:
       - `run.json` written to `state/dream/runs/<date>/`
     """
     probe_date = "1999-12-31"  # ancient; guaranteed no sessions logged
+    # verbose=false → blocking JSON response (the SSE branch is exercised
+    # separately by the CLI/Discord flow; this smoke only confirms the
+    # existing back-compat path still returns a parseable payload).
     async with httpx.AsyncClient(timeout=30.0) as http:
         r = await http.post(
             f"{PHOEBE_API_URL}/internal/dream-run",
-            json={"date": probe_date, "meta_enabled": False},
+            json={"date": probe_date, "meta_enabled": False, "verbose": False},
         )
     assert r.status_code == 200, f"/internal/dream-run → {r.status_code}: {r.text}"
     payload = r.json()

@@ -39,6 +39,11 @@ class ModelEntry(BaseModel):
     context_window: int = Field(ge=0)
     rank: int = Field(ge=1)
     capabilities: list[str] = Field(default_factory=list)
+    # Independent benchmark score (Artificial Analysis Intelligence Index, 0–100).
+    # Informational only — selection still keys off `rank` — but carries the
+    # provenance for why rank N sits where it does so edits are auditable.
+    intelligence_index: float | None = Field(default=None, ge=0.0, le=100.0)
+    notes: str | None = None
 
 
 class ModelCatalog(BaseModel):

@@ -24,6 +24,7 @@ import httpx
 from utils import is_allowed, split_message
 from views import (
     CallbackApprovalView,
+    DreamEditReviewView,
     InjectionView,
     PlanReviewView,
     QuestionView,
@@ -329,11 +330,26 @@ async def _render_worker_review(channel_id: int, data: dict) -> None:
     await _send_via_mod(channel_id, embed)
 
 
-async def _consume_sse_stream(stream, channel: discord.TextChannel) -> dict | None:
+async def _consume_sse_stream(
+    stream,
+    channel: discord.TextChannel,
+    bot_msg_ids: list[str] | None = None,
+) -> dict | None:
     """Read SSE events from an httpx streaming response, dispatching traces in real-time.
 
     Returns the full API response dict from the ``done`` event, or None on error.
+
+    When `bot_msg_ids` is provided, every discord.Message authored by this bot
+    (tool-start stubs, tool traces, retry/status chirps, error notices) is
+    recorded into the list so the caller can index them against the turn for
+    later message-edit rewind. Mod-bot embeds (supervisor verdict, worker
+    review) are NOT tracked — different author, not deletable by this bot.
     """
+
+    def _track(m: discord.Message | None) -> None:
+        if m is not None and bot_msg_ids is not None:
+            bot_msg_ids.append(str(m.id))
+
     current_event: str | None = None
     current_data:  str | None = None
     # call_id → discord.Message for in-place edit when tool_trace lands
@@ -347,6 +363,7 @@ async def _consume_sse_stream(stream, channel: discord.TextChannel) -> dict | No
                     try:
                         info = json.loads(current_data)
                         msg  = await channel.send(_format_tool_started(info))
+                        _track(msg)
                         call_id = info.get("call_id")
                         if call_id:
                             pending_tool_msgs[call_id] = msg
@@ -360,12 +377,12 @@ async def _consume_sse_stream(stream, channel: discord.TextChannel) -> dict | No
                         try:
                             await msg.edit(content=_format_single_trace(trace))
                         except Exception:
-                            await channel.send(_format_single_trace(trace))
+                            _track(await channel.send(_format_single_trace(trace)))
                     else:
-                        await channel.send(_format_single_trace(trace))
+                        _track(await channel.send(_format_single_trace(trace)))
                 elif current_event == "retry":
                     info = json.loads(current_data)
-                    await channel.send(f"-# \u21bb supervisor retry (attempt {info['attempt']})")
+                    _track(await channel.send(f"-# \u21bb supervisor retry (attempt {info['attempt']})"))
                 elif current_event == "supervisor_verdict":
                     try:
                         await _render_supervisor_verdict(channel.id, json.loads(current_data))
@@ -384,14 +401,14 @@ async def _consume_sse_stream(stream, channel: discord.TextChannel) -> dict | No
                             snippet = text.replace("\n", " ")
                             if len(snippet) > 500:
                                 snippet = snippet[:500] + "…"
-                            await channel.send(f"-# \U0001f4ad {snippet}")
+                            _track(await channel.send(f"-# \U0001f4ad {snippet}"))
                     except Exception:
                         pass
                 elif current_event == "done":
                     return json.loads(current_data)
                 elif current_event == "error":
                     err = json.loads(current_data)
-                    await channel.send(f"[stream error: {err.get('error', 'unknown')}]")
+                    _track(await channel.send(f"[stream error: {err.get('error', 'unknown')}]"))
                     return None
             current_event = None
             current_data = None
@@ -752,6 +769,46 @@ async def _execute_plan(session_id: str, channel: discord.TextChannel) -> None:
         await channel.send(chunk)
 
 
+async def _execute_retry(session_id: str, channel: discord.TextChannel, text: str, mode: str) -> None:
+    """Re-send a prior user message through the full worker pipeline."""
+    always_allow     = list(_session_always_allow.get(session_id, set()))
+    plan_context     = _session_plans.get(session_id, "")
+    privileged_paths = _session_privileged_paths.get(session_id, [])
+
+    _start_thinking(session_id, channel)
+    data = None
+    try:
+        async with _http.stream(
+            "POST",
+            f"{PHOEBE_API_URL}/v1/chat/completions",
+            json={
+                "messages":         [{"role": "user", "content": text}],
+                "session_id":       session_id,
+                "mode":             mode,
+                "approved_tools":   always_allow,
+                "stream":           True,
+                "plan_context":     plan_context,
+                "privileged_paths": privileged_paths,
+            },
+        ) as stream:
+            stream.raise_for_status()
+            data = await _consume_sse_stream(stream, channel)
+    except Exception as e:
+        err_str = str(e) or f"{type(e).__name__} (no message)"
+        await channel.send(f"[error: {err_str}]")
+        return
+    finally:
+        _stop_thinking(session_id)
+
+    if data is None:
+        await channel.send("[error: stream ended unexpectedly]")
+        return
+
+    answer = data.get("choices", [{}])[0].get("message", {}).get("content", "[no response]")
+    for chunk in split_message(answer):
+        await channel.send(chunk)
+
+
 # ── Mid-flight injection dispatcher ──────────────────────────────────────────
 
 _VALID_MODES = {"plan", "build", "converse"}
@@ -835,6 +892,126 @@ async def _post_injection(session_id: str, text: str, mode: str) -> dict | None:
     except Exception as e:
         print(f"[worker-bot] inject failed ({mode}): {e}", flush=True)
         return None
+
+
+async def _register_bot_msgs(
+    session_id: str, turn_index: int, msg_ids: list[str], channel_id: str,
+) -> None:
+    """Index bot reply msg_ids against a turn so a future edit can delete them."""
+    try:
+        await _http.post(
+            f"{PHOEBE_API_URL}/v1/sessions/{session_id}/message_index/bot_msgs",
+            json={
+                "turn_index": int(turn_index),
+                "discord_msg_ids": list(msg_ids),
+                "channel_id": channel_id,
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[worker-bot] register bot_msgs failed for {session_id}: {e}", flush=True)
+
+
+async def _handle_user_edit(after: discord.Message) -> None:
+    """Native Discord edit → session rewind → re-dispatch as fresh turn.
+
+    Flow: look up the turn index by `after.id`, kill any in-flight run,
+    truncate turns + state via POST /rewind, delete the bot's Discord replies
+    that came after, then re-enter on_message() with the edited message.
+    """
+    channel = after.channel
+    session_id = _channel_sessions.get(channel.id)
+    if not session_id:
+        return
+
+    # Resolve turn_index by looking up the edited message id in state.
+    try:
+        resp = await _http.get(
+            f"{PHOEBE_API_URL}/v1/sessions/{session_id}/state", timeout=5,
+        )
+        resp.raise_for_status()
+        state = resp.json()
+    except Exception as e:
+        print(f"[worker-bot] edit: state fetch failed for {session_id}: {e}", flush=True)
+        return
+
+    user_msgs = (state.get("message_index") or {}).get("user_msgs") or []
+    mid = str(after.id)
+    entry = next((m for m in user_msgs if str(m.get("discord_msg_id")) == mid), None)
+    if entry is None:
+        try:
+            await channel.send(
+                "-# edit ignored: this message isn't in my session history "
+                "(pre-dates the session, or was never linked)."
+            )
+        except Exception:
+            pass
+        return
+    target_turn = int(entry.get("turn_index", -1))
+    if target_turn < 0:
+        return
+
+    # Stop any in-flight run on this channel so rewind is safe. Poll briefly
+    # for _channel_in_flight to clear — the bot's finally block clears it
+    # when the SSE stream ends / cancels.
+    if _channel_in_flight.get(channel.id):
+        try:
+            await _http.post(
+                f"{PHOEBE_API_URL}/v1/sessions/{session_id}/kill", timeout=5,
+            )
+        except Exception:
+            pass
+        for _ in range(40):  # up to ~8s
+            if not _channel_in_flight.get(channel.id):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            try:
+                await channel.send(
+                    "-# edit ignored: still processing the previous run — try again."
+                )
+            except Exception:
+                pass
+            return
+
+    # Rewind server-side.
+    try:
+        resp = await _http.post(
+            f"{PHOEBE_API_URL}/v1/sessions/{session_id}/rewind",
+            json={"target_turn_index": target_turn, "reason": "user_edit"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        print(f"[worker-bot] edit: rewind failed for {session_id}: {e}", flush=True)
+        try:
+            await channel.send(f"-# edit failed: {e}")
+        except Exception:
+            pass
+        return
+
+    # Delete bot replies + user follow-ups posted after the edited message.
+    # The edited message itself (mid) is preserved — it's the new seed.
+    to_delete: list[str] = []
+    to_delete.extend(result.get("dropped_bot_msg_ids") or [])
+    for uid in (result.get("dropped_user_msg_ids") or []):
+        if str(uid) != mid:
+            to_delete.append(str(uid))
+    for did in to_delete:
+        try:
+            dmsg = await channel.fetch_message(int(did))
+            await dmsg.delete()
+        except (discord.NotFound, discord.Forbidden):
+            continue
+        except Exception as e:
+            print(f"[worker-bot] delete msg {did} failed: {e}", flush=True)
+
+    # Re-dispatch: the edited message routes through on_message as a fresh turn.
+    try:
+        await on_message(after)  # type: ignore[arg-type]
+    except Exception as e:
+        print(f"[worker-bot] edit: re-dispatch failed: {e}", flush=True)
 
 
 # ── Channel auto-create ───────────────────────────────────────────────────────
@@ -1337,11 +1514,24 @@ async def cmd_help(interaction: discord.Interaction):
         "• `/model` — Show current LLM model and settings\n"
         "• `/speak <prompt>` — Ask the agent a question and get a voice response\n"
         "• `/status` — Show your current mode, session, and system status\n"
-        "• `/context` — Show context-window usage and compression stats\n"
         "• `/help` — This message\n\n"
+        "**Diagnostics**\n"
+        "• `/diag` — System health check (sandbox + LLM)\n"
+        "• `/context` — Context-window usage and compression stats\n"
+        "• `/todos` — Todos and checkpoints for this session\n"
+        "• `/memory <query>` — Search stored memories (ChromaDB)\n"
+        "• `/soul` — Dump current SOUL.md\n"
+        "• `/plan-show` — Dump this session's active plan\n\n"
+        "**Session control**\n"
+        "• `/retry` — Re-run the last user message\n"
+        "• `/revoke <tool>` — Revoke a session-approved tool\n"
+        "• `/resume <sid>` — Bind this channel to a different session id\n"
+        "• `/compact` — Force-run the rolling compactor\n"
+        "• `/kill` — Hard-cancel the in-flight worker immediately\n"
+        "• `/dream-run [date] [meta] [review]` — Trigger a verbose dream run with per-edit review\n\n"
         "**Only while I'm working on something** (worker run in flight)\n"
         "• `/btw <text>` — Add context mid-flight without stopping the agent\n"
-        "• `/stop` — Cancel the currently running worker loop in this channel\n"
+        "• `/stop` — Cooperative stop (then escalates to hard cancel if repeated)\n"
         "*Tip:* just sending a normal message during a run pops up a 4-button\n"
         "popup (Immediate / Not urgent / Clarify / Queue) — usually easier than `/btw`.\n\n"
         "**Modes**\n"
@@ -1351,6 +1541,597 @@ async def cmd_help(interaction: discord.Interaction):
         "**Tip:** Create a channel in the `Conversations` category and I'll auto-connect to it."
     )
     await interaction.response.send_message(msg)
+
+
+# ── Diagnostics / introspection ──────────────────────────────────────────────
+
+def _session_for_channel(interaction: discord.Interaction) -> str:
+    """Return the channel's session id, creating a per-user one as fallback."""
+    if interaction.channel_id in _channel_sessions:
+        return _channel_sessions[interaction.channel_id]
+    return _get_session_id(interaction.channel_id, interaction.user.id)
+
+
+@tree.command(name="diag", description="Run system diagnostic checks and show overall health")
+async def cmd_diag(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/internal/diagnostics", timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        await interaction.followup.send(f"Diagnostics unavailable: {e}", ephemeral=True)
+        return
+
+    overall = data.get("overall", "?")
+    icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(overall, "❔")
+    summary = data.get("summary", "")
+
+    fails: list[str] = []
+    sandbox = data.get("sandbox_checks", {}) or {}
+    for check in sandbox.get("checks", []) or []:
+        if check.get("status") in ("fail", "warn"):
+            tag = "❌" if check["status"] == "fail" else "⚠️"
+            fails.append(f"{tag} `{check.get('name','?')}` — {check.get('detail','')[:100]}")
+    api_llm = data.get("api_checks", {}).get("llm_api_from_api", {}) or {}
+    if api_llm.get("status") in ("fail", "warn"):
+        tag = "❌" if api_llm["status"] == "fail" else "⚠️"
+        fails.append(f"{tag} `llm_api_from_api` — {api_llm.get('detail','')[:100]}")
+
+    lines = [f"{icon} **Overall**: `{overall}` — {summary}"]
+    if fails:
+        lines.append("**Issues:**")
+        lines.extend(f"• {f}" for f in fails[:8])
+    await interaction.followup.send("\n".join(lines))
+
+
+@tree.command(name="memory", description="Search stored memories (ChromaDB)")
+@app_commands.describe(query="What to search for", n="How many results (default 5)")
+async def cmd_memory(interaction: discord.Interaction, query: str, n: int = 5):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        resp = await _http.get(
+            f"{PHOEBE_API_URL}/internal/memory_search",
+            params={"q": query, "n": max(1, min(10, n))},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        await interaction.followup.send(f"Memory search failed: {e}", ephemeral=True)
+        return
+
+    results = data.get("results") or []
+    if not results:
+        await interaction.followup.send(f"No memories matched `{query}`.")
+        return
+
+    lines = [f"**Memory search** for `{query}` — {len(results)} hit(s):"]
+    for r in results[:5]:
+        score = r.get("score")
+        score_s = f"{score:.2f}" if isinstance(score, (int, float)) else "—"
+        content = str(r.get("content", "")).replace("\n", " ").strip()
+        if len(content) > 200:
+            content = content[:200] + "…"
+        lines.append(f"-# `{score_s}`  {content}")
+    await interaction.followup.send("\n".join(lines))
+
+
+@tree.command(name="todos", description="Show todos and checkpoints for this session")
+async def cmd_todos(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    sid = _session_for_channel(interaction)
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/v1/sessions/{sid}/state", timeout=5)
+        resp.raise_for_status()
+        state = resp.json()
+    except Exception as e:
+        await interaction.response.send_message(f"Could not read state: {e}", ephemeral=True)
+        return
+
+    todos = state.get("todos") or []
+    checkpoints = state.get("checkpoints") or []
+    if not todos and not checkpoints:
+        await interaction.response.send_message(
+            f"No todos or checkpoints recorded for `{sid}`."
+        )
+        return
+
+    def _fmt(items: list, header: str) -> list[str]:
+        if not items:
+            return []
+        out = [f"**{header}**"]
+        for item in items[:15]:
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("title") or item.get("description") or str(item)
+                status = item.get("status")
+                prefix = f"[{status}] " if status else ""
+                out.append(f"• {prefix}{txt}")
+            else:
+                out.append(f"• {item}")
+        if len(items) > 15:
+            out.append(f"…and {len(items) - 15} more")
+        return out
+
+    lines = [f"**Session** `{sid}`"]
+    lines.extend(_fmt(todos, "Todos"))
+    lines.extend(_fmt(checkpoints, "Checkpoints"))
+    await interaction.response.send_message("\n".join(lines))
+
+
+@tree.command(name="kill", description="Hard-cancel the in-flight worker run immediately")
+async def cmd_kill(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    sid = _channel_in_flight.get(interaction.channel_id)
+    if not sid:
+        await interaction.response.send_message("No active run in this channel.", ephemeral=True)
+        return
+    try:
+        resp = await _http.post(f"{PHOEBE_API_URL}/v1/sessions/{sid}/kill", timeout=5)
+    except Exception as e:
+        await interaction.response.send_message(f"Hard cancel failed: {e}", ephemeral=True)
+        return
+
+    if resp.status_code == 404:
+        await interaction.response.send_message(
+            "Run already finished — nothing to kill.", ephemeral=True
+        )
+        return
+    if resp.status_code != 200:
+        await interaction.response.send_message(
+            f"Hard cancel returned HTTP {resp.status_code}.", ephemeral=True
+        )
+        return
+    _stop_request_ts.pop(interaction.channel_id, None)
+    await interaction.response.send_message("🛑 **Hard cancel** — worker terminated.")
+
+
+@tree.command(name="retry", description="Re-run the last user message in this session")
+async def cmd_retry(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    if _channel_in_flight.get(interaction.channel_id):
+        await interaction.response.send_message(
+            "A run is already in flight — `/stop` or `/kill` first.", ephemeral=True
+        )
+        return
+
+    sid = _session_for_channel(interaction)
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/sessions/{sid}", timeout=5)
+    except Exception as e:
+        await interaction.response.send_message(f"Could not read session: {e}", ephemeral=True)
+        return
+    if resp.status_code == 404:
+        await interaction.response.send_message("No history in this session yet.", ephemeral=True)
+        return
+    if resp.status_code != 200:
+        await interaction.response.send_message(
+            f"Session fetch returned HTTP {resp.status_code}.", ephemeral=True
+        )
+        return
+
+    turns = resp.json().get("turns") or []
+    last_user = next(
+        (str(t.get("content") or "") for t in reversed(turns) if t.get("role") == "user"),
+        "",
+    )
+    if not last_user.strip():
+        await interaction.response.send_message("Nothing to retry.", ephemeral=True)
+        return
+
+    snippet = last_user if len(last_user) <= 80 else last_user[:80] + "…"
+    await interaction.response.send_message(f"🔁 Retrying: {snippet}")
+    mode = _get_mode(interaction.channel_id, interaction.user.id)
+    asyncio.create_task(_execute_retry(sid, interaction.channel, last_user, mode))
+
+
+@tree.command(name="revoke", description="Revoke a session-approved tool (next use re-prompts)")
+@app_commands.describe(tool="The tool name to revoke from this session")
+async def cmd_revoke(interaction: discord.Interaction, tool: str):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    sid = _session_for_channel(interaction)
+    approved = _session_always_allow.get(sid)
+    if not approved or tool not in approved:
+        await interaction.response.send_message(
+            f"`{tool}` is not in this session's always-allow list.", ephemeral=True
+        )
+        return
+    approved.discard(tool)
+    _sync_session_state(sid)
+    _save_state()
+    await interaction.response.send_message(
+        f"Revoked `{tool}`. Next invocation will prompt for approval again."
+    )
+
+
+@cmd_revoke.autocomplete("tool")
+async def _revoke_autocomplete(interaction: discord.Interaction, current: str):
+    sid = _session_for_channel(interaction)
+    approved = sorted(_session_always_allow.get(sid, set()))
+    cur = (current or "").lower()
+    return [
+        app_commands.Choice(name=t, value=t)
+        for t in approved if not cur or cur in t.lower()
+    ][:25]
+
+
+@tree.command(name="resume", description="Bind this channel to a different session id")
+@app_commands.describe(session_id="The session id to resume (see /sessions via api for a list)")
+async def cmd_resume(interaction: discord.Interaction, session_id: str):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/v1/sessions/{session_id}/state", timeout=5)
+        resp.raise_for_status()
+        state = resp.json()
+    except Exception as e:
+        await interaction.response.send_message(f"Could not fetch session: {e}", ephemeral=True)
+        return
+
+    turn_count = (state.get("stats") or {}).get("turn_count") or 0
+    if turn_count <= 0:
+        await interaction.response.send_message(
+            f"Session `{session_id}` has no recorded turns — refusing to bind (likely a typo).",
+            ephemeral=True,
+        )
+        return
+
+    _channel_sessions[interaction.channel_id] = session_id
+    WORKER_CHANNEL_IDS.add(interaction.channel_id)
+    _save_state()
+    await interaction.response.send_message(
+        f"Bound this channel to `{session_id}` ({turn_count} turns)."
+    )
+
+
+@tree.command(name="compact", description="Force-run the rolling compactor for this session")
+async def cmd_compact(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    sid = _session_for_channel(interaction)
+    await interaction.response.defer()
+    try:
+        resp = await _http.post(f"{PHOEBE_API_URL}/internal/compact/{sid}", timeout=600)
+        resp.raise_for_status()
+        result = resp.json()
+    except Exception as e:
+        await interaction.followup.send(f"Compaction failed: {e}", ephemeral=True)
+        return
+
+    if "skipped" in result:
+        await interaction.followup.send(f"Skipped: `{result['skipped']}`.")
+        return
+    if "error" in result:
+        await interaction.followup.send(f"❌ Compaction error: `{result['error']}`.")
+        return
+
+    covers = result.get("covers_up_to_turn", "?")
+    size = result.get("body_chars", 0)
+    await interaction.followup.send(
+        f"✅ Compacted through turn **{covers}** — summary size {size:,} chars."
+    )
+
+
+async def _render_dream_event(event: str, data: dict, channel: discord.TextChannel) -> None:
+    """Dispatch a single dream SSE event to the channel.
+
+    Delegates worker_status / tool_started / tool_trace / injection to the
+    worker formatters via a shared pending_tool_msgs dict; dream-level events
+    (conversation_start/end, meta, finalize_review) render as embeds or
+    subtext lines.
+    """
+    if event == "dream_run_start":
+        window = data.get("window") or {}
+        scope = (
+            f"last {window.get('hours', '?')}h" if window
+            else f"date {data.get('date', '?')}"
+        )
+        await channel.send(
+            f"-# 🌙 dream run starting ({scope})  "
+            f"candidates={data.get('candidates', 0)}  "
+            f"skipped={data.get('skipped', 0)}  "
+            f"dreamer=`{data.get('dreamer_model', '?')}`  "
+            f"review={'on' if data.get('review_required') else 'off'}"
+        )
+    elif event == "dream_conversation_start":
+        ch_id = data.get("channel_id")
+        ch_display = ""
+        if ch_id:
+            try:
+                resolved = client.get_channel(int(ch_id))
+                if resolved is not None:
+                    ch_display = f"  #{resolved.name}"
+                else:
+                    ch_display = f"  channel={ch_id}"
+            except Exception:
+                ch_display = f"  channel={ch_id}"
+        worker_model = data.get("worker_model") or "?"
+        mode = data.get("mode") or "?"
+        # `prompt_files` (new, from multi-target plumbing) lists the role →
+        # prompt-file pairs the dreamer can see in scope for this conv.
+        pf_line = ""
+        pf = data.get("prompt_files") or []
+        if pf:
+            pf_line = "  scope: " + ", ".join(
+                f"`{p.get('file', '?')}`" for p in pf if p.get("file")
+            )
+        await channel.send(
+            f"-# ▸ conv {data.get('idx', '?')}/{data.get('total', '?')}  "
+            f"role=`{data.get('role', '?')}` mode=`{mode}` "
+            f"worker_model=`{worker_model}`{ch_display}{pf_line}  "
+            f"sid=`{data.get('sid', '?')}`"
+        )
+    elif event == "dream_conversation_end":
+        status = data.get("status", "?")
+        committed = len(data.get("committed") or [])
+        flagged = len(data.get("flagged") or [])
+        err = data.get("error")
+        marker = "✗" if err else "✓"
+        line = f"-# {marker} {status}  committed={committed}  flagged={flagged}"
+        if err:
+            line += f"  err=`{err[:120]}`"
+        await channel.send(line)
+    elif event == "dream_meta_start":
+        await channel.send(
+            f"-# 🌀 meta-dreamer  flagged_total={data.get('flagged_total', 0)}  "
+            f"top_k={data.get('top_k', 0)}"
+        )
+    elif event == "dream_meta_briefing":
+        head = (data.get("head") or "")[:500].replace("\n", " ")
+        if head:
+            await channel.send(f"-# briefing: {head}")
+    elif event == "dream_meta_end":
+        await channel.send(f"-# meta: `{data.get('status', '?')}`")
+    elif event == "dream_run_end":
+        await channel.send(
+            f"-# 🌙 done  seen={data.get('seen', 0)}  "
+            f"completed={data.get('completed', 0)}  "
+            f"interrupted={data.get('interrupted', False)}"
+        )
+    elif event == "dream_finalize_review_timeout":
+        await channel.send(
+            f"⚠️ Review for `{data.get('dreamer_sid', '?')}` timed out — all edits dropped."
+        )
+    elif event == "dream_skip":
+        rationale = (data.get("rationale") or "(no reason given)").replace("`", "'")
+        await channel.send(
+            f"-# ⊘ dreamer skipped  rationale: _{rationale[:400]}_"
+        )
+
+
+async def _consume_dream_sse(stream, channel: discord.TextChannel) -> None:
+    """SSE consumer for `/dream-run`.
+
+    Renders dream-specific events; on `dream_finalize_review`, posts a
+    `DreamEditReviewView` that POSTs user decisions to
+    `/v1/dream/review_response`. Worker events (worker_status/tool_trace)
+    flow through the same channel.
+    """
+    current_event: str | None = None
+    data_lines: list[str] = []
+    pending_tool_msgs: dict[str, discord.Message] = {}
+
+    async for raw_line in stream.aiter_lines():
+        line = raw_line.rstrip("\r\n")
+        if line == "":
+            if current_event is None:
+                continue
+            blob = "\n".join(data_lines) if data_lines else "{}"
+            try:
+                data = json.loads(blob)
+            except Exception:
+                data = {"_raw": blob}
+            try:
+                if current_event == "tool_started":
+                    msg = await channel.send(_format_tool_started(data))
+                    call_id = data.get("call_id")
+                    if call_id:
+                        pending_tool_msgs[call_id] = msg
+                elif current_event == "tool_trace":
+                    call_id = data.get("call_id")
+                    msg = pending_tool_msgs.pop(call_id, None) if call_id else None
+                    formatted = _format_single_trace(data)
+                    if msg is not None:
+                        try:
+                            await msg.edit(content=formatted)
+                        except Exception:
+                            await channel.send(formatted)
+                    else:
+                        await channel.send(formatted)
+                elif current_event == "worker_status":
+                    text = (data.get("text") or "").strip().replace("\n", " ")
+                    if text:
+                        await channel.send(f"-# 💭 {text[:500]}")
+                elif current_event == "dream_finalize_review":
+                    raw_edits = data.get("edits") or []
+                    # Sort by target_prompt so all edits for one file cluster
+                    # together. Multi-target batches get a "## target.md"
+                    # divider field before each group.
+                    def _grp_key(e):
+                        return (e.get("target_prompt") or data.get("target_prompt") or "", e.get("phrase_id") or "")
+                    edits = sorted(raw_edits, key=_grp_key)
+                    targets = data.get("target_prompts") or (
+                        [data.get("target_prompt")] if data.get("target_prompt") else []
+                    )
+                    sid = data.get("dreamer_sid", "?")
+                    if len(targets) > 1:
+                        header_target = f"{len(targets)} prompts: {', '.join(targets)}"
+                    else:
+                        header_target = f"`{targets[0] if targets else '?'}`"
+                    embed = discord.Embed(
+                        title=f"🌙 Review {len(edits)} dream edit(s)",
+                        description=(
+                            f"**target:** {header_target}\n"
+                            f"**dreamer session:** `{sid}`\n"
+                            f"_rationale:_ {(data.get('rationale') or '')[:400]}"
+                        ),
+                        color=0x9b5de5,
+                    )
+                    last_target: str | None = None
+                    for i, e in enumerate(edits[:10], start=1):
+                        et = e.get("target_prompt") or (targets[0] if targets else "?")
+                        if et != last_target:
+                            # Group divider — a field without a diff body.
+                            embed.add_field(
+                                name=f"── {et} ──",
+                                value="​",  # zero-width space placeholder
+                                inline=False,
+                            )
+                            last_target = et
+                        old = (e.get("old_text") or "").replace("```", "`​``")
+                        new = (e.get("new_text") or "").replace("```", "`​``")
+                        body = (
+                            f"**kind:** `{e.get('kind', '?')}`  "
+                            f"**status:** `{e.get('status', 'ok')}`\n"
+                            f"```diff\n- {old[:300]}\n+ {new[:300]}\n```"
+                        )
+                        embed.add_field(
+                            name=f"{i}. {(e.get('phrase_id') or '')[:60]}",
+                            value=body[:1000],
+                            inline=False,
+                        )
+                    if len(edits) > 10:
+                        embed.set_footer(text=f"showing 10 of {len(edits)} edits — use Select… for the full list")
+                    view = DreamEditReviewView(dreamer_sid=sid, edits=edits)
+                    msg = await channel.send(embed=embed, view=view)
+                    view.message = msg
+                elif current_event == "done":
+                    return
+                elif current_event == "error":
+                    await channel.send(f"❌ dream stream error: `{data.get('error', 'unknown')}`")
+                    return
+                else:
+                    await _render_dream_event(current_event, data, channel)
+            except Exception as e:
+                print(f"[dream-stream] render {current_event} failed: {e}", flush=True)
+            current_event = None
+            data_lines = []
+            continue
+        if line.startswith("event:"):
+            current_event = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].lstrip())
+
+
+@tree.command(name="dream-run", description="Manually trigger a verbose dream run with per-edit review")
+@app_commands.describe(
+    date="UTC calendar day YYYY-MM-DD (default: rolling last 24h)",
+    window_hours="Rolling-window size in hours (default 24; ignored when date is set)",
+    meta="Run the meta-dreamer after per-conversation passes (default: true)",
+    review="Gate finalize on your accept/drop decisions (default: true)",
+)
+async def cmd_dream_run(
+    interaction: discord.Interaction,
+    date: str | None = None,
+    window_hours: float | None = None,
+    meta: bool = True,
+    review: bool = True,
+):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "Use this in a text channel so the stream has somewhere to render.", ephemeral=True
+        )
+        return
+    scope = (
+        f"`{date}`" if date
+        else f"last {window_hours}h" if window_hours is not None
+        else "last 24h"
+    )
+    await interaction.response.send_message(
+        f"🌙 starting dream run ({scope})  "
+        f"meta={'on' if meta else 'off'}  review={'on' if review else 'off'}"
+    )
+    payload: dict = {"verbose": True, "meta_enabled": bool(meta), "review": bool(review)}
+    if date:
+        payload["date"] = date
+    elif window_hours is not None:
+        payload["window_hours"] = window_hours
+    try:
+        async with _http.stream(
+            "POST",
+            f"{PHOEBE_API_URL}/internal/dream-run",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+            timeout=None,
+        ) as stream:
+            if stream.status_code != 200:
+                body = await stream.aread()
+                await channel.send(f"❌ dream-run HTTP {stream.status_code}: {body.decode('utf-8', 'replace')[:500]}")
+                return
+            await _consume_dream_sse(stream, channel)
+    except Exception as e:
+        await channel.send(f"❌ dream-run failed: `{e}`")
+
+
+@tree.command(name="soul", description="Show the current SOUL.md contents")
+async def cmd_soul(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/internal/soul", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        await interaction.followup.send(f"Could not read SOUL: {e}", ephemeral=True)
+        return
+
+    content = (data.get("content") or "").strip()
+    if not content:
+        await interaction.followup.send("SOUL.md is empty or missing.")
+        return
+
+    chunks = split_message(content)
+    await interaction.followup.send(f"**SOUL.md** ({len(content):,} chars)")
+    for chunk in chunks:
+        await interaction.channel.send(chunk)
+
+
+@tree.command(name="plan-show", description="Show this session's active plan")
+async def cmd_plan_show(interaction: discord.Interaction):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+    sid = _session_for_channel(interaction)
+    try:
+        resp = await _http.get(f"{PHOEBE_API_URL}/v1/sessions/{sid}/state", timeout=5)
+        resp.raise_for_status()
+        state = resp.json()
+    except Exception as e:
+        await interaction.response.send_message(f"Could not read state: {e}", ephemeral=True)
+        return
+
+    plan = state.get("plan") or _session_plans.get(sid, "")
+    plan = (plan or "").strip()
+    if not plan:
+        await interaction.response.send_message("No active plan for this session.")
+        return
+
+    chunks = split_message(plan)
+    await interaction.response.send_message(f"**Active plan** — {len(plan):,} chars")
+    for chunk in chunks:
+        await interaction.channel.send(chunk)
 
 
 @tree.command(name="speak", description="Ask the agent a question and get a voice response")
@@ -1515,6 +2296,52 @@ async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
 
 
 @client.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    """Native Discord edit hook → rewind the session and re-run the edited message.
+
+    Fires when the edited message is in discord.py's cache (which holds
+    recent messages). Older edits fall through to on_raw_message_edit below.
+    """
+    is_test_driver = TEST_DRIVER_USER_ID and after.author.id == TEST_DRIVER_USER_ID
+    if after.author.bot and not is_test_driver:
+        return
+    if not is_test_driver and not is_allowed(after.author.id):
+        return
+    if WORKER_CHANNEL_IDS and after.channel.id not in WORKER_CHANNEL_IDS:
+        return
+    if (before.content or "") == (after.content or ""):
+        # Discord fires edit events on embed unfurl, pin, etc. — ignore no-op edits.
+        return
+    await _handle_user_edit(after)
+
+
+@client.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent) -> None:
+    """Fallback edit hook for messages that fell out of discord.py's cache."""
+    if payload.cached_message is not None:
+        # on_message_edit handled it with full before/after context.
+        return
+    ch = client.get_channel(payload.channel_id)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(payload.channel_id)
+        except Exception:
+            return
+    try:
+        after = await ch.fetch_message(payload.message_id)
+    except Exception:
+        return
+    is_test_driver = TEST_DRIVER_USER_ID and after.author.id == TEST_DRIVER_USER_ID
+    if after.author.bot and not is_test_driver:
+        return
+    if not is_test_driver and not is_allowed(after.author.id):
+        return
+    if WORKER_CHANNEL_IDS and after.channel.id not in WORKER_CHANNEL_IDS:
+        return
+    await _handle_user_edit(after)
+
+
+@client.event
 async def on_message(msg: discord.Message):
     # Allow one designated driver bot (test/e2e) through the bot-ignore gate.
     is_test_driver = TEST_DRIVER_USER_ID and msg.author.id == TEST_DRIVER_USER_ID
@@ -1574,6 +2401,7 @@ async def on_message(msg: discord.Message):
     _start_thinking(session_id, msg.channel)
     _channel_in_flight[msg.channel.id] = session_id
     data = None
+    bot_msg_ids: list[str] = []
     # _channel_in_flight must stay set through chunk rendering so a rapid
     # follow-up message routes to the InjectionView dispatcher, not a second
     # worker. It's cleared in the outer finally, after the last chunk lands.
@@ -1590,13 +2418,17 @@ async def on_message(msg: discord.Message):
                     "stream":           True,
                     "plan_context":     plan_context,
                     "privileged_paths": privileged_paths,
+                    "discord_msg_id":   str(msg.id),
+                    "channel_id":       str(msg.channel.id),
                 },
             ) as stream:
                 stream.raise_for_status()
-                data = await _consume_sse_stream(stream, msg.channel)
+                data = await _consume_sse_stream(stream, msg.channel, bot_msg_ids)
         except Exception as e:
             err_str = str(e) or f"{type(e).__name__} (no message)"
-            await msg.channel.send(f"[error: {err_str}]")
+            sent = await msg.channel.send(f"[error: {err_str}]")
+            if sent is not None:
+                bot_msg_ids.append(str(sent.id))
             return
         finally:
             _stop_thinking(session_id)
@@ -1644,11 +2476,24 @@ async def on_message(msg: discord.Message):
                 sent = await msg.channel.send(chunk, view=view)
                 view.message = sent
             elif is_last:
-                await msg.channel.send(chunk, view=SpeakView(answer, msg.channel.id))
+                sent = await msg.channel.send(chunk, view=SpeakView(answer, msg.channel.id))
             else:
-                await msg.channel.send(chunk)
+                sent = await msg.channel.send(chunk)
+            if sent is not None:
+                bot_msg_ids.append(str(sent.id))
     finally:
         _channel_in_flight.pop(msg.channel.id, None)
+        # Index the bot's rendered messages against this turn so a native
+        # Discord edit can later resolve which messages to delete on rewind.
+        if bot_msg_ids and data is not None:
+            turn_index = data.get("turn_index")
+            if isinstance(turn_index, int):
+                asyncio.create_task(
+                    _register_bot_msgs(
+                        session_id, turn_index, list(bot_msg_ids), str(msg.channel.id)
+                    ),
+                    name=f"idx_bot_msgs_{session_id}_{turn_index}",
+                )
 
     # Queued injections replay as fresh turns. This MUST run after the in-flight
     # flag is cleared — the recursive on_message() call checks _channel_in_flight

@@ -140,6 +140,17 @@ def _default_state(session_id: str) -> dict[str, Any]:
 
         "debate_id": None,
         "pending_injections": [],
+
+        # Discord message_id ↔ turn ordinal bookkeeping for the edit/rewind
+        # feature. `user_msgs` is appended when a chat_completions request
+        # carries discord_msg_id + channel_id (bot-side trigger); `bot_msgs` is
+        # appended by the Discord bot after it finishes rendering the reply
+        # for a given turn. Both are ordered by `turn_index` (0-based over
+        # "final" turns). Empty when the session was not driven from Discord.
+        "message_index": {
+            "user_msgs": [],
+            "bot_msgs": [],
+        },
     }
 
 
@@ -338,6 +349,52 @@ class SessionState:
         hist["active"] = active_rel_path
         hist["compaction_covers_up_to_turn"] = int(covers_up_to_turn)
         hist["last_compaction_ts"] = _now()
+
+    def append_user_msg(self, turn_index: int, discord_msg_id: str,
+                        channel_id: str | None) -> None:
+        """Record the Discord user message that seeded a final turn.
+
+        Idempotent on `discord_msg_id` — calling twice with the same id is a
+        no-op. This matters because `run_agent_loop` may bail out and retry
+        paths each call here before the first final is logged.
+        """
+        mi = self.data.setdefault(
+            "message_index", {"user_msgs": [], "bot_msgs": []}
+        )
+        msgs = mi.setdefault("user_msgs", [])
+        if any(m.get("discord_msg_id") == discord_msg_id for m in msgs):
+            return
+        entry: dict[str, Any] = {
+            "turn_index": int(turn_index),
+            "discord_msg_id": str(discord_msg_id),
+        }
+        if channel_id is not None:
+            entry["channel_id"] = str(channel_id)
+        msgs.append(entry)
+
+    def append_bot_msgs(self, turn_index: int, discord_msg_ids: list[str],
+                        channel_id: str | None) -> None:
+        """Record the Discord messages the bot posted rendering one turn.
+
+        Called after the SSE stream drains; dedupes on (turn_index, msg_id).
+        """
+        mi = self.data.setdefault(
+            "message_index", {"user_msgs": [], "bot_msgs": []}
+        )
+        bots = mi.setdefault("bot_msgs", [])
+        existing = {(m.get("turn_index"), m.get("discord_msg_id")) for m in bots}
+        for mid in discord_msg_ids:
+            key = (int(turn_index), str(mid))
+            if key in existing:
+                continue
+            entry: dict[str, Any] = {
+                "turn_index": int(turn_index),
+                "discord_msg_id": str(mid),
+            }
+            if channel_id is not None:
+                entry["channel_id"] = str(channel_id)
+            bots.append(entry)
+            existing.add(key)
 
     def add_sub_session(self, child_sid: str) -> None:
         sub = self.data["sub_sessions"]

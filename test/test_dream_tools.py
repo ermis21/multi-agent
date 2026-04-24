@@ -425,11 +425,14 @@ def test_dream_finalize_keep_all_writes_new_prompt(dream_env):
     assert "Original line one." not in body
     # Pending batch deleted.
     assert dream_state.has_pending_batch("c-keep") is False
-    # History stamped for each committed phrase.
+    # History stamped for each committed phrase, attributed to the
+    # CONVERSATION that was dreamed about (not the dreamer's own sid) —
+    # otherwise _collect_outcome's `session_id == conv_sid` filter returns
+    # empty and every finalized run looks like a no_submission.
     for pid in pids:
         hist = phrase_store.get_history(pid)
         assert len(hist) >= 1
-        assert hist[-1]["session_id"] == "sess-keep"
+        assert hist[-1]["session_id"] == "c-keep"
 
 
 def test_dream_finalize_abandon_all_reverts_file(dream_env):
@@ -461,11 +464,135 @@ def test_dream_finalize_abandon_all_reverts_file(dream_env):
         assert "r" not in rationales  # dream_submit's rationale wasn't committed
 
 
-def test_dream_finalize_no_batch_errors(dream_env):
+def test_dream_finalize_no_batch_requires_rationale(dream_env):
+    """Empty-batch finalize without a rationale is rejected.
+
+    We used to treat `keep=[] + drop=[]` as a silent noop, but that let the
+    dreamer skip too easily — the user got no visibility into WHY. Now
+    skipping requires an explicit rationale (≥20 chars) which the runner
+    surfaces via the `dream_skip` SSE event.
+    """
     out = _run(dream_tools.dream_finalize(
         keep=[], drop=[], conversation_sid="no-such", session_id="s", cfg=_cfg(),
     ))
+    assert "error" in out
+    assert "rationale" in out["error"]
+
+
+def test_dream_finalize_no_batch_with_rationale_is_noop(dream_env):
+    """Explicit skip with a sufficient rationale is a clean no-op."""
+    rationale = "conversation ran cleanly; no prompt issues to address today"
+    out = _run(dream_tools.dream_finalize(
+        keep=[], drop=[], conversation_sid="no-such", session_id="s",
+        cfg=_cfg(), rationale=rationale,
+    ))
+    assert "error" not in out
+    assert out.get("noop") is True
+    assert out.get("skip_rationale") == rationale
+
+
+def test_dream_finalize_rationale_too_short_rejected(dream_env):
+    """Short rationale is rejected — we want real justification, not 'ok'."""
+    out = _run(dream_tools.dream_finalize(
+        keep=[], drop=[], conversation_sid="no-such", session_id="s",
+        cfg=_cfg(), rationale="ok",
+    ))
+    assert "error" in out
+    assert "rationale" in out["error"]
+
+
+def test_dream_finalize_no_batch_with_pids_still_errors(dream_env):
+    """Non-empty keep/drop with no pending batch is a real programming error."""
+    out = _run(dream_tools.dream_finalize(
+        keep=["ph-x"], drop=[], conversation_sid="no-such",
+        session_id="s", cfg=_cfg(),
+    ))
     assert "error" in out and "no pending batch" in out["error"]
+
+
+# ── multi-target dream_submit + dream_finalize ───────────────────────────────
+
+def test_dream_submit_multi_target_creates_unified_batch(dream_env):
+    """Two targets in one dream_submit land in a single pending batch with
+    edits stamped `target_prompt` on each — the foundation for one-sim /
+    one-finalize semantics across interacting prompts."""
+    _write_prompt(dream_env, "worker_full", "# Root\n\n## Rules\n\nWorker original.\n")
+    _write_prompt(dream_env, "supervisor_full", "# Root\n\n## Rules\n\nSupervisor original.\n")
+    out = _run(dream_tools.dream_submit(
+        targets=[
+            {"path": "worker_full",
+             "new_full_text": "# Root\n\n## Rules\n\nWorker revised.\n"},
+            {"path": "supervisor_full",
+             "new_full_text": "# Root\n\n## Rules\n\nSupervisor revised.\n"},
+        ],
+        rationale="coordinated worker+supervisor tuning",
+        conversation_sid="conv-mt", session_id="sid-mt", cfg=_cfg(),
+    ))
+    assert "error" not in out
+    assert out["target_prompts"] == ["worker_full", "supervisor_full"]
+    # Each target contributes at least one edit, flattened into one list.
+    targets = {e["target_prompt"] for e in out["edits"]}
+    assert targets == {"worker_full", "supervisor_full"}
+
+
+def test_dream_finalize_multi_target_rewrites_both_files(dream_env):
+    """Accepting all edits in a 2-target batch updates BOTH prompt files."""
+    p_worker = _write_prompt(dream_env, "worker_full",
+                             "# Root\n\n## Rules\n\nWorker OLD.\n")
+    p_super = _write_prompt(dream_env, "supervisor_full",
+                            "# Root\n\n## Rules\n\nSupervisor OLD.\n")
+    out = _run(dream_tools.dream_submit(
+        targets=[
+            {"path": "worker_full",
+             "new_full_text": "# Root\n\n## Rules\n\nWorker NEW.\n"},
+            {"path": "supervisor_full",
+             "new_full_text": "# Root\n\n## Rules\n\nSupervisor NEW.\n"},
+        ],
+        rationale="r",
+        conversation_sid="conv-fin", session_id="sid-fin", cfg=_cfg(),
+    ))
+    pids = [e["phrase_id"] for e in out["edits"]]
+    final = _run(dream_tools.dream_finalize(
+        keep=pids, drop=[], conversation_sid="conv-fin",
+        session_id="sid-fin", cfg=_cfg(),
+    ))
+    assert "error" not in final
+    assert "Worker NEW." in p_worker.read_text()
+    assert "Supervisor NEW." in p_super.read_text()
+    # Both files committed; dropped list empty.
+    committed_targets = {c["target_prompt"] for c in final["committed"]}
+    assert committed_targets == {"worker_full", "supervisor_full"}
+
+
+def test_dream_finalize_multi_target_partial_drop_scopes_to_file(dream_env):
+    """Dropping all edits for ONE target leaves that file unchanged while
+    committing the other target's edits — so a user who accepts worker
+    tweaks but rejects supervisor tweaks gets exactly that."""
+    p_worker = _write_prompt(dream_env, "worker_full",
+                             "# Root\n\n## Rules\n\nWorker OLD.\n")
+    p_super = _write_prompt(dream_env, "supervisor_full",
+                            "# Root\n\n## Rules\n\nSupervisor OLD.\n")
+    out = _run(dream_tools.dream_submit(
+        targets=[
+            {"path": "worker_full",
+             "new_full_text": "# Root\n\n## Rules\n\nWorker NEW.\n"},
+            {"path": "supervisor_full",
+             "new_full_text": "# Root\n\n## Rules\n\nSupervisor NEW.\n"},
+        ],
+        rationale="r",
+        conversation_sid="conv-split", session_id="sid-split", cfg=_cfg(),
+    ))
+    worker_pids = [e["phrase_id"] for e in out["edits"] if e["target_prompt"] == "worker_full"]
+    super_pids = [e["phrase_id"] for e in out["edits"] if e["target_prompt"] == "supervisor_full"]
+    final = _run(dream_tools.dream_finalize(
+        keep=worker_pids, drop=super_pids, conversation_sid="conv-split",
+        session_id="sid-split", cfg=_cfg(),
+    ))
+    assert "error" not in final
+    # Worker file rewritten; supervisor file untouched.
+    assert "Worker NEW." in p_worker.read_text()
+    assert "Supervisor OLD." in p_super.read_text()
+    assert "Supervisor NEW." not in p_super.read_text()
 
 
 # ── recal_historical_prompt ─────────────────────────────────────────────────

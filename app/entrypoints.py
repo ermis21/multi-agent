@@ -80,6 +80,7 @@ async def run_agent_role(
     session_id: str,
     *,
     prompts_dir: Path | None = None,
+    trace_queue: "asyncio.Queue | None" = None,
 ) -> dict:
     """
     Run any agent role from agents.yaml directly.
@@ -127,6 +128,12 @@ async def run_agent_role(
         if body.get("_source_trigger") is not None \
            and _rst.get("source_trigger") == {"type": "user", "ref": None}:
             _rst.set("source_trigger", body.get("_source_trigger"))
+        # Dream runs spawn a sub-session whose id is NOT the conversation being
+        # dreamed about; stamp the conversation sid so dream_submit/finalize can
+        # target the right pending batch. Without this, mcp_client defaults to
+        # the dreamer's own sid and every call fails with "no pending batch".
+        if body.get("_dream_conversation_sid"):
+            _rst.set("_dream_conversation_sid", body["_dream_conversation_sid"])
         _rst.save()
     except Exception:
         pass
@@ -155,6 +162,7 @@ async def run_agent_role(
         from app.dream import runner_hook as _dream_hook
         after_iteration_hook = _dream_hook.make_dream_hook(session_id, cfg)
 
+    worker_error: str | None = None
     try:
         try:
             response, _, tool_traces = await _run_worker(
@@ -163,14 +171,29 @@ async def run_agent_role(
                 session_id=session_id,
                 extra_auto_allow_paths=privileged_paths or None,
                 after_iteration_hook=after_iteration_hook,
+                trace_queue=trace_queue,
             )
         except Exception as e:
             response = f"[{role} error: {e or type(e).__name__}]"
+            worker_error = str(e) or type(e).__name__
+            # Surface the error on the trace stream so callers watching the
+            # SSE pipe (dream runner, /v1/chat/completions consumers) see the
+            # actual failure instead of a silent "no work done" outcome.
+            if trace_queue is not None:
+                try:
+                    trace_queue.put_nowait({
+                        "event": "error",
+                        "data": {"role": role, "error": worker_error},
+                    })
+                except Exception:
+                    pass
         logger.log_turn(0, "final", raw_input, response)
         await _auto_store_memory(raw_input, response, session_id, mode, allowed_tools)
         result = _format_response(response, session_id)
         if verbose_tools and tool_traces:
             result["tool_trace"] = tool_traces
+        if worker_error:
+            result["error"] = worker_error
         return result
     finally:
         cleanup_generated(session_id)

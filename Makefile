@@ -1,4 +1,4 @@
-.PHONY: up down build restart logs soul-update test-up test-down config-agent test eval test-full doctor e2e e2e-one test-dream test-dream-live e2e-dream
+.PHONY: up down build restart logs soul-update dream-run test-up test-down config-agent test eval test-full doctor e2e e2e-one test-dream test-dream-live e2e-dream
 
 # ── Production stack ─────────────────────────────────────────────────────────
 
@@ -31,6 +31,19 @@ status:
 soul-update:
 	@echo "Triggering manual soul update..."
 	@curl -sf -X POST http://localhost:8090/internal/soul-update | python3 -m json.tool
+
+# Manual dream run with live SSE stream + per-edit review.
+#   DATE=YYYY-MM-DD  use a UTC calendar day instead of the default rolling 24h window
+#   HOURS=N          rolling-window size in hours (default 24; ignored when DATE is set)
+#   META=0           skip meta-dreamer
+#   REVIEW=0         auto-commit (skip the per-edit review gate)
+dream-run:
+	@python3 scripts/dream_cli.py \
+	  --url http://localhost:8090 \
+	  $(if $(DATE),--date $(DATE),) \
+	  $(if $(HOURS),--window-hours $(HOURS),) \
+	  --meta $(if $(META),$(META),1) \
+	  --review $(if $(REVIEW),$(REVIEW),1)
 
 config-agent:
 	@echo "Starting config agent... (press Enter on blank line to exit)"

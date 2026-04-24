@@ -13,14 +13,23 @@
 # `config.yaml:models.<name>` to override endpoint/url details. If you only add
 # it here, the dream runner auto-constructs an LLM override from `provider` and
 # `model_id` — no second edit needed for Anthropic-hosted models.
+#
+# Ranks below are anchored to the Artificial Analysis Intelligence Index
+# (snapshot 2026-04-22, https://artificialanalysis.ai/leaderboards/models).
+# `intelligence_index` carries the raw score so future edits stay auditable.
+# Local models' `context_window` is refreshed nightly by the
+# `local_models_refresh` cron from each endpoint's /v1/models — prefer that
+# over hand-editing.
 
 models:
   - name: claude-opus-4-7
     provider: anthropic
     model_id: claude-opus-4-7
     tier: frontier
-    context_window: 200000
+    context_window: 1000000
     rank: 1
+    intelligence_index: 57
+    notes: "AA Index 57 (Adaptive Reasoning, Max Effort). Co-leads the April 2026 frontier tier alongside Gemini 3.1 Pro and GPT-5.4."
     capabilities:
       - destructive_edit_safe
       - long_context_reasoning
@@ -31,37 +40,56 @@ models:
     provider: anthropic
     model_id: claude-sonnet-4-6
     tier: large
-    context_window: 200000
+    context_window: 1000000
     rank: 2
+    intelligence_index: 52
+    notes: "AA Index 52. Effective dream floor — cheaper than Opus, still clears every required capability."
     capabilities:
       - destructive_edit_safe
       - long_context_reasoning
       - prompt_self_critique
       - simulation_judge
 
+  - name: vpn_local
+    provider: local
+    model_id: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
+    tier: medium
+    context_window: 262144
+    rank: 3
+    intelligence_index: 43
+    notes: "AA Index 43 (Reasoning mode). 35B MoE with 3B active params. Released 2026-04-16; served by the VPN-routed endpoint at http://10.64.82.60:8000."
+    capabilities:
+      - long_context_reasoning
+      - prompt_self_critique
+
   - name: claude-haiku-4-5
     provider: anthropic
     model_id: claude-haiku-4-5-20251001
     tier: medium
     context_window: 200000
-    rank: 5
+    rank: 4
+    intelligence_index: 31
+    notes: "AA Index 31 (non-reasoning). Cheap fast tier; below the dream floor — used only when explicitly pinned."
     capabilities:
       - long_context_reasoning
 
   - name: gpt-4o
     provider: openai
     model_id: gpt-4o
-    tier: medium
+    tier: small
     context_window: 128000
-    rank: 7
+    rank: 5
+    intelligence_index: 22
+    notes: "Legacy 2024 release; OpenAI has since shipped the GPT-5 line. Retained for fallback interop."
     capabilities:
       - long_context_reasoning
 
-  - name: vpn_local
+  - name: local_llama
     provider: local
-    model_id: Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
-    tier: medium
+    model_id: gemma-4-E4B-it-Q8_0.gguf
+    tier: small
     context_window: 131072
-    rank: 10
-    capabilities:
-      - long_context_reasoning
+    rank: 6
+    intelligence_index: 15
+    notes: "Gemma 4 E4B (4.5B effective params, 128K ctx). Served by the in-cluster llama-api-manager:8081; the fleet's default when no override is pinned."
+    capabilities: []

@@ -62,7 +62,7 @@ def test_dream_submit_missing_path_returns_validation_error(dispatch_env):
         "dream_submit", {"new_full_text": "x"},
         allowed=["dream_submit"], mode="build",
     ))
-    assert "error" in result and "'path'" in result["error"]
+    assert "error" in result and "targets" in result["error"]
 
 
 def test_dream_submit_non_string_text_returns_validation_error(dispatch_env):
@@ -74,10 +74,17 @@ def test_dream_submit_non_string_text_returns_validation_error(dispatch_env):
 
 
 def test_dream_submit_routes_to_dream_tools(dispatch_env, monkeypatch):
+    """Legacy path+new_full_text call shape still reaches dream_tools
+    wrapped into the new `targets=[...]` list form by the mcp_client shim."""
     seen: dict = {}
 
-    async def fake_submit(*, path, new_full_text, rationale, conversation_sid, session_id, cfg):
-        seen.update(locals())
+    async def fake_submit(targets=None, rationale="", *, conversation_sid,
+                          session_id, cfg, **_kwargs):
+        seen["targets"] = targets
+        seen["rationale"] = rationale
+        seen["conversation_sid"] = conversation_sid
+        seen["session_id"] = session_id
+        seen["cfg"] = cfg
         return {"pending_batch_id": "pb-stub", "ok": True}
 
     monkeypatch.setattr(dream_tools, "dream_submit", fake_submit)
@@ -87,12 +94,37 @@ def test_dream_submit_routes_to_dream_tools(dispatch_env, monkeypatch):
         allowed=["dream_submit"], mode="build", session_id="conv-123",
     ))
     assert result == {"pending_batch_id": "pb-stub", "ok": True}
-    assert seen["path"] == "worker_full"
-    assert seen["new_full_text"] == "# hi\n\nbody\n"
+    assert seen["targets"] == [{"path": "worker_full", "new_full_text": "# hi\n\nbody\n"}]
     assert seen["rationale"] == "r"
     assert seen["conversation_sid"] == "conv-123"
     assert seen["session_id"] == "conv-123"
     assert isinstance(seen["cfg"], dict)
+
+
+def test_dream_submit_multi_target_passthrough(dispatch_env, monkeypatch):
+    """Native multi-target call: body carries `targets=[...]` directly."""
+    seen: dict = {}
+
+    async def fake_submit(targets=None, rationale="", *, conversation_sid,
+                          session_id, cfg, **_kwargs):
+        seen["targets"] = targets
+        return {"pending_batch_id": "pb-stub", "ok": True}
+
+    monkeypatch.setattr(dream_tools, "dream_submit", fake_submit)
+    _run(mcp_client.call_tool(
+        "dream_submit",
+        {
+            "targets": [
+                {"path": "worker_full", "new_full_text": "a"},
+                {"path": "supervisor_full", "new_full_text": "b"},
+            ],
+            "rationale": "r",
+        },
+        allowed=["dream_submit"], mode="build", session_id="conv-999",
+    ))
+    assert len(seen["targets"]) == 2
+    assert seen["targets"][0]["path"] == "worker_full"
+    assert seen["targets"][1]["path"] == "supervisor_full"
 
 
 def test_dream_submit_exception_converted_to_error(dispatch_env, monkeypatch):
@@ -149,7 +181,7 @@ def test_dream_finalize_non_list_params_return_validation_error(dispatch_env):
 def test_dream_finalize_routes_and_coerces_to_str(dispatch_env, monkeypatch):
     seen: dict = {}
 
-    async def fake_finalize(*, keep, drop, conversation_sid, session_id, cfg):
+    async def fake_finalize(*, keep, drop, conversation_sid, session_id, cfg, rationale=None):
         seen.update(locals())
         return {"committed": [], "dropped": []}
 
@@ -168,7 +200,7 @@ def test_dream_finalize_routes_and_coerces_to_str(dispatch_env, monkeypatch):
 def test_dream_finalize_missing_params_defaults_to_empty_lists(dispatch_env, monkeypatch):
     seen: dict = {}
 
-    async def fake_finalize(*, keep, drop, conversation_sid, session_id, cfg):
+    async def fake_finalize(*, keep, drop, conversation_sid, session_id, cfg, rationale=None):
         seen.update(locals())
         return {"committed": [], "dropped": []}
 

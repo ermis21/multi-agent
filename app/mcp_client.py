@@ -388,19 +388,37 @@ async def call_tool(
         except Exception as e:
             return {"error": f"phrase_history_recall failed: {e}"}
 
+    # Dream runs target a conversation different from the dreamer's own session.
+    # Entrypoint stamps `_dream_conversation_sid` on the dreamer's state; read
+    # it here so dream_submit/finalize operate on the right pending batch.
+    def _conv_sid_from_state() -> str:
+        try:
+            st = SessionState.load_or_create(session_id)
+            conv = st.get("_dream_conversation_sid")
+            if conv:
+                return str(conv)
+        except Exception:
+            pass
+        return session_id
+
     if method == "dream_submit":
         from app.dream import dream_tools
-        path = str(params.get("path") or "").strip()
-        new_full_text = params.get("new_full_text")
+        targets = params.get("targets")
         rationale = str(params.get("rationale") or "").strip()
-        if not path or not isinstance(new_full_text, str):
-            return {"error": "dream_submit requires 'path' and 'new_full_text' (str)"}
+        # Legacy single-target params (path + new_full_text) still accepted —
+        # the dreamer role may call either shape depending on how its prompt
+        # has been updated. If `targets` is set, use it; else wrap legacy.
+        if targets is None:
+            path = str(params.get("path") or "").strip()
+            new_full_text = params.get("new_full_text")
+            if not path or not isinstance(new_full_text, str):
+                return {"error": "dream_submit requires `targets=[{path, new_full_text}, ...]` (or legacy `path` + `new_full_text`)"}
+            targets = [{"path": path, "new_full_text": new_full_text}]
         try:
             return await dream_tools.dream_submit(
-                path=path,
-                new_full_text=new_full_text,
+                targets=targets,
                 rationale=rationale,
-                conversation_sid=session_id,
+                conversation_sid=_conv_sid_from_state(),
                 session_id=session_id,
                 cfg=cfg,
             )
@@ -419,7 +437,7 @@ async def call_tool(
                 phrase_id=pid,
                 new_text=new_text,
                 rationale=rationale,
-                conversation_sid=session_id,
+                conversation_sid=_conv_sid_from_state(),
                 session_id=session_id,
                 cfg=cfg,
             )
@@ -430,15 +448,17 @@ async def call_tool(
         from app.dream import dream_tools
         keep = params.get("keep") or []
         drop = params.get("drop") or []
+        rationale = params.get("rationale")
         if not isinstance(keep, list) or not isinstance(drop, list):
             return {"error": "dream_finalize requires 'keep' and 'drop' as lists of phrase_ids"}
         try:
             return await dream_tools.dream_finalize(
                 keep=[str(p) for p in keep],
                 drop=[str(p) for p in drop],
-                conversation_sid=session_id,
+                conversation_sid=_conv_sid_from_state(),
                 session_id=session_id,
                 cfg=cfg,
+                rationale=(str(rationale) if rationale is not None else None),
             )
         except Exception as e:
             return {"error": f"dream_finalize failed: {e}"}

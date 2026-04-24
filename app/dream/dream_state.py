@@ -109,6 +109,28 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _migrate_pending_data(data: dict) -> dict:
+    """Promote legacy single-target fields into the multi-target schema.
+
+    Legacy batches had `target_prompt: str` + `new_prompt_text: str`. The
+    multi-target schema uses `target_prompts: list[str]` + a
+    `new_prompt_texts: {name: full_text}` map, and stamps `target_prompt` on
+    each edit. Any batch written by an older dreamer is promoted on read so
+    downstream code sees the uniform shape.
+    """
+    if "target_prompts" not in data and "target_prompt" in data:
+        legacy_name = data.get("target_prompt") or ""
+        data["target_prompts"] = [legacy_name] if legacy_name else []
+        if "new_prompt_texts" not in data:
+            data["new_prompt_texts"] = (
+                {legacy_name: data["new_prompt_text"]}
+                if legacy_name and "new_prompt_text" in data else {}
+            )
+        for e in data.get("edits") or []:
+            e.setdefault("target_prompt", legacy_name)
+    return data
+
+
 # ── Batch shape helpers ──────────────────────────────────────────────────────
 
 def _new_batch_id() -> str:
@@ -133,8 +155,26 @@ class PendingBatch:
         return self.data["conversation_sid"]
 
     @property
+    def target_prompts(self) -> list[str]:
+        """List of template names this batch edits (may be length 1 or more).
+
+        On-disk legacy batches that only had singular `target_prompt` are
+        promoted to a 1-element list at load-time by `_migrate_pending_data`.
+        """
+        return list(self.data.get("target_prompts") or [])
+
+    @property
+    def new_prompt_texts(self) -> dict[str, str]:
+        """Map from template name → new full rewritten text, per target."""
+        return dict(self.data.get("new_prompt_texts") or {})
+
+    @property
     def target_prompt(self) -> str:
-        return self.data["target_prompt"]
+        """Back-compat: first target. Retained so callers that handle a
+        single-target batch (today's common case) don't need immediate
+        rewrites. New callers should use `target_prompts`."""
+        targets = self.target_prompts
+        return targets[0] if targets else ""
 
     @property
     def phase(self) -> str:
@@ -187,7 +227,7 @@ def load_pending(conv_sid: str) -> PendingBatch:
     p = _find_pending_path(conv_sid)
     if p is None:
         raise NoPendingBatch(f"no pending batch for conversation {conv_sid!r}")
-    return PendingBatch(_read_json(p))
+    return PendingBatch(_migrate_pending_data(_read_json(p)))
 
 
 def save_pending(batch: PendingBatch, run_date: str | None = None) -> None:
@@ -210,8 +250,10 @@ def delete_pending(conv_sid: str) -> bool:
 def create_or_replace_pending(
     *,
     conversation_sid: str,
-    target_prompt: str,
-    new_prompt_text: str,
+    target_prompts: list[str] | None = None,
+    new_prompt_texts: dict[str, str] | None = None,
+    target_prompt: str | None = None,     # legacy single-target shim
+    new_prompt_text: str | None = None,   # legacy single-target shim
     rationale: str,
     edits: list[dict],
     run_date: str | None = None,
@@ -219,12 +261,36 @@ def create_or_replace_pending(
     """Write a fresh pending batch, replacing any prior one wholesale.
 
     Fresh `dream_submit` semantics: start over; simulation counter resets.
+    Each edit in `edits` must carry a `target_prompt` field naming which
+    file it belongs to — the finalize loop groups by that.
+
+    Accepts both the new plural signature (`target_prompts` +
+    `new_prompt_texts`) and the legacy singular form (`target_prompt` +
+    `new_prompt_text`), so older tests and any remaining single-target
+    callers don't have to migrate at once.
     """
+    if target_prompts is None:
+        if target_prompt is None or new_prompt_text is None:
+            raise TypeError(
+                "create_or_replace_pending requires either `target_prompts`+"
+                "`new_prompt_texts` OR legacy `target_prompt`+`new_prompt_text`"
+            )
+        target_prompts = [target_prompt]
+        new_prompt_texts = {target_prompt: new_prompt_text}
+    elif new_prompt_texts is None:
+        new_prompt_texts = {}
+    # Mirror singular fields for legacy readers that might still exist in
+    # third-party code paths (tests, scripts). Not load-bearing — everything
+    # in-tree reads the plural versions.
+    legacy_target = target_prompts[0] if target_prompts else ""
+    legacy_text = new_prompt_texts.get(legacy_target, "") if legacy_target else ""
     data = {
         "pending_batch_id": _new_batch_id(),
         "conversation_sid": conversation_sid,
-        "target_prompt": target_prompt,
-        "new_prompt_text": new_prompt_text,
+        "target_prompts": list(target_prompts),
+        "new_prompt_texts": dict(new_prompt_texts),
+        "target_prompt": legacy_target,
+        "new_prompt_text": legacy_text,
         "rationale": rationale,
         "submitted_at": _now_iso(),
         "phase": PHASE_SUBMIT,

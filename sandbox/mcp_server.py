@@ -1410,10 +1410,12 @@ def _diagnostic_check(_params: dict) -> dict:
         checks["phrase_index_consistent"] = fail(f"phrase_index probe failed: {e}")
 
     # dream_cron_scheduled: when dream enabled, /internal/dream-run must be routed.
+    # Probe with verbose=false so we exercise the blocking-JSON path — the SSE
+    # branch would leave an async background task in flight on the bogus date.
     try:
         _r = httpx.post(
             "http://localhost:8090/internal/dream-run",
-            json={"date": "__diag_probe__"},
+            json={"date": "__diag_probe__", "verbose": False},
             timeout=5.0,
         )
         _reachable = _r.status_code in (200, 400, 404, 422, 500)

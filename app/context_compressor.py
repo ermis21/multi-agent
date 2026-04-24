@@ -150,15 +150,21 @@ def filter_skills(user_msg: str, skills: list[dict], cfg: dict) -> list[dict]:
     Keep as many skills as fit in `context.budgets.skills`. PR 1 keeps them in
     the order they were discovered; PR 3 replaces this with semantic ranking
     against `user_msg`.
+
+    Budget accounting uses the exact bullet rendered by
+    `prompt_generator._format_skill_line` so we never spend tokens we didn't
+    measure.
     """
     if not skills:
         return []
+    # Local import avoids a circular module dep at load time.
+    from app.prompt_generator import _format_skill_line
+
     budget = int(cfg.get("context", {}).get("budgets", {}).get("skills", 800))
     out: list[dict] = []
     running = 0
     for s in skills:
-        row = f"| `{s.get('name','')}` | {s.get('when','')} | `{s.get('path','')}` |"
-        tokens = count(row)
+        tokens = count(_format_skill_line(s))
         if running + tokens > budget and out:
             break
         out.append(s)

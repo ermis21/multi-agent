@@ -330,3 +330,166 @@ class InjectionView(discord.ui.View):
                 )
             except Exception:
                 pass
+
+
+class DreamEditReviewView(discord.ui.View):
+    """Per-edit review for a dream_finalize_review event.
+
+    Accept all  → POST {all: "keep"} and commit the whole batch.
+    Reject all  → POST {all: "drop"} and discard the whole batch.
+    Select…     → show a multi-select menu of phrase_ids to KEEP; everything
+                  unchecked is dropped. For batches > 25 edits (Discord Select
+                  cap) we fall back to chunked menus one at a time.
+
+    The trigger flow (`/dream-run` slash in bot_worker) posts this view with
+    `dreamer_sid` and the full edit list; the view POSTs to
+    /v1/dream/review_response to unblock the dreamer's dream_finalize call.
+    """
+
+    _SELECT_CAP = 25  # Discord hard limit on Select options
+
+    def __init__(self, dreamer_sid: str, edits: list[dict]):
+        super().__init__(timeout=660)
+        self.dreamer_sid = dreamer_sid
+        self.edits = edits
+        self.message: discord.Message | None = None
+        self._resolved = False
+
+    async def _post_decisions(self, decisions: dict[str, str]) -> dict:
+        import bot_worker as bw
+        try:
+            resp = await bw._http.post(
+                f"{bw.PHOEBE_API_URL}/v1/dream/review_response",
+                json={"dreamer_sid": self.dreamer_sid, "decisions": decisions},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            print(f"[dream-review] POST failed: {e}", flush=True)
+            return {"ok": False, "error": str(e)}
+
+    async def _finish(self, interaction: discord.Interaction, decisions: dict[str, str]) -> None:
+        self._resolved = True
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        kept = sum(1 for v in decisions.values() if v == "keep")
+        dropped = sum(1 for v in decisions.values() if v == "drop")
+        summary = f"Submitted review: **keep={kept}**, **drop={dropped}**"
+        try:
+            await interaction.response.edit_message(content=summary, view=self)
+        except Exception:
+            if self.message:
+                try:
+                    await self.message.edit(content=summary, view=self)
+                except Exception:
+                    pass
+        await self._post_decisions(decisions)
+        self.stop()
+
+    @discord.ui.button(label="Accept all", style=discord.ButtonStyle.green, emoji="✅")
+    async def accept_all(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        decisions = {e["phrase_id"]: "keep" for e in self.edits}
+        await self._finish(interaction, decisions)
+
+    @discord.ui.button(label="Reject all", style=discord.ButtonStyle.red, emoji="❌")
+    async def reject_all(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        decisions = {e["phrase_id"]: "drop" for e in self.edits}
+        await self._finish(interaction, decisions)
+
+    @discord.ui.button(label="Select…", style=discord.ButtonStyle.blurple, emoji="\U0001f5f3️")
+    async def select_subset(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if len(self.edits) <= self._SELECT_CAP:
+            select_view = _DreamSelectView(self.dreamer_sid, self.edits, parent=self)
+            await interaction.followup.send(
+                f"Tick the edits you want to **keep** (unticked = drop):",
+                view=select_view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"⚠ {len(self.edits)} edits exceeds Discord's 25-option select cap. "
+                f"Use the CLI (`make dream-run`) for large batches, or Accept/Reject all here.",
+                ephemeral=True,
+            )
+
+    async def on_timeout(self) -> None:
+        if self._resolved or self.message is None:
+            return
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        try:
+            await self.message.edit(
+                content="⏱️ Review timed out — all edits dropped.",
+                view=self,
+            )
+        except Exception:
+            pass
+        # Server-side review_bus also times out at 660s with the same fallback,
+        # so we don't strictly need to POST here — but doing so is idempotent
+        # and gives an immediate drop-all if the server timer hasn't fired yet.
+        await self._post_decisions({e["phrase_id"]: "drop" for e in self.edits})
+
+
+class _DreamSelectView(discord.ui.View):
+    """Inner multi-select used by DreamEditReviewView's "Select…" button."""
+
+    def __init__(self, dreamer_sid: str, edits: list[dict], *, parent: "DreamEditReviewView"):
+        super().__init__(timeout=300)
+        self.dreamer_sid = dreamer_sid
+        self.edits = edits
+        self.parent_view = parent
+
+        opts: list[discord.SelectOption] = []
+        for i, e in enumerate(edits, start=1):
+            # Prefix the target prompt so Discord's flat dropdown reads as
+            # grouped even though SelectOption has no native group header.
+            target = (e.get("target_prompt") or "").strip()
+            target_prefix = f"[{target}] " if target else ""
+            label = f"{i}. {target_prefix}{e.get('kind', '?')} · {(e.get('phrase_id') or '')[:70]}"
+            desc_src = (e.get("section_path") or e.get("narrative") or "").replace("\n", " ")
+            opts.append(discord.SelectOption(
+                label=label[:100],
+                value=e["phrase_id"],
+                description=desc_src[:100] or None,
+            ))
+        self.select = discord.ui.Select(
+            placeholder="Select edits to KEEP (leave blank to drop all)",
+            min_values=0,
+            max_values=len(opts),
+            options=opts,
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        kept = set(self.select.values)
+        decisions = {
+            e["phrase_id"]: ("keep" if e["phrase_id"] in kept else "drop")
+            for e in self.edits
+        }
+        # Mirror disabling on this ephemeral view.
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        try:
+            await interaction.response.edit_message(
+                content=f"Submitted: keep={len(kept)}, drop={len(self.edits) - len(kept)}",
+                view=self,
+            )
+        except Exception:
+            pass
+        await self.parent_view._post_decisions(decisions)
+        self.parent_view._resolved = True
+        # Mirror the parent view's disabled state.
+        for item in self.parent_view.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.parent_view.message:
+            try:
+                await self.parent_view.message.edit(
+                    content=f"Review submitted: keep={len(kept)}, drop={len(self.edits) - len(kept)}",
+                    view=self.parent_view,
+                )
+            except Exception:
+                pass
+        self.parent_view.stop()
+        self.stop()

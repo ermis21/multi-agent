@@ -273,9 +273,11 @@ async def _run_worker(
                     continue
                 # Dream auto-sim splice: if the hook returns a synthetic tool-result
                 # (e.g. sim result), keep looping instead of returning so the
-                # dreamer can react.
+                # dreamer can react. `just_revised=False` — reaching this branch
+                # means the current iteration emitted prose + end, not a revise
+                # tool. (The tool-result branch below passes its own flag.)
                 if after_iteration_hook is not None:
-                    hook_msg = await after_iteration_hook(full_messages)
+                    hook_msg = await after_iteration_hook(full_messages, False)
                     if hook_msg:
                         full_messages.append({"role": "assistant", "content": content})
                         full_messages.append({"role": "user", "content": hook_msg})
@@ -307,6 +309,17 @@ async def _run_worker(
             full_messages.append({"role": "assistant", "content": content})
             if trace_queue is not None and content.strip():
                 trace_queue.put_nowait({"event": "worker_status", "data": {"text": content.strip()}})
+            # Dream auto-sim splice: the dreamer sometimes stops calling
+            # revise tools and just narrates ("now waiting for simulation"),
+            # which used to trap it in a scaffold loop until max_iter. Fire
+            # the hook here too — if a submit-phase batch is staged and the
+            # dreamer is no longer revising, run the sim and splice the
+            # result in so the dreamer can react and call dream_finalize.
+            if after_iteration_hook is not None:
+                hook_msg = await after_iteration_hook(full_messages, False)
+                if hook_msg:
+                    full_messages.append({"role": "user", "content": hook_msg})
+                    continue
             full_messages.append({
                 "role": "user",
                 "content": (
@@ -427,8 +440,13 @@ async def _run_worker(
 
         # Dream auto-sim splice: fires when the tool just called was not
         # dream_submit / edit_revise and a submit-phase batch is staged.
+        # Pass an explicit just_revised flag derived from the tool name we
+        # actually dispatched this iteration — `full_messages` inference
+        # fails on the prose-without-end path where the last tool_result is
+        # stale (from a prior iteration).
         if after_iteration_hook is not None:
-            hook_msg = await after_iteration_hook(full_messages)
+            _just_revised = tc["tool"] in {"dream_submit", "edit_revise"}
+            hook_msg = await after_iteration_hook(full_messages, _just_revised)
             if hook_msg:
                 full_messages.append({"role": "user", "content": hook_msg})
 
