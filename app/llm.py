@@ -222,10 +222,18 @@ async def _llm_call_anthropic(messages: list[dict], llm: dict, temperature: floa
         # produce an unbound `resp`.
         raise last_err or RuntimeError("anthropic retry loop exited unexpectedly")
 
-    # Normalise to OpenAI-compatible shape so the rest of the pipeline is unchanged
-    text = next((b.text for b in resp.content if b.type == "text"), "")
+    # Normalise to OpenAI-compatible shape so the rest of the pipeline is unchanged.
+    # Anthropic separates thinking blocks (b.type == "thinking") from output text
+    # (b.type == "text") — we extract both and surface thinking via the same
+    # `reasoning_content` field that llama.cpp/OpenAI o-series populate, so
+    # `_thought()` finds it uniformly.
+    text     = next((b.text for b in resp.content if b.type == "text"), "")
+    thinking = "\n".join(b.thinking for b in resp.content if b.type == "thinking")
+    message: dict = {"role": "assistant", "content": text}
+    if thinking:
+        message["reasoning_content"] = thinking
     return {
-        "choices": [{"message": {"role": "assistant", "content": text}}],
+        "choices": [{"message": message}],
         "usage": {
             "input_tokens":  resp.usage.input_tokens,
             "output_tokens": resp.usage.output_tokens,
@@ -271,3 +279,57 @@ def _content(llm_response: dict) -> str:
         return llm_response["choices"][0]["message"]["content"]
     except (KeyError, IndexError):
         return str(llm_response)
+
+
+# Inline thought-block regexes for models that don't separate thinking into
+# its own field. Three patterns cover the formats observed in the wild:
+#   <|channel>thought<channel|>...<channel|>   (Gemma 4 chat-template raw)
+#   <|think|>...<|/think|>                     (some llama.cpp builds, Qwen)
+#   <think>...</think>                         (DeepSeek, R1-distilled)
+import re as _re
+_THOUGHT_PATTERNS = (
+    _re.compile(r"<\|channel>\s*thought\s*<channel\|>(.*?)<channel\|>", _re.DOTALL),
+    _re.compile(r"<\|think\|>(.*?)<\|/think\|>", _re.DOTALL),
+    _re.compile(r"<think>(.*?)</think>", _re.DOTALL),
+)
+
+
+def _thought(llm_response: dict) -> str | None:
+    """Extract reasoning/thought content from a chat completion response.
+
+    Resolution order:
+      1. `message.reasoning_content` — set by llama.cpp's Gemma 4 chat template
+         and by OpenAI o-series; injected by `_llm_call_anthropic` for thinking
+         blocks. Plain string field.
+      2. Inline regex fallback on `message.content` — matches `<|channel>`,
+         `<|think|>`, and `<think>` block formats. Returns the first match.
+      3. None — model didn't think, or thinking was disabled.
+
+    Returns the stripped thought string, or None.
+    """
+    try:
+        message = llm_response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError):
+        return None
+
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+
+    content = message.get("content") or ""
+    for pat in _THOUGHT_PATTERNS:
+        m = pat.search(content)
+        if m:
+            return m.group(1).strip() or None
+    return None
+
+
+def _strip_inline_thought(content: str) -> str:
+    """Remove any inline thought blocks from the content string.
+
+    Use after `_thought()` extraction to avoid duplicating the thought in the
+    final answer the user sees. Matches the same patterns as `_thought()`.
+    """
+    for pat in _THOUGHT_PATTERNS:
+        content = pat.sub("", content)
+    return content

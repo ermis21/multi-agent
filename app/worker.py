@@ -13,7 +13,7 @@ import uuid
 
 from app.config_loader import get_config
 from app.context_compressor import compact_tool_result, store_tool_result
-from app.llm import _content, _extract_logprobs, _llm_call
+from app.llm import _content, _extract_logprobs, _llm_call, _strip_inline_thought, _thought
 from app.mcp_client import call_tool, _extract_tool_call
 from app.sessions.state import SessionState, TurnAccumulator, log_tool_error
 
@@ -28,6 +28,16 @@ _SHELL_TOOLS = frozenset({
 # Tokens/substrings that look like an attempted tool call — used to detect
 # parse failures so we can correct the model instead of accepting prose as final.
 _TOOL_CALL_HINTS = ("<|tool_call", "<tool_call", '"tool":', "call:")
+
+# Tools whose result body is attacker-controllable (web pages, third-party
+# Discord/Notion content). When prompt_features.provenance_tags is on, their
+# bodies are wrapped in `<tool_result trust="untrusted">…</tool_result>` so the
+# worker treats them as data, not instructions.
+_UNTRUSTED_TOOLS = frozenset({
+    "web_fetch", "web_search",
+    "discord_read",
+    "notion_search", "notion_get_page",
+})
 
 # Explicit end-of-turn marker. A non-tool-call message is only treated as the
 # final answer when it contains this sentinel; otherwise it's mid-turn scaffolding.
@@ -189,6 +199,20 @@ async def _run_worker(
         resp    = await _llm_call(full_messages, cfg, temperature, role_cfg=role_cfg,
                                    request_logprobs=request_logprobs)
         content = _content(resp)
+        # Extract reasoning/thought before any further processing — most models
+        # split this into a separate field; some embed it inline. Strip inline
+        # blocks from `content` so the user-facing answer never contains raw
+        # thought tokens. SSE-emit when present so callers (Discord, eval) can
+        # observe metacognition. Thought is debugging signal — never logged in
+        # the `final` turn JSONL (replay-uses-final-only invariant, §16).
+        thought = _thought(resp)
+        if thought:
+            content = _strip_inline_thought(content)
+            if trace_queue is not None:
+                trace_queue.put_nowait({
+                    "event": "worker_thought",
+                    "data": {"thought": thought, "iteration": i},
+                })
         if turn_acc is not None:
             turn_acc.llm_call_count += 1
             _usage = resp.get("usage") or {}
@@ -329,6 +353,15 @@ async def _run_worker(
             })
             continue
 
+        # Snapshot config once per iteration — read by both the success branch
+        # (provenance wrap) and the deferred-injection drain (sibling-message
+        # gate). Keeping it here means both paths see the same flags even when
+        # the tool errored.
+        try:
+            _cfg = get_config()
+        except Exception:
+            _cfg = {}
+
         # Emit a synchronous tool_started event BEFORE dispatch so the Discord
         # bot can anchor the "⏳ tool …" message above any subsequent worker
         # text. call_id threads start → complete so the bot edits in place.
@@ -358,6 +391,8 @@ async def _run_worker(
                 "Pick one: retry with corrected parameters, try a different tool, or try a different approach. "
                 "Only give a final plain-text answer if every reasonable approach has been exhausted."
             )
+            if thought:
+                result_text = f"[thought] {thought}\n{result_text}"
             trace = {"call_id": call_id, "tool": tc["tool"], "duration_s": round(duration, 2),
                      "lines": 0, "error": tool_result["error"], "params_preview": params_preview}
             tool_traces.append(trace)
@@ -378,7 +413,6 @@ async def _run_worker(
             # window. Worker can `tool_result_recall` the stashed body on demand.
             handle_id: str | None = None
             try:
-                _cfg = get_config()
                 _ctx = (_cfg.get("context") or {})
                 if _ctx.get("enabled", True):
                     _budget = int((_ctx.get("budgets") or {}).get("tool_result_inline", 1500))
@@ -405,7 +439,27 @@ async def _run_worker(
                         turn_acc.handles_created = getattr(turn_acc, "handles_created", 0) + 1
                     except Exception:
                         pass
-            result_text = f"{header}\n{inline_body}"
+            # Provenance wrap for tools that return attacker-controllable bodies.
+            # Header stays OUTSIDE the tag so the legacy `[tool_result: …]` parser
+            # keeps working and the model sees both styles concurrently.
+            if _UNTRUSTED_TOOLS and tc["tool"] in _UNTRUSTED_TOOLS and (
+                ((_cfg.get("prompt_features") or {}).get("provenance_tags", True))
+            ):
+                body_wrapped = (
+                    f'<tool_result tool="{tc["tool"]}" trust="untrusted">\n'
+                    f"{inline_body}\n"
+                    f"</tool_result>"
+                )
+                result_text = f"{header}\n{body_wrapped}"
+            else:
+                result_text = f"{header}\n{inline_body}"
+            # When the model thought about *this* turn (which produced a tool
+            # call), preserve the thought in the next-turn user echo. Per
+            # Gemma 4 docs: keep thoughts during function calls, drop them on
+            # final answers. The final-answer path doesn't echo, so dropping
+            # there is automatic.
+            if thought:
+                result_text = f"[thought] {thought}\n{result_text}"
 
             trace = {"call_id": call_id, "tool": tc["tool"], "duration_s": round(duration, 2),
                      "lines": result_text.count("\n"), "error": None, "params_preview": params_preview,
@@ -417,8 +471,11 @@ async def _run_worker(
                 turn_acc.record_tool(tc["tool"], tc.get("params", {}), error=False)
                 turn_acc.duration_ms += int(duration * 1000)
 
-        # Staple any not_urgent / clarify injections onto this tool result so
-        # the worker sees them at a natural boundary without restarting its plan.
+        # Drain not_urgent / clarify injections at this tool boundary. With the
+        # injection_sibling_message flag we emit them as a SEPARATE user message
+        # AFTER the tool_result so an injected page can never spoof a `[user_*]`
+        # marker INSIDE its body and have the worker treat it as user input.
+        sibling_injection_text = ""
         if deferred_injections:
             notes = []
             for inj in deferred_injections:
@@ -427,11 +484,18 @@ async def _run_worker(
                 if inj["mode"] == "clarify":
                     suffix = "\n(continue your current research — this is clarification, not a new task)"
                 notes.append(f"{prefix} {inj['text']}{suffix}")
-            result_text = result_text + "\n\n" + "\n\n".join(notes)
+            block = "\n\n".join(notes)
+            if (_cfg.get("prompt_features") or {}).get("injection_sibling_message", True):
+                sibling_injection_text = block
+            else:
+                # Legacy path: staple onto the tool_result body.
+                result_text = result_text + "\n\n" + block
             deferred_injections.clear()
 
         full_messages.append({"role": "assistant", "content": content})
         full_messages.append({"role": "user", "content": result_text})
+        if sibling_injection_text:
+            full_messages.append({"role": "user", "content": sibling_injection_text})
 
         # Inject pending inflection nudge after tool result
         if inflection_nudge:
