@@ -179,3 +179,148 @@ def test_hallucination_guard_matches_various_phrasings():
     ):
         verdict = {"feedback": f"failing because: {phrase}."}
         assert _detect_hallucinated_zero_tool_claim(verdict, tool_count=1) is not None, phrase
+
+
+# ── SupervisorVerdict schema + self-heal retry ───────────────────────────────
+
+from app.schemas import SupervisorVerdict, format_validation_error  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+
+def test_schema_minimal_valid():
+    """Only `pass` and `score` are required; everything else defaults."""
+    v = SupervisorVerdict.model_validate_json('{"pass": true, "score": 0.8}')
+    dumped = v.model_dump(by_alias=True)
+    assert dumped["pass"] is True
+    assert dumped["score"] == 0.8
+    assert dumped["feedback"] == ""
+    assert dumped["tool_issues"] == []
+
+
+def test_schema_rejects_missing_required():
+    """Missing `score` → ValidationError."""
+    with pytest.raises(ValidationError) as exc:
+        SupervisorVerdict.model_validate_json('{"pass": true}')
+    assert "score" in str(exc.value)
+
+
+def test_schema_rejects_out_of_range_score():
+    """Score must be in [0, 1]."""
+    with pytest.raises(ValidationError):
+        SupervisorVerdict.model_validate_json('{"pass": true, "score": 2.0}')
+
+
+def test_schema_alias_pass_round_trip():
+    """`pass` is a Python keyword; alias must work for both input and output."""
+    v = SupervisorVerdict.model_validate_json('{"pass": false, "score": 0.3}')
+    dumped = v.model_dump(by_alias=True)
+    assert "pass" in dumped
+    assert "pass_" not in dumped
+
+
+def test_schema_extra_fields_allowed():
+    """Supervisor sometimes adds notes — extra=allow keeps them."""
+    raw = '{"pass": true, "score": 0.9, "weird_extra_field": "note"}'
+    v = SupervisorVerdict.model_validate_json(raw)
+    assert v.model_dump(by_alias=True).get("weird_extra_field") == "note"
+
+
+def test_format_validation_error_lists_field_paths():
+    """Self-heal retry needs field-specific feedback."""
+    try:
+        SupervisorVerdict.model_validate_json('{"pass": true, "score": 5.0}')
+    except ValidationError as e:
+        msg = format_validation_error(e)
+        assert "score" in msg
+        # Should be on a single bullet line
+        assert msg.startswith("- ")
+
+
+def test_run_supervisor_valid_first_try(monkeypatch):
+    """Valid JSON on first try → no retry, verdict returned as-is."""
+    import asyncio
+    from app import supervisor as sup_mod
+
+    calls = []
+
+    async def fake_llm_call(messages, cfg, role_cfg=None, **kw):
+        calls.append(messages)
+        return {"choices": [{"message": {"content": '{"pass": true, "score": 0.85, "feedback": "good"}'}}]}
+
+    monkeypatch.setattr(sup_mod, "_llm_call", fake_llm_call)
+    result = asyncio.run(sup_mod._run_supervisor(
+        worker_response="answer",
+        original_messages=[],
+        system_prompt="grade",
+        cfg={},
+        include_history=False,
+    ))
+    assert len(calls) == 1, "should not have retried on a valid first response"
+    assert result["pass"] is True
+    assert result["score"] == 0.85
+    assert result["feedback"] == "good"
+
+
+def test_run_supervisor_self_heals_on_first_failure(monkeypatch):
+    """Malformed first → corrective retry → valid second → returned."""
+    import asyncio
+    from app import supervisor as sup_mod
+
+    responses = [
+        '{"pass": true, "score": "not a number"}',  # invalid: score not float
+        '{"pass": true, "score": 0.7, "feedback": "fixed"}',  # valid
+    ]
+
+    async def fake_llm_call(messages, cfg, role_cfg=None, **kw):
+        content = responses.pop(0)
+        # Verify the second call carries a corrective user message citing the score field.
+        if not responses:
+            last_user = next(m for m in reversed(messages) if m["role"] == "user")
+            assert "score" in last_user["content"], "correction must cite the bad field"
+            assert "schema validation" in last_user["content"]
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(sup_mod, "_llm_call", fake_llm_call)
+    result = asyncio.run(sup_mod._run_supervisor(
+        worker_response="x",
+        original_messages=[],
+        system_prompt="grade",
+        cfg={},
+        include_history=False,
+    ))
+    assert result["pass"] is True
+    assert result["score"] == 0.7
+    assert result["feedback"] == "fixed"
+
+
+def test_run_supervisor_falls_back_after_two_failures(monkeypatch):
+    """Two consecutive validation failures → pass=True fallback + log."""
+    import asyncio
+    from app import supervisor as sup_mod
+    from app.sessions import state as state_mod
+
+    async def fake_llm_call(messages, cfg, role_cfg=None, **kw):
+        return {"choices": [{"message": {"content": '{"score": "bad"}'}}]}  # always invalid
+
+    logs: list[tuple] = []
+
+    def fake_log_tool_error(sid, tool, error, params_preview=""):
+        logs.append((sid, tool, error))
+
+    monkeypatch.setattr(sup_mod, "_llm_call", fake_llm_call)
+    monkeypatch.setattr(state_mod, "log_tool_error", fake_log_tool_error)
+
+    result = asyncio.run(sup_mod._run_supervisor(
+        worker_response="x",
+        original_messages=[],
+        system_prompt="grade",
+        cfg={},
+        include_history=False,
+        session_id="test_sid",
+    ))
+    # Anti-retry-storm invariant preserved: pass=True on supervisor breakage
+    assert result["pass"] is True
+    assert result["score"] == 0.5
+    assert "validation failed" in result["feedback"]
+    # Audit logged
+    assert any(l[0] == "test_sid" and l[1] == "supervisor_schema" for l in logs)

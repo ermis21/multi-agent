@@ -9,8 +9,11 @@ loop in app.loop injects those arrays as retry feedback.
 import json
 import re
 
+from pydantic import ValidationError
+
 from app.llm import _content, _llm_call
 from app.mcp_client import strip_json_fences
+from app.schemas import SupervisorVerdict, format_validation_error
 
 
 # Weak supervisor models occasionally claim "no tools were called" even when the
@@ -177,11 +180,18 @@ async def _run_supervisor(
     cfg:                dict,
     include_history:    bool,
     role_cfg:           dict | None = None,
+    session_id:         str | None = None,
 ) -> dict:
     """
     Grade the worker response — process audit with structured issue arrays.
     Returns dict with pass, score, feedback, issue arrays, alternative, suggest_spawn, suggest_debate.
-    Falls back to pass=True on JSON parse errors to avoid infinite error loops.
+
+    Validation flow (per plan §C):
+      1. Validate `_llm_call` output against SupervisorVerdict (forgiving schema).
+      2. On ValidationError → build a corrective user message citing the
+         specific Pydantic errors, re-call the LLM exactly once.
+      3. On second ValidationError → log to tool_errors.jsonl and fall back
+         to pass=True (preserves CLAUDE.md §16 anti-retry-storm invariant).
     """
     context_messages = original_messages if include_history else []
     messages = (
@@ -196,29 +206,83 @@ async def _run_supervisor(
     )
 
     _fallback = {
-        "pass": True, "score": 0.5, "feedback": "supervisor parse error — treating as pass",
+        "pass": True, "score": 0.5,
+        "feedback": "[supervisor schema validation failed twice; passed by default]",
         "alternative": "", "suggest_spawn": "", "suggest_debate": "",
         "tool_issues": [], "source_gaps": [], "research_gaps": [],
         "accuracy_issues": [], "completeness_issues": [],
     }
 
+    def _try_parse(content: str) -> tuple[dict | None, ValidationError | Exception | None]:
+        """Return (verdict_dict, None) on success, (None, err) on validation/JSON failure."""
+        try:
+            raw = strip_json_fences(content)
+        except Exception as e:
+            return None, e
+        try:
+            verdict = SupervisorVerdict.model_validate_json(raw)
+            # Dump with by_alias=True so callers see the legacy `"pass"` key.
+            return verdict.model_dump(by_alias=True), None
+        except ValidationError as e:
+            return None, e
+        except Exception as e:
+            return None, e
+
+    # First call
     try:
-        resp   = await _llm_call(messages, cfg, role_cfg=role_cfg)
-        raw    = strip_json_fences(_content(resp))
-        result = json.loads(raw)
-        for k in ("pass", "score", "feedback"):
-            if k not in result:
-                raise ValueError(f"supervisor missing key: {k}")
-        result["score"] = float(result["score"])
-        # Default optional keys
-        result.setdefault("alternative", "")
-        result.setdefault("suggest_spawn", "")
-        result.setdefault("suggest_debate", "")
-        result.setdefault("tool_issues", [])
-        result.setdefault("source_gaps", [])
-        result.setdefault("research_gaps", [])
-        result.setdefault("accuracy_issues", [])
-        result.setdefault("completeness_issues", [])
-        return result
+        resp = await _llm_call(messages, cfg, role_cfg=role_cfg)
+        first_content = _content(resp)
     except Exception:
         return _fallback
+
+    verdict, err = _try_parse(first_content)
+    if verdict is not None:
+        return verdict
+
+    # Self-heal retry — once. Pass the first response back so the model sees
+    # what it produced; cite the specific errors so it knows what to fix.
+    if isinstance(err, ValidationError):
+        correction_body = format_validation_error(err)
+    else:
+        correction_body = f"- JSON parse error: {err}"
+    correction = (
+        "Your previous response failed schema validation:\n"
+        + correction_body +
+        "\n\nRe-emit the verdict, fixing only the listed errors. "
+        "Pure JSON, no preamble, no markdown fences."
+    )
+    retry_messages = messages + [
+        {"role": "assistant", "content": first_content},
+        {"role": "user", "content": correction},
+    ]
+    try:
+        resp2 = await _llm_call(retry_messages, cfg, role_cfg=role_cfg)
+        retry_content = _content(resp2)
+    except Exception:
+        if session_id:
+            try:
+                from app.sessions.state import log_tool_error
+                log_tool_error(session_id, "supervisor_schema",
+                               f"retry-call failed; first error: {err}")
+            except Exception:
+                pass
+        return _fallback
+
+    verdict, err2 = _try_parse(retry_content)
+    if verdict is not None:
+        return verdict
+
+    # Second failure — log and fall back. The fallback's pass=True preserves
+    # CLAUDE.md §16's anti-retry-storm invariant (don't make the worker retry
+    # because the supervisor's parser is broken).
+    if session_id:
+        try:
+            from app.sessions.state import log_tool_error
+            errors_payload = (
+                err2.errors() if isinstance(err2, ValidationError) else str(err2)
+            )
+            log_tool_error(session_id, "supervisor_schema",
+                           f"validation failed twice: {errors_payload}")
+        except Exception:
+            pass
+    return _fallback

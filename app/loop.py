@@ -13,8 +13,9 @@ from pathlib import Path
 
 import httpx
 
+from app.authorizer import _session_plan_path
 from app.config_loader import get_agents_config, get_config
-from app.mcp_client import _session_plan_path, call_tool
+from app.mcp_client import call_tool
 from app.llm import _content  # noqa: F401 — kept for potential downstream use
 from app.mode import _mode_context_string, _mode_temperature, _mode_tools
 from app.prompt_generator import cleanup_generated, generate
@@ -390,6 +391,7 @@ async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue
                 cfg,
                 s_cfg.get("include_conversation_history", True),
                 role_cfg=s_cfg,
+                session_id=session_id,
             )
 
             # Safety net: if the supervisor hallucinated "no tools were called"
