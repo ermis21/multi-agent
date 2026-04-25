@@ -35,6 +35,11 @@ WORKSPACE    = Path(os.environ.get("WORKSPACE_DIR", "/workspace"))
 CONFIG       = Path(os.environ.get("CONFIG_DIR",    "/config"))
 STATE        = Path(os.environ.get("STATE_DIR",     "/state"))
 GENERATED    = Path(os.environ.get("GENERATED_DIR", "/cache/prompts"))
+# Optional second skills root: host-installed skills mounted into the container
+# (e.g. by `npx skills add ...` writing to ~/.agents/skills on the host).
+# Set HOST_SKILLS_DIR="" to disable. Project skills win on name collision.
+_host_skills_env = os.environ.get("HOST_SKILLS_DIR", "/config/host_skills")
+HOST_SKILLS: Path | None = Path(_host_skills_env) if _host_skills_env else None
 
 # Canonical on-disk paths for curated files substituted into prompts.
 _CURATED_PATHS: dict[str, Path] = {
@@ -267,39 +272,63 @@ def _discover_skills() -> list[dict]:
             "path": str,                     # relative, e.g. "config/skills/x/SKILL.md"
         }
     """
-    skills_root = CONFIG / "skills"
-    try:
-        mtime = skills_root.stat().st_mtime
-    except FileNotFoundError:
+    primary_root = CONFIG / "skills"
+    host_root = HOST_SKILLS
+
+    def _root_mtime(p: Path | None) -> float:
+        if p is None:
+            return 0.0
+        try:
+            return p.stat().st_mtime
+        except FileNotFoundError:
+            return 0.0
+
+    primary_mtime = _root_mtime(primary_root)
+    host_mtime    = _root_mtime(host_root)
+    if primary_mtime == 0.0 and host_mtime == 0.0:
         _SKILLS_CACHE["mtime"] = 0.0
         _SKILLS_CACHE["entries"] = []
         return []
+
+    # Cache key combines both roots so changes to either invalidate.
+    mtime = max(primary_mtime, host_mtime)
     if mtime == _SKILLS_CACHE["mtime"]:
         return _SKILLS_CACHE["entries"]
 
     entries: list[dict] = []
-    for skill_md in sorted(skills_root.glob("*/SKILL.md")):
-        try:
-            text = skill_md.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        meta = _parse_frontmatter(text)
-        name = meta.get("name") or skill_md.parent.name
-        description = _coerce_meta_scalar(meta.get("description"))
-        when_to     = _coerce_meta_scalar(
-            meta.get("when-to-trigger") or meta.get("when_to_trigger")
-        )
-        when_not    = _coerce_meta_scalar(
-            meta.get("when-not-to-trigger") or meta.get("when_not_to_trigger")
-        )
-        rel_path = f"config/skills/{skill_md.parent.name}/SKILL.md"
-        entries.append({
-            "name":                name,
-            "description":         description,
-            "when_to_trigger":     when_to or None,
-            "when_not_to_trigger": when_not or None,
-            "path":                rel_path,
-        })
+    seen: set[str] = set()  # project skills win on name collision
+
+    def _scan(root: Path, rel_prefix: str) -> None:
+        for skill_md in sorted(root.glob("*/SKILL.md")):
+            try:
+                text = skill_md.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            meta = _parse_frontmatter(text)
+            name = meta.get("name") or skill_md.parent.name
+            if name in seen:
+                continue
+            seen.add(name)
+            description = _coerce_meta_scalar(meta.get("description"))
+            when_to     = _coerce_meta_scalar(
+                meta.get("when-to-trigger") or meta.get("when_to_trigger")
+            )
+            when_not    = _coerce_meta_scalar(
+                meta.get("when-not-to-trigger") or meta.get("when_not_to_trigger")
+            )
+            rel_path = f"{rel_prefix}/{skill_md.parent.name}/SKILL.md"
+            entries.append({
+                "name":                name,
+                "description":         description,
+                "when_to_trigger":     when_to or None,
+                "when_not_to_trigger": when_not or None,
+                "path":                rel_path,
+            })
+
+    if primary_mtime:
+        _scan(primary_root, "config/skills")
+    if host_mtime and host_root is not None:
+        _scan(host_root, "config/host_skills")
 
     _SKILLS_CACHE["mtime"] = mtime
     _SKILLS_CACHE["entries"] = entries

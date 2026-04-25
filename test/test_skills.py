@@ -211,6 +211,92 @@ def test_discover_skills_keeps_description_for_minimal_spec_skills(tmp_workspace
     assert e["when_not_to_trigger"] is None
 
 
+def _write_skill_at(skills_root: Path, name: str, description: str = "Test skill") -> Path:
+    skill_dir = skills_root / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    content = textwrap.dedent(f"""\
+        ---
+        name: {name}
+        description: {description}
+        ---
+        body
+        """)
+    path = skill_dir / "SKILL.md"
+    path.write_text(content)
+    return path
+
+
+def test_discover_skills_includes_host_root(tmp_path, monkeypatch):
+    """Skills under HOST_SKILLS are merged into discovery as a second root."""
+    project_cfg = tmp_path / "config"
+    host_skills = tmp_path / "host_skills"
+    monkeypatch.setattr(prompt_generator, "CONFIG", project_cfg)
+    monkeypatch.setattr(prompt_generator, "HOST_SKILLS", host_skills)
+    prompt_generator._SKILLS_CACHE["mtime"] = 0.0
+    prompt_generator._SKILLS_CACHE["entries"] = []
+
+    _write_skill(project_cfg, "alpha", description="Project skill alpha")
+    _write_skill_at(host_skills, "beta", description="Host skill beta")
+
+    entries = prompt_generator._discover_skills()
+    by_name = {e["name"]: e for e in entries}
+    assert set(by_name) == {"alpha", "beta"}
+    assert by_name["alpha"]["path"] == "config/skills/alpha/SKILL.md"
+    assert by_name["beta"]["path"] == "config/host_skills/beta/SKILL.md"
+
+
+def test_discover_skills_project_wins_on_collision(tmp_path, monkeypatch):
+    """If a skill name exists in both roots, the project copy wins."""
+    project_cfg = tmp_path / "config"
+    host_skills = tmp_path / "host_skills"
+    monkeypatch.setattr(prompt_generator, "CONFIG", project_cfg)
+    monkeypatch.setattr(prompt_generator, "HOST_SKILLS", host_skills)
+    prompt_generator._SKILLS_CACHE["mtime"] = 0.0
+    prompt_generator._SKILLS_CACHE["entries"] = []
+
+    _write_skill(project_cfg, "shared", description="Project version")
+    _write_skill_at(host_skills, "shared", description="Host version")
+
+    entries = prompt_generator._discover_skills()
+    assert len(entries) == 1
+    assert entries[0]["path"] == "config/skills/shared/SKILL.md"
+    assert "Project version" in entries[0]["description"]
+
+
+def test_discover_skills_host_only(tmp_path, monkeypatch):
+    """Host root alone is sufficient — no project skills dir required."""
+    project_cfg = tmp_path / "config"
+    host_skills = tmp_path / "host_skills"
+    monkeypatch.setattr(prompt_generator, "CONFIG", project_cfg)
+    monkeypatch.setattr(prompt_generator, "HOST_SKILLS", host_skills)
+    prompt_generator._SKILLS_CACHE["mtime"] = 0.0
+    prompt_generator._SKILLS_CACHE["entries"] = []
+
+    _write_skill_at(host_skills, "lonely", description="Only on host")
+
+    entries = prompt_generator._discover_skills()
+    assert len(entries) == 1
+    assert entries[0]["name"] == "lonely"
+    assert entries[0]["path"] == "config/host_skills/lonely/SKILL.md"
+
+
+def test_discover_skills_host_disabled(tmp_path, monkeypatch):
+    """HOST_SKILLS=None disables host scanning even if dir exists."""
+    project_cfg = tmp_path / "config"
+    host_skills = tmp_path / "host_skills"
+    monkeypatch.setattr(prompt_generator, "CONFIG", project_cfg)
+    monkeypatch.setattr(prompt_generator, "HOST_SKILLS", None)
+    prompt_generator._SKILLS_CACHE["mtime"] = 0.0
+    prompt_generator._SKILLS_CACHE["entries"] = []
+
+    _write_skill(project_cfg, "alpha")
+    _write_skill_at(host_skills, "beta")
+
+    entries = prompt_generator._discover_skills()
+    names = {e["name"] for e in entries}
+    assert names == {"alpha"}
+
+
 def test_format_skill_line_concise_spec_style(tmp_workspace):
     """Rendered metadata line should be a single bullet with name + description,
     no table scaffolding — matches the Agent Skills progressive-disclosure

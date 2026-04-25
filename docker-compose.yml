@@ -156,6 +156,9 @@ services:
     volumes:
       # User-edited config: identity, skills, prompts, *.yaml (rw — skills are agent-written)
       - ./config:/config
+      # Host-installed skills (e.g. `npx skills add …` → ~/.agents/skills). Read-only;
+      # picked up by _discover_skills as a second root. Project skills win on collision.
+      - ${HOST_SKILLS_DIR:-/home/homelab/.agents/skills}:/config/host_skills:ro
       # Agent-written persistent state: soul/, memory/, sessions/, discord/, chroma/
       - ./state:/state
       # Regenerable cache: prompts/ (audit trail, cleaned per-session)
@@ -221,6 +224,8 @@ services:
     volumes:
       # User-edited config: identity, skills, prompts, *.yaml
       - ./config:/config
+      # Host-installed skills (mirrors phoebe-sandbox mount). Read-only.
+      - ${HOST_SKILLS_DIR:-/home/homelab/.agents/skills}:/config/host_skills:ro
       # Agent-written persistent state (session logs land here)
       - ./state:/state
       # Regenerable cache (generated prompts audit trail)
