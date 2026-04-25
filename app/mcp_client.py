@@ -11,7 +11,6 @@ Timeouts:
   All others (shell_exec, git_*, docker_*):    130s
 """
 
-import asyncio
 import json
 import os
 import re
@@ -19,8 +18,9 @@ from uuid import uuid4
 
 import httpx
 
+from app.authorizer import authorize, resolve_approval  # noqa: F401 — re-exported
 from app.config_loader import get_config, patch_config
-from app.sessions.state import SessionState, log_approval
+from app.sessions.state import SessionState
 
 SANDBOX_URL = os.environ.get("SANDBOX_URL", "http://phoebe-sandbox:9000")
 
@@ -50,70 +50,6 @@ SLOW_TOOLS: frozenset[str] = frozenset({
 # Shared client — connection pool reused across tool calls in the same process.
 # Per-request timeout is passed to each .post() call, overriding the client default.
 _client = httpx.AsyncClient(timeout=SLOW_TIMEOUT_S)
-
-# ── Inline approval gate ─────────────────────────────────────────────────────
-# When a tool needs user approval, call_tool() POSTs an approval request to the
-# Discord service and waits on an asyncio.Event.  The event is set when the user
-# clicks a button in Discord, which triggers a callback to /v1/approval_response
-# on phoebe-api, which calls resolve_approval().  call_tool() never returns
-# "pending_approval" — it simply doesn't return until the tool runs or is denied.
-
-DISCORD_URL = os.environ.get("DISCORD_URL", "http://phoebe-discord:4000")
-_discord_http = httpx.AsyncClient(timeout=10)
-
-# approval_id → {event: asyncio.Event, approved: bool, always: bool}
-_pending_approvals: dict[str, dict] = {}
-
-
-def _safe_log_approval(session_id: str, tool: str, status: str, extra: dict | None = None) -> None:
-    """Best-effort approval audit — never raises out of the hot path."""
-    if not session_id:
-        return
-    try:
-        log_approval(session_id, tool, status, extra)
-    except Exception:
-        pass
-
-
-def resolve_approval(approval_id: str, approved: bool, always: bool = False) -> bool:
-    """Called by POST /v1/approval_response to unblock a waiting call_tool()."""
-    state = _pending_approvals.get(approval_id)
-    if not state:
-        return False
-    state["approved"] = approved
-    state["always"] = always
-    state["event"].set()
-    return True
-
-
-def _path_is_auto_allowed(method: str, params: dict, auto_allow_paths: list[str]) -> bool:
-    """
-    Return True if the tool's target path starts with any auto_allow path prefix.
-    Used to exempt plan-file writes from ask_user in plan mode.
-    """
-    if not auto_allow_paths:
-        return False
-    path = params.get("path") or params.get("destination") or params.get("source", "")
-    return any(path.startswith(prefix) for prefix in auto_allow_paths)
-
-
-# Plan-mode write scoping — in plan mode, the only writable target is the session
-# plan file. Everything else auto-fails, so the worker can't wait on approval for
-# ad-hoc paths. See RC3 in /home/homelab/.claude/plans/20-58-lets-recursive-owl.md.
-_PLAN_MODE_WRITE_TOOLS: frozenset[str] = frozenset({
-    "file_write", "file_edit", "create_dir", "file_move", "write_config",
-})
-
-
-def _session_plan_path(session_id: str) -> str:
-    """Canonical plan-file path for a session, in the prefix-form tools expect."""
-    sid = session_id or "unknown"
-    return f"state/sessions/{sid}/plan.md"
-
-
-def _normalize_rel_path(path: str) -> str:
-    """Strip leading slash + normalize separators for prefix comparison."""
-    return str(path or "").lstrip("/").replace("\\", "/")
 
 
 async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | None) -> dict:
@@ -171,31 +107,6 @@ async def _run_agent_tool(params: dict, session_id: str, spawnable: list[str] | 
                 pass
 
 
-async def _approval_heartbeat(trace_queue: "asyncio.Queue | None", tool: str,
-                               approval_id: str, interval: float = 90.0) -> None:
-    """Emit periodic `approval_waiting` events into the trace queue so the SSE
-    stream's idle timer stays armed and the Discord bot can show progress.
-    Cancelled by the caller once `event.wait()` resolves.
-    """
-    if trace_queue is None:
-        return
-    elapsed = 0.0
-    try:
-        while True:
-            await asyncio.sleep(interval)
-            elapsed += interval
-            try:
-                trace_queue.put_nowait({
-                    "event": "approval_waiting",
-                    "data": {"tool": tool, "approval_id": approval_id,
-                             "elapsed_s": int(elapsed)},
-                })
-            except Exception:
-                return
-    except asyncio.CancelledError:
-        return
-
-
 async def call_tool(
     method: str,
     params: dict,
@@ -219,104 +130,32 @@ async def call_tool(
         return {"error": f"Tool '{method}' is not permitted for this agent role. Allowed: {allowed}"}
 
     cfg = get_config()
-    mode_approval    = cfg.get("approval", {}).get(mode, {})
-    auto_fail        = set(mode_approval.get("auto_fail", []))
-    ask_user         = set(mode_approval.get("ask_user", []))
-    auto_allow_paths = mode_approval.get("auto_allow", {}).get("paths", [])
-    if extra_auto_allow_paths:
-        auto_allow_paths = auto_allow_paths + extra_auto_allow_paths
-    pre_approved     = set(approved_tools or [])
-
-    # Session-scoped deny lists (Phase 12.6) — consulted before mode-level gates.
-    state = None
+    state: SessionState | None = None
     if session_id:
         try:
             state = SessionState.load_or_create(session_id)
         except Exception:
             state = None
-    if state is not None:
-        denied = set(state.get("permissions.denied_tools", []) or [])
-        if method in denied:
-            _safe_log_approval(session_id, method, "auto_failed", {"reason": "denied_tools"})
-            return {"error": f"Tool '{method}' is on this session's denied_tools list."}
-        always_deny = state.get("permissions.always_deny_paths", []) or []
-        p_path = params.get("path") or params.get("destination") or params.get("source", "")
-        if p_path and any(str(p_path).startswith(prefix) for prefix in always_deny):
-            _safe_log_approval(session_id, method, "auto_failed",
-                               {"reason": "always_deny_paths", "path": str(p_path)})
-            return {"error": f"Path '{p_path}' is on this session's always_deny_paths list."}
 
-    # Hard-block — no LLM or user approval can bypass this
-    if method in auto_fail:
-        _safe_log_approval(session_id, method, "auto_failed", {"reason": "mode_auto_fail", "mode": mode})
-        return {"error": f"Tool '{method}' is permanently blocked in {mode!r} mode by system policy."}
-
-    # Plan-mode write scoping — writes are limited to the session plan file.
-    # `create_dir` / `file_move` / `write_config` naturally fail this check since
-    # their target paths don't match, so the worker stops asking for them mid-plan.
-    if mode == "plan" and method in _PLAN_MODE_WRITE_TOOLS:
-        plan_file = _session_plan_path(session_id)
-        target = params.get("path") or params.get("destination") or ""
-        if _normalize_rel_path(target) != _normalize_rel_path(plan_file):
-            _safe_log_approval(session_id, method, "auto_failed",
-                               {"reason": "plan_mode_write_scope",
-                                "attempted_path": str(target),
-                                "plan_file": plan_file})
-            return {"error": (
-                f"Plan mode only writes to '{plan_file}'. "
-                f"Put your plan there, or switch to build mode for general writes."
-            )}
-        # Target matches the plan file — bypass the ask_user gate.
-        pre_approved = pre_approved | {method}
-        _safe_log_approval(session_id, method, "auto_allowed",
-                           {"reason": "plan_mode_plan_file", "path": str(target)})
-
-    # Ask-user gate — skip if pre-approved or if path is auto-allowed.
-    # When approval is needed, POST to Discord and wait for the user's response.
-    # call_tool() does NOT return until the tool has been approved+executed or denied.
-    needs_ask = method in ask_user
-    if needs_ask and (method in pre_approved or _path_is_auto_allowed(method, params, auto_allow_paths)):
-        reason = "pre_approved" if method in pre_approved else "auto_allow_path"
-        _safe_log_approval(session_id, method, "auto_allowed", {"reason": reason})
-    if (needs_ask
-            and method not in pre_approved
-            and not _path_is_auto_allowed(method, params, auto_allow_paths)):
-        approval_id = uuid4().hex[:12]
-        event = asyncio.Event()
-        _pending_approvals[approval_id] = {"event": event, "approved": False, "always": False}
-        _safe_log_approval(session_id, method, "requested", {"approval_id": approval_id, "mode": mode})
-        try:
-            await _discord_http.post(f"{DISCORD_URL}/discord/request_approval", json={
-                "tool": method, "params": params,
-                "approval_id": approval_id, "session_id": session_id,
-            })
-        except Exception as e:
-            _pending_approvals.pop(approval_id, None)
-            return {"error": f"Could not request approval: {e}"}
-        # Keep the SSE stream's idle window armed while we wait for the user.
-        hb_task = asyncio.create_task(_approval_heartbeat(trace_queue, method, approval_id))
-        try:
-            try:
-                await asyncio.wait_for(event.wait(), timeout=660)
-            except asyncio.TimeoutError:
-                _pending_approvals.pop(approval_id, None)
-                _safe_log_approval(session_id, method, "timeout", {"approval_id": approval_id})
-                return {"error": f"Approval for '{method}' timed out."}
-        finally:
-            hb_task.cancel()
-            try:
-                await hb_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        result = _pending_approvals.pop(approval_id)
-        _safe_log_approval(session_id, method,
-                           "approved" if result["approved"] else "denied",
-                           {"always": bool(result.get("always")), "approval_id": approval_id})
-        if not result["approved"]:
-            return {"error": f"User declined to run '{method}'."}
-        if result["always"] and approved_tools is not None:
-            approved_tools.append(method)
-        # Fall through → execute the tool normally
+    pre_approved: set[str] = set(approved_tools or [])
+    decision = await authorize(
+        method=method,
+        params=params,
+        mode=mode,
+        cfg=cfg,
+        session_id=session_id,
+        state=state,
+        pre_approved=pre_approved,
+        extra_auto_allow_paths=extra_auto_allow_paths,
+        trace_queue=trace_queue,
+    )
+    if not decision.allowed:
+        return {"error": decision.error_message}
+    # Persist "Always"-approvals into the caller's session-scoped list.
+    if approved_tools is not None:
+        for tool in decision.always_approve:
+            if tool not in approved_tools:
+                approved_tools.append(tool)
 
     if method == "read_config":
         return {"config": get_config()}

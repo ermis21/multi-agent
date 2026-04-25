@@ -28,8 +28,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents import run_agent_loop, run_agent_role, run_config_agent, run_soul_update
+from app.authorizer import resolve_approval
 from app.config_loader import get_config, patch_config
-from app.mcp_client import call_tool, resolve_approval
+from app.mcp_client import call_tool
 from app.prompt_generator import cleanup_all_generated
 from app.sessions.logger import get_session, list_sessions
 from app.sessions.state import SessionState

@@ -1,4 +1,4 @@
-"""Unit tests for plan-mode write scoping in app.mcp_client.call_tool.
+"""Unit tests for plan-mode write scoping in app.authorizer.authorize.
 
 In plan mode the only writable target is state/sessions/{sid}/plan.md. All
 other write-class tool attempts auto-fail with a clear message — no Discord
@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import asyncio
 
-from app.mcp_client import (
+from app.authorizer import (
     _PLAN_MODE_WRITE_TOOLS,
     _normalize_rel_path,
     _session_plan_path,
-    call_tool,
 )
+from app.mcp_client import call_tool
 
 
 def _run(coro):
@@ -37,7 +37,7 @@ def test_plan_mode_rejects_write_to_other_paths(monkeypatch):
                                          "ask_user": [], "auto_fail": []}}},
     )
     async def _boom(*a, **k): raise AssertionError("should not POST to Discord")
-    monkeypatch.setattr("app.mcp_client._discord_http.post", _boom, raising=False)
+    monkeypatch.setattr("app.authorizer._discord_http.post", _boom, raising=False)
 
     result = _run(call_tool(
         "create_dir",
@@ -59,7 +59,7 @@ def test_plan_mode_allows_write_to_session_plan_file(monkeypatch):
                                          "ask_user": ["file_write"], "auto_fail": []}}},
     )
     async def _boom(*a, **k): raise AssertionError("should not POST to Discord for plan file")
-    monkeypatch.setattr("app.mcp_client._discord_http.post", _boom, raising=False)
+    monkeypatch.setattr("app.authorizer._discord_http.post", _boom, raising=False)
 
     async def _fake_post(url, json=None, **kw):
         class _R:
@@ -88,7 +88,7 @@ def test_plan_mode_rejects_write_config(monkeypatch):
                                          "ask_user": ["write_config"], "auto_fail": []}}},
     )
     async def _boom(*a, **k): raise AssertionError("should not POST to Discord")
-    monkeypatch.setattr("app.mcp_client._discord_http.post", _boom, raising=False)
+    monkeypatch.setattr("app.authorizer._discord_http.post", _boom, raising=False)
 
     result = _run(call_tool(
         "write_config",
@@ -109,7 +109,7 @@ def test_plan_mode_write_scope_does_not_affect_build_mode(monkeypatch):
                                           "ask_user": ["create_dir"], "auto_fail": []}}},
     )
     async def _boom(*a, **k): raise AssertionError("should not POST to Discord when pre-approved")
-    monkeypatch.setattr("app.mcp_client._discord_http.post", _boom, raising=False)
+    monkeypatch.setattr("app.authorizer._discord_http.post", _boom, raising=False)
 
     async def _fake_post(url, json=None, **kw):
         class _R:
