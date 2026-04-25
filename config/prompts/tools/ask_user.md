@@ -9,7 +9,8 @@ Use when:
 
 Do NOT ask questions you can answer by reading files, searching memory, or investigating.
 
-<|tool_call|>call: ask_user, {"question": "Which database should I configure?", "options": ["PostgreSQL (recommended for production)", "SQLite (simpler, for development)", "Keep current setup"], "context": "User asked to set up the database. Workspace has both pg and sqlite configs."}<|tool_call|>
+Examples:
+- {"question": "Which database should I configure?", "options": ["PostgreSQL (recommended for production)", "SQLite (simpler, for development)", "Keep current setup"], "context": "User asked to set up the database. Workspace has both pg and sqlite configs."}
 
 The user always sees two extra choices alongside your A–E options:
 - **Other…** — types a free-form reply. Result comes back as `letter: "other"` with their text in `answer`. Treat it as the user's considered answer.

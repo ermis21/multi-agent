@@ -40,6 +40,10 @@ GENERATED    = Path(os.environ.get("GENERATED_DIR", "/cache/prompts"))
 # Set HOST_SKILLS_DIR="" to disable. Project skills win on name collision.
 _host_skills_env = os.environ.get("HOST_SKILLS_DIR", "/config/host_skills")
 HOST_SKILLS: Path | None = Path(_host_skills_env) if _host_skills_env else None
+# Per-model prompt overlays — opt-in extra paragraph injected at {{PROMPT_OVERLAY}}.
+# Activated via `cfg.models.<name>.prompt_overlay: <name>` (or `cfg.llm.prompt_overlay`);
+# loads `<OVERLAYS_DIR>/<name>.md` and substitutes its content. Default empty.
+OVERLAYS_DIR = Path(os.environ.get("OVERLAYS_DIR", "/config/prompts/overlays"))
 
 # Canonical on-disk paths for curated files substituted into prompts.
 _CURATED_PATHS: dict[str, Path] = {
@@ -124,6 +128,56 @@ class _ToolDocsMapping:
 TOOL_DOCS = _ToolDocsMapping()
 
 
+# ── Overlay registry ──────────────────────────────────────────────────────────
+# Overlay files live at `{OVERLAYS_DIR}/<name>.md`. Each is rendered verbatim
+# above the rules block when a model has `prompt_overlay: <name>` set in its
+# config block. Mtime-cached on the directory; same pattern as TOOL_DOCS.
+
+_OVERLAYS_CACHE: dict = {"mtime": 0.0, "docs": {}}
+
+
+def _load_overlays() -> dict[str, str]:
+    root = OVERLAYS_DIR
+    try:
+        mtime = root.stat().st_mtime
+    except FileNotFoundError:
+        _OVERLAYS_CACHE["mtime"] = 0.0
+        _OVERLAYS_CACHE["docs"] = {}
+        return _OVERLAYS_CACHE["docs"]
+    if mtime == _OVERLAYS_CACHE["mtime"]:
+        return _OVERLAYS_CACHE["docs"]
+
+    docs: dict[str, str] = {}
+    for f in sorted(root.glob("*.md")):
+        try:
+            docs[f.stem] = f.read_text(encoding="utf-8").rstrip()
+        except Exception:
+            continue
+    _OVERLAYS_CACHE["mtime"] = mtime
+    _OVERLAYS_CACHE["docs"] = docs
+    return docs
+
+
+def _resolve_overlay_name(cfg: dict, role_cfg: dict) -> str | None:
+    """Return the overlay name for the role's effective LLM config, or None.
+
+    Resolution mirrors `_llm_call`: role_cfg.model -> cfg.models[name] wins
+    over cfg.llm. Both blocks may carry an optional `prompt_overlay: <name>`
+    string field; missing/empty -> no overlay.
+    """
+    model_name = (role_cfg or {}).get("model")
+    override = cfg.get("models", {}).get(model_name, {}) if model_name else {}
+    overlay = override.get("prompt_overlay") or cfg.get("llm", {}).get("prompt_overlay")
+    return overlay or None
+
+
+def _build_overlay_block(cfg: dict, role_cfg: dict) -> str:
+    name = _resolve_overlay_name(cfg, role_cfg)
+    if not name:
+        return ""
+    return _load_overlays().get(name, "")
+
+
 # ── Template helpers ───────────────────────────────────────────────────────────
 
 def _read_curated(path: Path, max_chars: int) -> str:
@@ -156,13 +210,11 @@ def _build_tool_block(allowed_tools: list[str]) -> str:
     inventory = ", ".join(f"`{t}`" for t in allowed_tools)
     header = (
         "## Calling a tool\n\n"
-        "Emit exactly one tool call on its own, in this format and nothing else:\n"
-        '`<|tool_call|>call: TOOL_NAME, {param_json}<|tool_call|>`\n\n'
-        "Example:\n"
-        '`<|tool_call|>call: file_read, {"path": "example.txt"}<|tool_call|>`\n\n'
+        "Emit one tool call per line when you need data. Use whatever JSON-call "
+        "format your model emits natively — the system parses common variants.\n\n"
         "Rules:\n"
-        "- No prose, no markdown fences, no nesting around the call.\n"
-        "- `param_json` is a flat JSON object — do NOT wrap it in `{\"params\": ...}`.\n"
+        "- One tool call per message line, no prose around it, no markdown fences.\n"
+        "- Params are a flat JSON object — do NOT wrap in `{\"params\": ...}`.\n"
         "- Give your final plain-text answer only once you have enough information.\n\n"
         f"## Your tools ({len(allowed_tools)})\n\n"
         f"You have access to **exactly these tools** — do not claim otherwise, "
@@ -548,6 +600,7 @@ def generate(
         "{{USER}}":          curated["USER.md"],
         "{{MEMORY}}":        curated["MEMORY.md"],
         "{{IDENTITY}}":      curated["IDENTITY.md"],
+        "{{PROMPT_OVERLAY}}": _build_overlay_block(cfg, role_cfg),
         "{{ALLOWED_TOOLS}}": _build_tool_block(tool_list_for_block),
         "{{SKILLS}}":        _build_skills_block(spawnable, agents_cfg, skills_entries_for_block),
         "{{AGENT_ID}}":      agent_id,
@@ -564,6 +617,8 @@ def generate(
         "{{SUPERVISOR_HANDLER}}":   "",   # empty by default; injected via extra= on retries
         "{{PLAN_CONTEXT_SECTION}}": "",   # empty by default; injected via extra= in build mode
         "{{TOOL_TRACES}}":          "(no tools were called)",  # default; overridden via extra=
+        "{{TURN_SUMMARY}}":         "",   # Phase 3 fills this; Phase 1 ships a no-op default
+        "{{PLAYBOOK}}":             "",   # Phase 3 fills this; Phase 1 ships a no-op default
         "{{APPROVAL_CONTEXT}}": _build_approval_context(cfg, allowed_tools, agent_mode),
         **(extra or {}),
     }

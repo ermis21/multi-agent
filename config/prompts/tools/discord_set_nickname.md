@@ -1,3 +1,4 @@
 ### discord_set_nickname
 Set a nickname for a guild member.
-<|tool_call|>call: discord_set_nickname, {"guild_id": 123, "user_id": 456, "nickname": "NewName", "bot": "worker"}<|tool_call|>
+Examples:
+- {"guild_id": 123, "user_id": 456, "nickname": "NewName", "bot": "worker"}

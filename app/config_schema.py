@@ -42,6 +42,10 @@ class LLMConfig(BaseModel):
     thinking_budget_tokens: int | None = None
     base_url: str | None = None
     url: str | None = None
+    # Optional name of an overlay file under config/prompts/overlays/<name>.md
+    # to inject above the rules block via the {{PROMPT_OVERLAY}} marker.
+    # Use to teach a weak local model an explicit tool-call grammar.
+    prompt_overlay: str | None = None
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────

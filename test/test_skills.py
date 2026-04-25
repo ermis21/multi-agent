@@ -12,8 +12,13 @@ from app import prompt_generator
 def tmp_workspace(tmp_path, monkeypatch):
     """Redirect CONFIG to a tmp dir and clear the skills cache so each test
     sees a fresh world. Fixture name kept as ``tmp_workspace`` to minimise
-    test-call-site churn."""
+    test-call-site churn.
+
+    Also disables HOST_SKILLS so tests don't accidentally pick up host-installed
+    skills (added in commit 58af32b — host root scanned in addition to project root).
+    """
     monkeypatch.setattr(prompt_generator, "CONFIG", tmp_path)
+    monkeypatch.setattr(prompt_generator, "HOST_SKILLS", None)
     # Reset the mtime-cached skills list
     if hasattr(prompt_generator, "_SKILLS_CACHE"):
         prompt_generator._SKILLS_CACHE["mtime"] = 0.0

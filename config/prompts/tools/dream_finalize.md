@@ -8,5 +8,6 @@ Params:
 
 **Skip path (no revision):** If you truly found nothing worth revising, call `dream_finalize(keep=[], drop=[], rationale="<≥20-char reason>")`. This is an explicit, visible skip — the user sees your rationale in the stream. If you identified ANY concrete issue in the conversation, prefer `dream_submit` with a targeted fix instead of skipping; the user reviews every edit and can reject it, so erring on the side of proposing a fix is cheap.
 
-<|tool_call|>call: dream_finalize, {"keep": ["ph-aaaa", "ph-cccc"], "drop": ["ph-bbbb"]}<|tool_call|>
-<|tool_call|>call: dream_finalize, {"keep": [], "drop": [], "rationale": "Conversation ran cleanly; worker used tools correctly, supervisor verdicts were precise, no prompt-attributable issue to fix."}<|tool_call|>
+Examples:
+- {"keep": ["ph-aaaa", "ph-cccc"], "drop": ["ph-bbbb"]}
+- {"keep": [], "drop": [], "rationale": "Conversation ran cleanly; worker used tools correctly, supervisor verdicts were precise, no prompt-attributable issue to fix."}

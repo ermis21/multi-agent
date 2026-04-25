@@ -9,5 +9,6 @@ Params:
 
 **Single-target** remains the common case — wrap your one rewrite in a 1-element `targets` list.
 
-<|tool_call|>call: dream_submit, {"targets": [{"path": "worker_full", "new_full_text": "# Worker\n\n..."}], "rationale": "tighten tool-call grammar guidance"}<|tool_call|>
-<|tool_call|>call: dream_submit, {"targets": [{"path": "worker_full", "new_full_text": "# Worker\n\n..."}, {"path": "supervisor_full", "new_full_text": "# Supervisor\n\n..."}], "rationale": "supervisor kept nagging on converse-mode research — loosen supervisor checks and tighten worker's mid-research phrasing"}<|tool_call|>
+Examples:
+- {"targets": [{"path": "worker_full", "new_full_text": "# Worker\n\n..."}], "rationale": "tighten tool-call grammar guidance"}
+- {"targets": [{"path": "worker_full", "new_full_text": "# Worker\n\n..."}, {"path": "supervisor_full", "new_full_text": "# Supervisor\n\n..."}], "rationale": "supervisor kept nagging on converse-mode research — loosen supervisor checks and tighten worker's mid-research phrasing"}
