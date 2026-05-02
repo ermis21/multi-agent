@@ -1,9 +1,9 @@
 llm:
-  provider: openai
-  url: null
-  model: gpt-5-nano
+  provider: local
+  url: http://10.64.82.60:8000
+  model: Qwen3.6-27B-UD-Q4_K_XL.gguf
   temperature: 1.0
-  max_tokens: 16384
+  max_tokens: 131072
   top_p: 0.95
   top_k: 64
   enable_thinking: false
@@ -448,3 +448,19 @@ dream:
     to: ekatsaounis@uth.gr
     provider: gmail
     fallback_channel_id: null
+tts:
+  voice: af_bella
+
+# ── Pi.dev Remote Control ─────────────────────────────────────────────────────
+# Pi connects OUT to Phoebe via WebSocket. Phoebe listens on ws_port and
+# multiplexes multiple Pi instances on a single port.
+remote:
+  enabled: true
+  ws_port: 8090           # same port as phoebe-api (FastAPI handles WS upgrade)
+  ws_host: phoebe-api    # hostname Pi should connect to (set to your Phoebe host IP)
+  default_model: null     # default model for new sessions (e.g. "anthropic/claude-sonnet-4-20250514")
+  default_thinking: medium
+  session_dir: /state/pi_sessions   # where Pi stores session.jsonl
+  auto_compaction: true
+  auto_retry: true
+  max_tool_timeout_s: 120

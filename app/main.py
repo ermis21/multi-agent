@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agents import run_agent_loop, run_agent_role, run_config_agent, run_soul_update
@@ -80,6 +80,14 @@ def get_session_state(session_id: str) -> dict | None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # B6 — initialize OpenInference instrumentation. Gated on
+    # PHOEBE_OBSERVABILITY_ENABLED=1; otherwise a silent no-op.
+    try:
+        from app.observability import setup_observability
+        setup_observability()
+    except Exception as e:
+        print(f"[phoebe-api] observability setup warning: {e}", flush=True)
+
     # Clean up stale generated prompt files from previous runs
     cleanup_all_generated()
 
@@ -1204,3 +1212,147 @@ async def models():
             return r.json()
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── Pi.dev Remote Control ─────────────────────────────────────────────────────
+
+from app.remote.bridge import (
+    get_all_connections,
+    get_connection,
+    get_connection_for_channel,
+    handle_pi_connection,
+    list_connections,
+)
+
+
+@app.websocket("/v1/remote/ws")
+async def remote_websocket(ws: WebSocket):
+    """WebSocket endpoint for Pi.dev RPC connections.
+
+    Pi connects to this endpoint with query params:
+      ?channel_id=<discord_channel_id>&model=<model_name>
+
+    Once connected, Pi's JSONL RPC events are bridged to Discord.
+    """
+    channel_id_str = ws.query_params.get("channel_id", "")
+    model_name = ws.query_params.get("model", "")
+    session_name = ws.query_params.get("session_name", "")
+
+    if not channel_id_str:
+        await ws.close(code=4004, reason="channel_id query param required")
+        return
+
+    try:
+        channel_id = int(channel_id_str)
+    except ValueError:
+        await ws.close(code=4004, reason="channel_id must be an integer")
+        return
+
+    metadata = {}
+    if model_name:
+        metadata["model"] = model_name
+    if session_name:
+        metadata["session_name"] = session_name
+
+    await ws.accept()
+    conn = await handle_pi_connection(ws, channel_id, metadata)
+
+    # Send a welcome message to Discord
+    try:
+        from app.remote.bridge import _discord_send
+        model_info = f" (model: {model_name})" if model_name else ""
+        session_info = f" (session: {session_name})" if session_name else ""
+        await _discord_send(
+            channel_id,
+            f"-# 🔗 Pi connected{model_info}{session_info}  id=`{conn.conn_id}`"
+        )
+    except Exception:
+        pass
+
+    # Keep connection alive until Pi disconnects
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        await conn.stop()
+
+
+@app.get("/v1/remote/status")
+async def remote_status():
+    """Get status of all active Pi connections."""
+    return {"connections": list_connections()}
+
+
+@app.get("/v1/remote/channel/{channel_id}")
+async def remote_channel_status(channel_id: int):
+    """Get the Pi connection status for a specific Discord channel."""
+    conn = get_connection_for_channel(channel_id)
+    if conn is None:
+        raise HTTPException(404, "No active Pi connection for this channel")
+    return conn.get_status()
+
+
+@app.post("/v1/remote/command")
+async def remote_command(request: Request):
+    """Send an RPC command to a Pi connection.
+
+    Body: {"channel_id": int, "command": {"type": "prompt", "message": "..."}}
+    """
+    body = await request.json()
+    channel_id = body.get("channel_id")
+    command = body.get("command")
+
+    if not channel_id or not command:
+        raise HTTPException(400, "channel_id and command are required")
+
+    conn = get_connection_for_channel(channel_id)
+    if conn is None:
+        raise HTTPException(404, "No active Pi connection for this channel")
+
+    await conn.send_command(command)
+    return {"ok": True, "conn_id": conn.conn_id}
+
+
+@app.post("/v1/remote/ui_response")
+async def remote_ui_response(request: Request):
+    """Send an extension UI response to a Pi connection.
+
+    Body: {"channel_id": int, "req_id": str, "response": {"value": "..."}}
+    """
+    body = await request.json()
+    channel_id = body.get("channel_id")
+    req_id = body.get("req_id")
+    response = body.get("response", {})
+
+    if not channel_id or not req_id:
+        raise HTTPException(400, "channel_id and req_id are required")
+
+    conn = get_connection_for_channel(channel_id)
+    if conn is None:
+        raise HTTPException(404, "No active Pi connection for this channel")
+
+    await conn.send_ui_response(req_id, response)
+    return {"ok": True}
+
+
+@app.post("/v1/remote/detach/{channel_id}")
+async def remote_detach(channel_id: int):
+    """Detach a Pi connection from a Discord channel."""
+    conn = get_connection_for_channel(channel_id)
+    if conn is None:
+        raise HTTPException(404, "No active Pi connection for this channel")
+    await conn.stop()
+    return {"ok": True, "conn_id": conn.conn_id}
+
+
+@app.post("/v1/remote/detach_all")
+async def remote_detach_all():
+    """Detach all active Pi connections."""
+    conns = get_all_connections()
+    results = []
+    for conn in conns:
+        await conn.stop()
+        results.append(conn.conn_id)
+    return {"ok": True, "detached": results}

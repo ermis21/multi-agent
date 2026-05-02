@@ -34,7 +34,7 @@ from views import (
 PHOEBE_API_URL      = os.environ.get("PHOEBE_API_URL",             "http://phoebe-api:8090")
 WORKER_TOKEN     = os.environ.get("DISCORD_TOKEN_WORKER",   "")
 GUILD_ID         = int(os.environ.get("DISCORD_GUILD_ID",   "0"))
-WORKER_NICKNAME  = os.environ.get("DISCORD_WORKER_NICKNAME", "Gemma")
+WORKER_NICKNAME  = os.environ.get("DISCORD_WORKER_NICKNAME", "Phoebe")
 
 # Test-driver bot user id: when set, this specific bot author is NOT ignored by
 # the author.bot early-return in on_message. Used by discord/e2e_scenarios.py
@@ -79,6 +79,10 @@ _session_always_allow: dict[str, set[str]] = {}
 _session_plans: dict[str, str] = {}                  # session_id → plan markdown text
 _session_privileged_paths: dict[str, list[str]] = {}  # session_id → scope paths (for Accept+Privileged)
 
+# Per-session auto-dictate toggle (A3 /speak slash). When True, every worker
+# final answer fires speak_voice IF the originating user is currently in a VC.
+_session_auto_dictate: dict[str, bool] = {}          # session_id → bool
+
 # channel_id → session_id currently running a worker loop in that channel.
 # Drives mid-flight injection dispatcher + /btw + /stop slash commands.
 _channel_in_flight: dict[int, str] = {}
@@ -101,6 +105,7 @@ def _sync_session_state(session_id: str) -> None:
             "privileged_paths": list(_session_privileged_paths.get(session_id, []) or []),
             "approved_tools": sorted(_session_always_allow.get(session_id, set()) or set()),
         },
+        "tts": {"auto_dictate": _session_auto_dictate.get(session_id, False)},
     }
     async def _do() -> None:
         try:
@@ -520,6 +525,7 @@ def _save_state() -> None:
                 "renamed_channels": list(_renamed_channels),
                 "session_plans":           _session_plans,
                 "session_privileged_paths": _session_privileged_paths,
+                "session_auto_dictate":    _session_auto_dictate,
             }, ensure_ascii=False),
             encoding="utf-8",
         )
@@ -541,6 +547,7 @@ def _load_state() -> None:
         _renamed_channels.update(int(x) for x in data.get("renamed_channels", []))
         _session_plans.update(data.get("session_plans", {}))
         _session_privileged_paths.update(data.get("session_privileged_paths", {}))
+        _session_auto_dictate.update(data.get("session_auto_dictate", {}))
         print(
             f"[worker-bot] restored {len(_session_ids)} sessions, "
             f"{len(_user_modes)} modes, "
@@ -922,6 +929,17 @@ async def _handle_user_edit(after: discord.Message) -> None:
     channel = after.channel
     session_id = _channel_sessions.get(channel.id)
     if not session_id:
+        # Legacy per-user channels store sessions in _session_ids keyed by
+        # "{user_id}:{channel_id}". Only bot-created (/new) channels populate
+        # _channel_sessions — without this fallback, edits in plain channels
+        # silently no-op'd.
+        session_id = _session_ids.get(f"{after.author.id}:{channel.id}")
+    if not session_id:
+        print(
+            f"[worker-bot] edit ignored: no session bound to channel "
+            f"{channel.id} for user {after.author.id}",
+            flush=True,
+        )
         return
 
     # Resolve turn_index by looking up the edited message id in state.
@@ -1267,9 +1285,14 @@ async def cmd_model(
                     r.raise_for_status()
                     models_data = r.json().get("data", [])
                     if models_data:
-                        real_model = models_data[0]["id"]
-                        await _http.patch(f"{PHOEBE_API_URL}/config", json={"llm": {"model": real_model}})
-                        llm["model"] = real_model
+                        configured_model = patch.get("model", "")
+                        loaded_ids = [m["id"] for m in models_data]
+                        if configured_model and configured_model in loaded_ids:
+                            pass  # Configured model is already loaded — trust it
+                        else:
+                            real_model = loaded_ids[0]
+                            await _http.patch(f"{PHOEBE_API_URL}/config", json={"llm": {"model": real_model}})
+                            llm["model"] = real_model
                 except Exception:
                     pass
             msg = (
@@ -1529,6 +1552,17 @@ async def cmd_help(interaction: discord.Interaction):
         "• `/compact` — Force-run the rolling compactor\n"
         "• `/kill` — Hard-cancel the in-flight worker immediately\n"
         "• `/dream-run [date] [meta] [review]` — Trigger a verbose dream run with per-edit review\n\n"
+        "**Pi.dev Remote Control**\n"
+        "• `/remote attach [model]` — Attach a Pi.dev session to this channel\n"
+        "• `/remote detach` — Detach Pi from this channel\n"
+        "• `/remote status` — Show Pi session state and stats\n"
+        "• `/remote steer \"...\"` — Steer the running agent\n"
+        "• `/remote follow \"...\"` — Queue follow-up for after current task\n"
+        "• `/remote abort` — Abort current operation\n"
+        "• `/remote bash \"cmd\"` — Run a shell command in Pi's context\n"
+        "• `/remote model [preset]` — Switch Pi's model\n"
+        "• `/remote compact` — Manually compact conversation\n"
+        "• `/remote help` — Full remote control help\n\n"
         "**Only while I'm working on something** (worker run in flight)\n"
         "• `/btw <text>` — Add context mid-flight without stopping the agent\n"
         "• `/stop` — Cooperative stop (then escalates to hard cancel if repeated)\n"
@@ -2134,68 +2168,37 @@ async def cmd_plan_show(interaction: discord.Interaction):
         await interaction.channel.send(chunk)
 
 
-@tree.command(name="speak", description="Ask the agent a question and get a voice response")
-@app_commands.describe(prompt="What to ask the agent")
-async def cmd_speak(interaction: discord.Interaction, prompt: str):
+@tree.command(name="speak", description="Toggle auto-dictate for this channel — every reply is spoken in your VC while ON")
+async def cmd_speak(interaction: discord.Interaction):
+    """A3: repurposed from one-shot ask+speak to per-session toggle.
+
+    The 🔊 Listen button on each reply already covers the one-shot case;
+    this slash now controls whether replies AUTO-speak when the user is in
+    a voice channel. Persists per-session in `state.tts.auto_dictate`."""
     if not is_allowed(interaction.user.id):
         await interaction.response.send_message("Not authorized.", ephemeral=True)
         return
-
-    await interaction.response.defer()
 
     if interaction.channel_id in _channel_sessions:
         session_id = _channel_sessions[interaction.channel_id]
     else:
         session_id = _get_session_id(interaction.channel_id, interaction.user.id)
-    mode = _get_mode(interaction.channel_id, interaction.user.id)
 
-    _start_thinking(session_id, interaction.channel)
-    data = None
-    try:
-        resp = await _http.post(f"{PHOEBE_API_URL}/v1/chat/completions", json={
-            "messages":   [{"role": "user", "content": prompt}],
-            "session_id": session_id,
-            "mode":       mode,
-        })
-        resp.raise_for_status()
-        data = resp.json()
-        answer = data["choices"][0]["message"]["content"]
-    except Exception as e:
-        err_str = str(e) or f"{type(e).__name__} (no message)"
-        await interaction.followup.send(f"[error: {err_str}]")
-        return
-    finally:
-        _stop_thinking(session_id)
+    new_state = not _session_auto_dictate.get(session_id, False)
+    _session_auto_dictate[session_id] = new_state
+    _save_state()
+    _sync_session_state(session_id)
 
-    if data is not None and data.get("tool_trace"):
-        await interaction.followup.send(_format_tool_trace(data["tool_trace"]))
-
-    # Play TTS — prefer voice channel, fall back to WAV file in text channel
-    voice_state = interaction.user.voice if interaction.guild else None
-    voice_ch    = voice_state.channel if voice_state else None
-    tts_ok = False
-    try:
-        if voice_ch:
-            tts_resp = await _http.post("http://localhost:4000/discord/speak_voice", json={
-                "voice_channel_id": voice_ch.id,
-                "text":             answer,
-            })
-        else:
-            tts_resp = await _http.post("http://localhost:4000/discord/speak", json={
-                "channel_id": interaction.channel_id,
-                "text":       answer,
-            })
-        tts_resp.raise_for_status()
-        tts_ok = tts_resp.json().get("ok", False)
-    except Exception as e:
-        print(f"[worker-bot] TTS failed: {e}", flush=True)
-
-    # Always send the text too so the response is readable
-    for chunk in split_message(answer):
-        await interaction.followup.send(chunk)
-
-    if not tts_ok:
-        await interaction.followup.send("_(voice generation failed — text response above)_", ephemeral=True)
+    if new_state:
+        await interaction.response.send_message(
+            "🔊 **Auto-dictate ON** — replies will be spoken in your voice channel "
+            "(when you're in one). Run `/speak` again to turn off."
+        )
+    else:
+        await interaction.response.send_message(
+            "🔇 **Auto-dictate OFF** — replies are text-only. Click 🔊 Listen on any "
+            "reply for one-shot voice playback."
+        )
 
 
 # ── Background model-name poller ─────────────────────────────────────────────
@@ -2217,13 +2220,337 @@ async def _poll_model_name() -> None:
                 r.raise_for_status()
                 models_data = r.json().get("data", [])
                 if models_data:
-                    real_model = models_data[0]["id"]
-                    if real_model != llm.get("model"):
+                    configured_model = llm.get("model", "")
+                    loaded_ids = [m["id"] for m in models_data]
+                    if configured_model and configured_model in loaded_ids:
+                        pass  # Configured model is already loaded — trust it
+                    else:
+                        real_model = loaded_ids[0]
                         await _http.patch(f"{PHOEBE_API_URL}/config", json={"llm": {"model": real_model}})
-                        print(f"[worker-bot] model name updated: {llm.get('model')!r} → {real_model!r}", flush=True)
+                        print(f"[worker-bot] model name updated: {configured_model!r} → {real_model!r}", flush=True)
         except Exception:
             pass
         await asyncio.sleep(60)
+
+
+# ── Pi.dev Remote Control ─────────────────────────────────────────────────────
+# Slash commands for attaching Pi.dev sessions and controlling them from Discord.
+
+_REMOTE_HELP = (
+    "**Pi.dev Remote Control**\n"
+    "• `/remote attach [model]` — Start a new Pi session in this channel\n"
+    "• `/remote detach` — Detach Pi from this channel\n"
+    "• `/remote status` — Show Pi session state and stats\n"
+    "• `/remote steer \"...\"` — Steer the running agent\n"
+    "• `/remote follow \"...\"` — Queue follow-up for after current task\n"
+    "• `/remote abort` — Abort current operation\n"
+    "• `/remote bash \"cmd\"` — Run a shell command in Pi's context\n"
+    "• `/remote model [preset]` — Switch Pi's model\n"
+    "• `/remote compact` — Manually compact conversation\n"
+    "• `/remote new-session` — Start a fresh Pi session\n"
+    "• `/remote export` — Export session to HTML\n"
+    "• `/remote ui-select <req_id> <option>` — Respond to Pi extension select\n"
+    "• `/remote ui-confirm <req_id> <yes|no>` — Respond to Pi extension confirm\n"
+    "• `/remote ui-input <req_id> <value>` — Respond to Pi extension input\n"
+    "• `/remote ui-editor <req_id> <text>` — Respond to Pi extension editor\n"
+    "\n**Tip:** Normal messages in the channel are sent as prompts to Pi.\n"
+    "When Pi is running, use `/remote steer` for mid-flight guidance."
+)
+
+
+@tree.command(name="remote", description="Control a Pi.dev coding session from Discord")
+@app_commands.describe(
+    action="attach, detach, status, steer, follow, abort, bash, model, compact, new-session, export, ui-select, ui-confirm, ui-input, ui-editor, help",
+    value="Action-specific value (model name, message, command, etc.)",
+    extra="Extra parameter for ui-* commands (req_id)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="attach", value="attach"),
+    app_commands.Choice(name="detach", value="detach"),
+    app_commands.Choice(name="status", value="status"),
+    app_commands.Choice(name="steer", value="steer"),
+    app_commands.Choice(name="follow", value="follow"),
+    app_commands.Choice(name="abort", value="abort"),
+    app_commands.Choice(name="bash", value="bash"),
+    app_commands.Choice(name="model", value="model"),
+    app_commands.Choice(name="compact", value="compact"),
+    app_commands.Choice(name="new-session", value="new-session"),
+    app_commands.Choice(name="export", value="export"),
+    app_commands.Choice(name="ui-select", value="ui-select"),
+    app_commands.Choice(name="ui-confirm", value="ui-confirm"),
+    app_commands.Choice(name="ui-input", value="ui-input"),
+    app_commands.Choice(name="ui-editor", value="ui-editor"),
+    app_commands.Choice(name="help", value="help"),
+])
+async def cmd_remote(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    value: str | None = None,
+    extra: str | None = None,
+):
+    if not is_allowed(interaction.user.id):
+        await interaction.response.send_message("Not authorized.", ephemeral=True)
+        return
+
+    channel_id = interaction.channel_id
+
+    if action.value == "help":
+        await interaction.response.send_message(_REMOTE_HELP)
+        return
+
+    if action.value == "attach":
+        model_name = value or ""
+        await interaction.response.send_message(
+            f"🔗 Starting Pi session{f' (model: {model_name})' if model_name else ''}…"
+        )
+        # Spawn Pi via the rpc-proxy on the user's machine.
+        # The proxy connects OUT to Phoebe's WebSocket endpoint.
+        # For now, we instruct the user to connect.
+        try:
+            cfg_resp = await _http.get(f"{PHOEBE_API_URL}/config", timeout=5)
+            cfg_resp.raise_for_status()
+            cfg = cfg_resp.json()
+            remote_cfg = cfg.get("remote", {}) or {}
+            ws_port = remote_cfg.get("ws_port", 9300)
+            ws_host = remote_cfg.get("ws_host", "phoebe-api")
+        except Exception:
+            ws_port = 9300
+            ws_host = "phoebe-api"
+
+        model_param = f"&model={model_name}" if model_name else ""
+        await interaction.followup.send(
+            f"-# 🔗 Pi connection URL:\n"
+            f"`pi --mode rpc --rpc-url ws://{ws_host}:{ws_port}/v1/remote/ws?channel_id={channel_id}{model_param}`\n\n"
+            f"Or use the rpc-proxy:\n"
+            f"`rpc-proxy --url ws://{ws_host}:{ws_port}/v1/remote/ws?channel_id={channel_id}{model_param}`"
+        )
+        return
+
+    if action.value == "detach":
+        try:
+            resp = await _http.post(
+                f"{PHOEBE_API_URL}/v1/remote/detach/{channel_id}",
+                timeout=5,
+            )
+            if resp.status_code == 404:
+                await interaction.response.send_message(
+                    "No active Pi connection in this channel.", ephemeral=True
+                )
+                return
+            resp.raise_for_status()
+            await interaction.response.send_message("🔌 Pi detached.")
+        except Exception as e:
+            await interaction.response.send_message(f"Detach failed: {e}")
+        return
+
+    if action.value == "status":
+        try:
+            resp = await _http.get(
+                f"{PHOEBE_API_URL}/v1/remote/channel/{channel_id}",
+                timeout=5,
+            )
+            if resp.status_code == 404:
+                await interaction.response.send_message(
+                    "No active Pi connection in this channel.", ephemeral=True
+                )
+                return
+            resp.raise_for_status()
+            data = resp.json()
+            model = data.get("model", "?")
+            session_id = data.get("session_id", "?")
+            session_name = data.get("session_name", "")
+            is_streaming = data.get("is_streaming", False)
+            is_compacting = data.get("is_compacting", False)
+            status_icon = "🟢 streaming" if is_streaming else "🟡 idle"
+            if is_compacting:
+                status_icon = "📦 compacting"
+            msg = (
+                f"**Pi Status** — {status_icon}\n"
+                f"**Model**: `{model}`\n"
+                f"**Session**: `{session_id}`"
+                f"{f' ({session_name})' if session_name else ''}\n"
+                f"**Connection**: `{data.get('conn_id', '?')}`"
+            )
+            if data.get("pending_ui"):
+                msg += f"\n**Pending UI**: {len(data['pending_ui'])} dialog(s)"
+            await interaction.response.send_message(msg)
+        except Exception as e:
+            await interaction.response.send_message(f"Status failed: {e}")
+        return
+
+    # All other actions require an active connection
+    try:
+        status_resp = await _http.get(
+            f"{PHOEBE_API_URL}/v1/remote/channel/{channel_id}",
+            timeout=5,
+        )
+        if status_resp.status_code == 404:
+            await interaction.response.send_message(
+                "No active Pi connection in this channel. Use `/remote attach` first.",
+                ephemeral=True,
+            )
+            return
+    except Exception:
+        pass
+
+    if action.value == "steer":
+        if not value:
+            await interaction.response.send_message(
+                "Usage: `/remote steer \"your message\"`", ephemeral=True
+            )
+            return
+        await _send_remote_command(channel_id, {"type": "steer", "message": value})
+        await interaction.response.send_message(f"-# 🎯 Steered: {value[:100]}")
+
+    elif action.value == "follow":
+        if not value:
+            await interaction.response.send_message(
+                "Usage: `/remote follow \"your message\"`", ephemeral=True
+            )
+            return
+        await _send_remote_command(channel_id, {"type": "follow_up", "message": value})
+        await interaction.response.send_message(f"-# 📨 Follow-up queued: {value[:100]}")
+
+    elif action.value == "abort":
+        await _send_remote_command(channel_id, {"type": "abort"})
+        await interaction.response.send_message("🛑 Abort sent.")
+
+    elif action.value == "bash":
+        if not value:
+            await interaction.response.send_message(
+                "Usage: `/remote bash \"ls -la\"`", ephemeral=True
+            )
+            return
+        await _send_remote_command(channel_id, {"type": "bash", "command": value})
+        await interaction.response.send_message(f"-# ⚡ Bash: `{value[:80]}`")
+
+    elif action.value == "model":
+        if not value:
+            await interaction.response.send_message(
+                "Usage: `/remote model anthropic/claude-sonnet-4-20250514`", ephemeral=True
+            )
+            return
+        # Parse provider/modelId from value
+        if "/" in value:
+            provider, model_id = value.split("/", 1)
+        else:
+            # Try to resolve from presets
+            try:
+                presets = await _fetch_model_presets()
+                if value in presets:
+                    spec = presets[value]
+                    provider = spec.get("provider", "openai")
+                    model_id = spec.get("model", value)
+                else:
+                    await interaction.response.send_message(
+                        f"Unknown model `{value}`. Use `provider/modelId` format.",
+                        ephemeral=True,
+                    )
+                    return
+            except Exception:
+                provider = "openai"
+                model_id = value
+        await _send_remote_command(channel_id, {"type": "set_model", "provider": provider, "modelId": model_id})
+        await interaction.response.send_message(f"-# 🔄 Model set to `{provider}/{model_id}`")
+
+    elif action.value == "compact":
+        await _send_remote_command(channel_id, {"type": "compact"})
+        await interaction.response.send_message("-# 📦 Compaction requested.")
+
+    elif action.value == "new-session":
+        await _send_remote_command(channel_id, {"type": "new_session"})
+        await interaction.response.send_message("🔄 New session started.")
+
+    elif action.value == "export":
+        await _send_remote_command(channel_id, {"type": "export_html"})
+        await interaction.response.send_message("-# 📄 Export requested (check Pi session dir).")
+
+    elif action.value in ("ui-select", "ui-confirm", "ui-input", "ui-editor"):
+        req_id = extra or (value.split()[0] if value and " " in value else None)
+        ui_value = value.split(" ", 1)[1] if value and " " in value else ""
+        if not req_id:
+            await interaction.response.send_message(
+                f"Usage: `/remote {action.value} <req_id> <value>`", ephemeral=True
+            )
+            return
+        if action.value == "ui-confirm":
+            confirmed = ui_value.lower() in ("yes", "y", "true", "1")
+            response = {"confirmed": confirmed}
+        else:
+            response = {"value": ui_value}
+        try:
+            resp = await _http.post(
+                f"{PHOEBE_API_URL}/v1/remote/ui_response",
+                json={"channel_id": channel_id, "req_id": req_id, "response": response},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            await interaction.response.send_message(f"-# ✅ UI response sent for `{req_id}`")
+        except Exception as e:
+            await interaction.response.send_message(f"UI response failed: {e}")
+
+
+async def _send_remote_command(channel_id: int, command: dict) -> dict | None:
+    """Send an RPC command to Pi via the bridge."""
+    try:
+        resp = await _http.post(
+            f"{PHOEBE_API_URL}/v1/remote/command",
+            json={"channel_id": channel_id, "command": command},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"[worker-bot] remote command failed: {e}", flush=True)
+        return None
+
+
+def _get_pi_connection(channel_id: int) -> dict | None:
+    """Check if there's an active Pi connection for this channel.
+
+    Returns the connection status dict or None.
+    """
+    try:
+        resp = _get_http_sync().get(
+            f"{PHOEBE_API_URL}/v1/remote/channel/{channel_id}",
+            timeout=2,
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+# Module-level sync client for quick status checks
+_http_sync_client: httpx.Client | None = None
+
+
+def _get_http_sync() -> httpx.Client:
+    """Get a cached synchronous httpx client for quick status checks."""
+    global _http_sync_client
+    if _http_sync_client is None:
+        _http_sync_client = httpx.Client(timeout=2)
+    return _http_sync_client
+
+
+async def _route_to_pi(msg: discord.Message, conn_status: dict) -> None:
+    """Route a Discord message to Pi via the bridge.
+
+    If Pi is streaming, sends as steer. If idle, sends as prompt.
+    """
+    is_streaming = conn_status.get("is_streaming", False)
+    command_type = "steer" if is_streaming else "prompt"
+
+    await _send_remote_command(
+        msg.channel.id,
+        {"type": command_type, "message": msg.content},
+    )
+
+    # Acknowledge the routing
+    icon = "🎯" if is_streaming else "💬"
+    await msg.channel.send(f"-# {icon} {'Steered' if is_streaming else 'Prompted'} Pi: {msg.content[:80]}")
 
 
 # ── Bot events ────────────────────────────────────────────────────────────────
@@ -2236,13 +2563,13 @@ async def on_ready():
         WORKER_CHANNEL_IDS.add(ch_id)
     print(f"[worker-bot] logged in as {client.user}", flush=True)
 
-    # Set bot avatar from the bundled Gemma logo (best-effort; Discord rate-limits
+    # Set bot avatar from the bundled Phoebe logo (best-effort; Discord rate-limits
     # avatar changes to roughly once per 10 minutes, so failures are non-fatal).
     try:
-        logo = Path(__file__).parent / "gemma_logo.jpg"
+        logo = Path(__file__).parent / "Phoebe.png"
         if logo.exists():
             await client.user.edit(avatar=logo.read_bytes())
-            print("[worker-bot] avatar set from gemma_logo.jpg", flush=True)
+            print("[worker-bot] avatar set from Phoebe.png", flush=True)
     except Exception as e:
         print(f"[worker-bot] avatar set skipped: {e}", flush=True)
 
@@ -2358,6 +2685,13 @@ async def on_message(msg: discord.Message):
         handled = await _handle_text_command(msg)
         if handled:
             return
+
+    # Pi.dev remote: if this channel has an active Pi connection, route the
+    # message to Pi instead of Phoebe's worker.
+    pi_conn = _get_pi_connection(msg.channel.id)
+    if pi_conn is not None:
+        await _route_to_pi(msg, pi_conn)
+        return
 
     # Mid-flight message: the channel already has a worker loop running.
     # Pop the 4-option dispatcher instead of starting a second session.
@@ -2481,6 +2815,30 @@ async def on_message(msg: discord.Message):
                 sent = await msg.channel.send(chunk)
             if sent is not None:
                 bot_msg_ids.append(str(sent.id))
+
+        # A3 auto-dictate: when the per-session toggle is ON and the user is
+        # currently in a voice channel, fire speak_voice for the final answer.
+        # Skipped for plan output (PlanReviewView already needs user attention)
+        # and when not in a VC (silent). Fire-and-forget so it doesn't block
+        # the in-flight clear in the finally below.
+        if not is_plan_output and _session_auto_dictate.get(session_id, False):
+            voice_state = msg.author.voice if getattr(msg, "guild", None) else None
+            voice_ch    = voice_state.channel if voice_state else None
+            if voice_ch:
+                async def _auto_dictate(text: str, vc_id: int) -> None:
+                    try:
+                        r = await _http.post(
+                            "http://localhost:4000/discord/speak_voice",
+                            json={"voice_channel_id": vc_id, "text": text, "block": True},
+                            timeout=180,
+                        )
+                        r.raise_for_status()
+                    except Exception as e:
+                        print(f"[worker-bot] auto-dictate failed: {e}", flush=True)
+                asyncio.create_task(
+                    _auto_dictate(answer, voice_ch.id),
+                    name=f"auto_dictate_{session_id}",
+                )
     finally:
         _channel_in_flight.pop(msg.channel.id, None)
         # Index the bot's rendered messages against this turn so a native

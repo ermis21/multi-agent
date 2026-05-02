@@ -188,19 +188,45 @@ class LocalModelsRefreshConfig(BaseModel):
 # ── Misc ───────────────────────────────────────────────────────────────────────
 
 class InflectionConfig(BaseModel):
+    """Inflection-nudging engine settings (B3).
+
+    Until B3 the `app/inflection.py` module didn't exist on disk and every
+    nudge attempt silently failed. This block configures the now-built
+    module with three detectable signal sources:
+
+    * `logprobs`         — token-entropy + top-2 logprob gap (uses the
+                           logprobs payload from the LLM call when available)
+    * `linguistic`       — hedging-marker word counts on the response text
+    * `uqlm_whitebox`    — UQLM MinTokenProbability + LengthNormalizedProbability
+                           scorers; runs on the SAME logprobs payload, no extra
+                           LLM call (cost is just math)
+
+    The legacy `inflection_mode` field is kept for back-compat — old configs
+    keep working. New configs should use `engine` which has a wider enum and
+    supersedes inflection_mode when both are present.
+    """
     model_config = ConfigDict(extra="forbid")
 
+    engine: Literal[
+        "off", "logprobs", "linguistic", "both", "uqlm_whitebox"
+    ] = "off"
     entropy_threshold: float = 1.5
     logprob_gap_threshold: float = 0.5
     top_logprobs: int = Field(5, ge=1)
     strong_marker_threshold: int = Field(1, ge=0)
     weak_marker_threshold: int = Field(3, ge=0)
     max_nudges_per_turn: int = Field(2, ge=0)
+    # UQLM-only: minimum normalized probability below which a nudge fires.
+    uqlm_min_norm_prob: float = 0.4
 
 
 class DebateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # B1: engine selector. "current" = original 2-advocate + judge in app/debate.py;
+    # "mad" = MAD-pattern affirmative + negative + moderator + judge fallback in
+    # app/debate_mad.py. Default "current" — flip after A/B validation.
+    engine: Literal["current", "mad"] = "current"
     checkpoint_messages: int = Field(4, ge=1)
     advocate_temperature: float = 0.4
     judge_temperature: float = 0.2
@@ -208,6 +234,11 @@ class DebateConfig(BaseModel):
     judge_model: str = "debate_judge"
     use_judge: bool = True
     max_total_messages: int = Field(12, ge=1)
+    # MAD-only: moderator decides per-round if convergence is reached.
+    moderator_temperature: float = 0.3
+    moderator_model: str = "debate_judge"  # share judge model by default
+    # State path for per-model reliability tracking (across-session learning).
+    history_path: str = "state/debate_history.jsonl"
 
 
 class LoggingConfig(BaseModel):
@@ -241,6 +272,20 @@ class ContextConfig(BaseModel):
     total_soft_cap: int = Field(12000, ge=0)
     tokenizer_backend: Literal["llama", "tiktoken", "heuristic"] = "llama"
     elision_strategy: Literal["head", "tail", "head_tail", "middle"] = "head_tail"
+    # B2 — compactor engine selector. "agent" spawns the legacy session_compactor
+    # sub-run (one full LLM round-trip per compaction). "lingua" uses LongLLMLingua
+    # to compress the uncompacted tail directly via a small BERT-tier scorer (no
+    # LLM call). Both paths must produce text containing `## RUNNING_SUMMARY` —
+    # the lingua path wraps its output with that header so downstream
+    # `_rebuild_session_context` stays unchanged. Default "agent" — flip after
+    # A/B verification on logged sessions.
+    compactor_engine: Literal["agent", "lingua"] = "agent"
+    # Lingua-only knobs (passed to LongLLMLingua; defaults match the paper).
+    lingua_target_token: int = Field(1500, ge=100)
+    lingua_rate: float = Field(0.5, ge=0.05, le=1.0)
+    # Compactor scheduling helpers (used by app/compactor.py).
+    compaction_interval_turns: int = Field(6, ge=1)
+    compaction_churn_seconds: float = Field(60.0, ge=0)
 
 
 # ── Dream (nightly prompt self-improvement) ──────────────────────────────────
@@ -335,6 +380,53 @@ class ToolsConfig(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+class TTSConfig(BaseModel):
+    """Discord TTS (A3). `backend` selects which engine the discord container
+    loads via `discord/tts_backend.py`. `voice` and per-backend model paths
+    are also overridable here so config_agent can tune them at runtime."""
+    model_config = ConfigDict(extra="forbid")
+
+    backend: Literal["piper", "kokoro_onnx", "kokoro_torch"] = "piper"
+    voice:   str = "af_bella"  # Kokoro default; ignored for Piper (model file is the voice)
+
+
+class SandboxConfig(BaseModel):
+    """Sandbox execution engine (B5). `current` keeps the working subprocess
+    path inside phoebe-sandbox; `microsandbox` routes shell_exec into a
+    persistent microVM via the embedded microsandbox SDK.
+
+    The microsandbox path is OPT-IN. Activating it requires:
+      1. Installing the `microsandbox` PyPI package in sandbox/requirements.txt.
+      2. Mounting `/dev/kvm` into the phoebe-sandbox container in docker-compose.yml.
+      3. Setting `cfg.sandbox.engine: microsandbox` here.
+    Any failure in the microsandbox path falls back to the legacy `current`
+    engine with a logged warning so a misconfigured opt-in never breaks
+    shell_exec for the agent."""
+    model_config = ConfigDict(extra="forbid")
+
+    engine: Literal["current", "microsandbox"] = "current"
+    image:  str = "alpine:latest"  # OCI image microsandbox boots from when engine=microsandbox
+
+
+# ── Pi.dev Remote Control ─────────────────────────────────────────────────────
+
+class RemoteConfig(BaseModel):
+    """Pi.dev remote control bridge. Pi connects OUT to Phoebe via WebSocket.
+    Phoebe listens on ws_port and multiplexes multiple Pi instances on a single port.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    ws_port: int = Field(8090, ge=1, le=65535)
+    ws_host: str = "phoebe-api"
+    default_model: str | None = None
+    default_thinking: Literal["off", "minimal", "low", "medium", "high", "xhigh"] = "medium"
+    session_dir: str = "/state/pi_sessions"
+    auto_compaction: bool = True
+    auto_retry: bool = True
+    max_tool_timeout_s: int = Field(120, ge=1)
+
+
 # ── Root ──────────────────────────────────────────────────────────────────────
 
 class RootConfig(BaseModel):
@@ -349,11 +441,14 @@ class RootConfig(BaseModel):
     discord_moderator: DiscordModeratorConfig = Field(default_factory=DiscordModeratorConfig)
     local_models_refresh: LocalModelsRefreshConfig = Field(default_factory=LocalModelsRefreshConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    tts: TTSConfig = Field(default_factory=TTSConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     inflection: InflectionConfig = Field(default_factory=InflectionConfig)
     debate: DebateConfig = Field(default_factory=DebateConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     dream: DreamConfig = Field(default_factory=DreamConfig)
+    remote: RemoteConfig = Field(default_factory=RemoteConfig)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

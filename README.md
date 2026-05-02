@@ -113,6 +113,17 @@ make doctor      # Full subsystem diagnostics
 | `GET` | `/internal/diagnostics` | Deterministic subsystem health check |
 | `GET` | `/models` | Proxy llama.cpp models endpoint |
 
+### Pi.dev Remote Control
+
+| Method | Path | Description |
+|---|---|---|
+| `WS` | `/v1/remote/ws?channel_id=<id>` | WebSocket entry for Pi RPC connections |
+| `GET` | `/v1/remote/status` | List all active Pi connections |
+| `GET` | `/v1/remote/channel/{id}` | Get Pi connection for a Discord channel |
+| `POST` | `/v1/remote/command` | Send RPC command to Pi (prompt/steer/bash/etc.) |
+| `POST` | `/v1/remote/ui_response` | Respond to Pi extension UI dialogs |
+| `POST` | `/v1/remote/detach/{id}` | Detach Pi from a Discord channel |
+
 **Example:**
 
 ```bash
@@ -230,6 +241,24 @@ Two cron jobs start automatically with `phoebe-api`:
 | Discord Moderation | 10:00 every 3 days | Organises channels, archives inactive ones |
 | Dream Run | 04:00 daily (off by default) | Nightly prompt self-improvement; edits `config/prompts/` via phrase-level provenance. Requires `cfg.dream.enabled: true` and all four dream diagnostic probes green |
 | Dream Digest | 10:00 daily (off by default) | Emails yesterday's dream report to `cfg.dream.email.to`; Discord fallback on SMTP failure |
+
+---
+
+## Pi.dev Remote Control
+
+Attach active Pi.dev coding sessions to the Phoebe Discord UI for real-time monitoring and control. Pi connects **OUT** to Phoebe via WebSocket, Phoebe multiplexes multiple Pi instances on a single port, and renders events to Discord.
+
+```bash
+# Connect Pi from your machine:
+node rpc-proxy.js --url ws://your-phoebe-host:8090/v1/remote/ws?channel_id=YOUR_CHANNEL_ID
+
+# Or with a specific model:
+node rpc-proxy.js --url ws://your-phoebe-host:8090/v1/remote/ws?channel_id=YOUR_CHANNEL_ID --pi-args "--model anthropic/claude-sonnet-4-20250514"
+```
+
+Once connected, messages in that Discord channel route to Pi as `prompt` (idle) or `steer` (streaming). Use `/remote` slash commands for status, abort, bash, model switch, compact, etc.
+
+See [docs/remote-control.md](docs/remote-control.md) for full documentation.
 
 ---
 
