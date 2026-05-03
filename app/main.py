@@ -16,6 +16,7 @@ Endpoints:
 
 import asyncio
 import json
+import socket
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -1356,3 +1357,68 @@ async def remote_detach_all():
         await conn.stop()
         results.append(conn.conn_id)
     return {"ok": True, "detached": results}
+
+
+@app.post("/v1/remote/create-channel")
+async def remote_create_channel():
+    """Create a new Discord channel for Pi remote control.
+
+    Returns the channel_id and WebSocket URL for the Pi extension to connect to.
+    """
+    import os
+    guild_id = os.environ.get("DISCORD_GUILD_ID", "")
+
+    if not guild_id:
+        raise HTTPException(500, "DISCORD_GUILD_ID not configured")
+
+    # Resolve Discord URL (same logic as bridge.py)
+    candidates = [
+        os.environ.get("DISCORD_URL", "http://phoebe-discord:4000"),
+        "http://phoebe-discord-pycord:4000",
+    ]
+    discord_url = None
+    for url in candidates:
+        host = url.replace("http://", "").replace("https://", "").split(":")[0]
+        try:
+            socket.getaddrinfo(host, 4000)
+            discord_url = url
+            break
+        except socket.gaierror:
+            continue
+    if discord_url is None:
+        raise HTTPException(500, "Cannot resolve Discord hostname")
+
+    ts = datetime.now(timezone.utc).strftime("%m%d-%H%M")
+    channel_name = f"pi-{ts}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{discord_url}/discord/create_channel",
+                json={
+                    "guild_id": guild_id,
+                    "name": channel_name,
+                    "topic": "Pi.dev remote control",
+                    "bot": "worker",
+                },
+            )
+            data = resp.json()
+            if not data.get("ok"):
+                raise HTTPException(500, f"Failed to create channel: {data.get('error', 'unknown')}")
+
+            channel_id = int(data["channel_id"])
+            ws_host = os.environ.get("REMOTE_WS_HOST", "localhost")
+            ws_port = os.environ.get("REMOTE_WS_PORT", "8090")
+            ws_url = f"ws://{ws_host}:{ws_port}/v1/remote/ws?channel_id={channel_id}"
+
+            return {
+                "ok": True,
+                "channel_id": channel_id,
+                "channel_name": data["name"],
+                "ws_url": ws_url,
+                "connect_command": f"/connect-phoebe {channel_id} {ws_url}",
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to create channel: {e}")

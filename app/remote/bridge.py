@@ -89,6 +89,20 @@ async def _discord_send_embed(channel_id: int, embed: dict) -> bool:
         return False
 
 
+async def _rename_channel(channel_id: int, name: str) -> bool:
+    """Rename a Discord channel."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{_DISCORD_URL}/discord/edit_channel",
+                json={"channel_id": str(channel_id), "name": name[:100]},
+            )
+            return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"Discord channel rename failed for channel {channel_id}: {e}")
+        return False
+
+
 # ── Event mapper: Pi RPC events → Discord messages ───────────────────────────
 
 def _format_tool_args(args: dict) -> str:
@@ -169,9 +183,11 @@ class EventMapper:
 
         try:
             if event_type == "agent_start":
+                self.conn.is_streaming = True
                 await _discord_send(channel_id, "-# 🚀 Agent started")
 
             elif event_type == "agent_end":
+                self.conn.is_streaming = False
                 await _discord_send(channel_id, "-# ✈️ Agent idle")
 
             elif event_type == "turn_start":
@@ -268,7 +284,29 @@ class EventMapper:
                 error = event.get("error", "?")
                 await _discord_send(channel_id, f"-# ⚠️ Extension error ({ext_path}): {error[:200]}")
 
-            # message_start, message_end — informational, skip for Discord
+            elif event_type == "message_start":
+                msg = event.get("message", {})
+                # Capture model info from first assistant message
+                if msg.get("role") == "assistant" and not self.conn._model:
+                    self.conn._model = msg.get("model", "")
+                    provider = msg.get("provider", "")
+                    model_display = f"{provider}/{self.conn._model}" if provider else self.conn._model
+                    await _discord_send(channel_id, f"-# 🤖 Model: {model_display}")
+
+                # Rename channel based on first user prompt
+                if msg.get("role") == "user" and not self.conn._session_name:
+                    content = msg.get("content", [])
+                    if content:
+                        prompt = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+                        # Truncate and sanitize for channel name
+                        title = prompt.strip()[:50]
+                        if len(title) > 100:
+                            title = title[:97] + "…"
+                        if title:
+                            self.conn._session_name = title
+                            await _rename_channel(channel_id, title)
+
+            # message_end — informational, skip for Discord
         except Exception as e:
             logger.error(f"Event mapping failed for {event_type}: {e}", exc_info=True)
 
@@ -559,6 +597,12 @@ async def handle_pi_connection(
     _connections[conn.conn_id] = conn
     await conn.start()
     logger.info(f"Pi connection {conn.conn_id} established for channel {channel_id}")
+
+    # Send initial context to Discord
+    await _discord_send(channel_id, f"-# 🔗 Pi connected  id=`{conn.conn_id}`")
+    await _discord_send(channel_id, "-# 💡 Send messages here to control Pi. Pi will respond in this channel.")
+    await _discord_send(channel_id, "-# 📖 Use `/remote` slash commands for status, abort, bash, model, etc.")
+
     return conn
 
 

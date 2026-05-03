@@ -48,23 +48,30 @@ Or load it temporarily: `pi -e /path/to/phoebe-connect.ts`
 
 ### 2. Connect from Pi
 
-In Pi's TUI, type:
+**TUI mode (recommended):** In Pi's TUI, type:
 
 ```
-/connect-phoebe 123456789012345678          # connect to localhost:8090
-/connect-phoebe 123456789012345678 ws://phoebe:8090  # custom URL
+/connect-phoebe                             # auto-create Discord channel
+/connect-phoebe ws://phoebe:8090            # auto-create on custom Phoebe URL
+/connect-phoebe 1234567890                  # connect to existing channel
+/connect-phoebe 1234567890 ws://phoebe:8090 # existing channel + custom URL
 ```
 
-Replace `123456789012345678` with your Discord channel ID (find in `.env`):
+**RPC/headless mode:** WebSocket events don't fire reliably in Pi's `--mode rpc` extension context. Use the `rpc-proxy.js` wrapper instead:
+
 ```bash
-grep DISCORD_WORKER_CHANNELS .env
+# Auto-create channel and connect via rpc-proxy.js
+curl -s -X POST http://localhost:8090/v1/remote/create-channel | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'PHOEBE_CHANNEL_ID={d[\"channel_id\"]}')"
+# Then: PHOEBE_CHANNEL_ID=<id> node rpc-proxy.js --url ws://localhost:8090
 ```
+
+No args = creates a new Discord channel automatically and connects to it.
 
 ### 3. Pi extension commands
 
 | Command | Description |
 |---------|-------------|
-| `/connect-phoebe <channel_id> [url]` | Connect to Phoebe |
+| `/connect-phoebe [url_or_channel_id] [url]` | Connect (auto-creates channel if no ID) |
 | `/disconnect-phoebe` | Disconnect from Phoebe |
 | `/phoebe-status` | Show connection status |
 

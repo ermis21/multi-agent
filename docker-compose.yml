@@ -46,12 +46,89 @@ services:
     logging: *logging
 
   # ── Discord Bots ──────────────────────────────────────────────────────────
-  phoebe-discord:
+  # phoebe-discord:
+  #   build:
+  #     context: ./discord
+  #     dockerfile: Dockerfile
+  #     network: host
+  #   container_name: phoebe-discord
+  #   environment:
+  #     DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
+  #     DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
+  #     DISCORD_TOKEN_MOD: "${DISCORD_TOKEN_MOD:-}"
+  #     DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
+  #     DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
+  #     DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
+  #     DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
+  #     DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Phoebe}"
+  #     DISCORD_CONFIG_NICKNAME: "${DISCORD_CONFIG_NICKNAME:-Phoebe-config}"
+  #     DISCORD_MOD_NICKNAME: "${DISCORD_MOD_NICKNAME:-Phoebe_mod}"
+  #     DISCORD_MAX_MESSAGE_LENGTH: "1900"
+  #     PHOEBE_API_URL: "http://phoebe-vpn:8090"
+  #     # E2E scenario runner (optional; empty in production)
+  #     DISCORD_TEST_CHANNEL_ID: "${DISCORD_TEST_CHANNEL_ID:-}"
+  #     DISCORD_TEST_DRIVER_USER_ID: "${DISCORD_TEST_DRIVER_USER_ID:-}"
+  #     PHOEBE_ENABLE_TEXT_COMMANDS: "${PHOEBE_ENABLE_TEXT_COMMANDS:-}"
+  #     # "1" = keep scenario messages in the channel (default); "0" = delete bot
+  #     # messages after each scenario (CI-style).
+  #     PHOEBE_E2E_PERSIST_MESSAGES: "${PHOEBE_E2E_PERSIST_MESSAGES:-1}"
+  #   networks:
+  #     - phoebe-net
+  #   healthcheck:
+  #     test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 15s
+  #   volumes:
+  #     # Persistent bot state — session IDs and user modes survive container restarts
+  #     - ./state/discord:/app/state
+  #     # E2E scenario runner — mounted read-only so `make e2e` works without rebuild
+  #     - ./discord/e2e_scenarios.py:/app/e2e_scenarios.py:ro
+  #     # E2E scenarios need to write a probe SKILL.md to exercise skill-discovery
+  #     - ./config/skills:/config/skills
+  #     # Session state files — read-only hydration source for bot on startup
+  #     - ./state/sessions:/state/sessions:ro
+  #     # Source mounts so bot_worker/bot_config/bot_mod edits don't require a rebuild
+  #     - ./discord/bot_worker.py:/app/bot_worker.py
+  #     - ./discord/bot_config.py:/app/bot_config.py
+  #     - ./discord/bot_mod.py:/app/bot_mod.py
+  #     - ./discord/main.py:/app/main.py
+  #     - ./discord/utils.py:/app/utils.py
+  #     - ./discord/views.py:/app/views.py
+  #     - ./discord/tts_backend.py:/app/tts_backend.py
+  #     # Bot avatar assets — mounted so updates don't require an image rebuild.
+  #     - ./discord/Phoebe.png:/app/Phoebe.png:ro
+  #     - ./discord/Phoebe_config.png:/app/Phoebe_config.png:ro
+  #     - ./discord/Phoebe_mod.png:/app/Phoebe_mod.png:ro
+  #   restart: unless-stopped
+  #   logging: *logging
+  #   depends_on:
+  #     phoebe-api:
+  #       condition: service_healthy
+
+  # ── Discord Bots — Pycord variant (A2 PR2) ───────────────────────────────
+  # Parallel to phoebe-discord. Profile-gated so it does NOT auto-start.
+  # Swap procedure (full instructions in discord/pycord/README.md):
+  #   1. docker compose stop phoebe-discord
+  #   2. docker compose --profile pycord up -d phoebe-discord-pycord
+  # Rollback procedure:
+  #   1. docker compose stop phoebe-discord-pycord
+  #   2. docker compose start phoebe-discord
+  #
+  # Both containers share state/discord and config/skills volumes so bot
+  # state, session IDs, plans, and skills are continuous across the swap.
+  # Different host port (4001 → 4000) so neither collides if both happen
+  # to be running briefly. The Discord tokens are the same — only ONE
+  # container should be running at a time, otherwise both will try to
+  # connect to Discord with the same identity (Discord rejects the second).
+  phoebe-discord-pycord:
+    profiles: [pycord]
     build:
-      context: ./discord
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: discord/pycord/Dockerfile
       network: host
-    container_name: phoebe-discord
+    container_name: phoebe-discord-pycord
     environment:
       DISCORD_TOKEN_WORKER: "${DISCORD_TOKEN_WORKER:-}"
       DISCORD_TOKEN_CONFIG: "${DISCORD_TOKEN_CONFIG:-}"
@@ -60,18 +137,26 @@ services:
       DISCORD_WORKER_CHANNELS: "${DISCORD_WORKER_CHANNELS:-}"
       DISCORD_CONFIG_CHANNELS: "${DISCORD_CONFIG_CHANNELS:-}"
       DISCORD_ALLOWED_USER_IDS: "${DISCORD_ALLOWED_USER_IDS:-}"
-      DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Gemma}"
+      DISCORD_WORKER_NICKNAME: "${DISCORD_WORKER_NICKNAME:-Phoebe}"
+      DISCORD_CONFIG_NICKNAME: "${DISCORD_CONFIG_NICKNAME:-Phoebe-config}"
+      DISCORD_MOD_NICKNAME: "${DISCORD_MOD_NICKNAME:-Phoebe_mod}"
       DISCORD_MAX_MESSAGE_LENGTH: "1900"
       PHOEBE_API_URL: "http://phoebe-vpn:8090"
-      # E2E scenario runner (optional; empty in production)
       DISCORD_TEST_CHANNEL_ID: "${DISCORD_TEST_CHANNEL_ID:-}"
       DISCORD_TEST_DRIVER_USER_ID: "${DISCORD_TEST_DRIVER_USER_ID:-}"
       PHOEBE_ENABLE_TEXT_COMMANDS: "${PHOEBE_ENABLE_TEXT_COMMANDS:-}"
-      # "1" = keep scenario messages in the channel (default); "0" = delete bot
-      # messages after each scenario (CI-style).
       PHOEBE_E2E_PERSIST_MESSAGES: "${PHOEBE_E2E_PERSIST_MESSAGES:-1}"
+      # Which bot identity does voice playback. {worker,mod,config}.
+      # Default `mod` for now while diagnosing the UDP egress timeout —
+      # mod has Manage Channels + Manage Nicknames perms so this also
+      # tests whether the issue is bot-perms vs network.
+      DISCORD_VOICE_BOT: "${DISCORD_VOICE_BOT:-mod}"
     networks:
       - phoebe-net
+    ports:
+      # Loopback-only host port so curl localhost:4001/health works during
+      # validation without exposing the gateway publicly.
+      - "127.0.0.1:4001:4000"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health', timeout=3)"]
       interval: 10s
@@ -79,21 +164,23 @@ services:
       retries: 5
       start_period: 15s
     volumes:
-      # Persistent bot state — session IDs and user modes survive container restarts
       - ./state/discord:/app/state
-      # E2E scenario runner — mounted read-only so `make e2e` works without rebuild
-      - ./discord/e2e_scenarios.py:/app/e2e_scenarios.py:ro
-      # E2E scenarios need to write a probe SKILL.md to exercise skill-discovery
       - ./config/skills:/config/skills
-      # Session state files — read-only hydration source for bot on startup
       - ./state/sessions:/state/sessions:ro
-      # Source mounts so bot_worker/bot_config/bot_mod edits don't require a rebuild
-      - ./discord/bot_worker.py:/app/bot_worker.py
-      - ./discord/bot_config.py:/app/bot_config.py
-      - ./discord/bot_mod.py:/app/bot_mod.py
-      - ./discord/main.py:/app/main.py
+      # Source mounts — point at discord/pycord/* so edits don't require rebuild.
+      # Phase 1 only mounts main.py; phases 2a–2e add the rest as they migrate.
+      - ./discord/pycord/main.py:/app/main.py
+      - ./discord/pycord/bot_config.py:/app/bot_config.py
+      - ./discord/pycord/bot_mod.py:/app/bot_mod.py
+      - ./discord/pycord/bot_worker.py:/app/bot_worker.py
+      - ./discord/pycord/views.py:/app/views.py
       - ./discord/utils.py:/app/utils.py
-      - ./discord/views.py:/app/views.py
+      - ./discord/tts_backend.py:/app/tts_backend.py
+      - ./discord/e2e_scenarios.py:/app/e2e_scenarios.py:ro
+      # Bot avatar assets — mounted so updates don't require an image rebuild.
+      - ./discord/Phoebe.png:/app/Phoebe.png:ro
+      - ./discord/Phoebe_config.png:/app/Phoebe_config.png:ro
+      - ./discord/Phoebe_mod.png:/app/Phoebe_mod.png:ro
     restart: unless-stopped
     logging: *logging
     depends_on:
@@ -117,6 +204,9 @@ services:
       - llama-api_default
     ports:
       - "8090:8090"
+      # VPN-side llama (10.64.82.60:8000) bridged through socat in entrypoint.sh.
+      # Loopback-only on the host; expose to tailnet peers via `tailscale serve`.
+      - "127.0.0.1:8000:8000"
     sysctls:
       - net.ipv4.conf.all.rp_filter=2
     healthcheck:
@@ -171,6 +261,12 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Live-reload: code changes take effect on next request without rebuild
       - ./sandbox:/app/sandbox
+    # B5 microsandbox engine OPT-IN — uncomment to activate microVM-backed shell_exec.
+    # 1. Add `microsandbox` to sandbox/requirements.txt and rebuild phoebe-sandbox.
+    # 2. Set `cfg.sandbox.engine: microsandbox` in config.yaml.
+    # 3. Uncomment the devices block below so /dev/kvm is accessible.
+    # devices:
+    #   - /dev/kvm:/dev/kvm
     network_mode: "service:phoebe-vpn"
     # No ports: section — not exposed to host, internal network only
     mem_limit: 1g
@@ -211,6 +307,7 @@ services:
       # so it is reachable on localhost rather than by hostname.
       SANDBOX_URL: "http://localhost:9000"
       DISCORD_URL: "http://phoebe-discord:4000"
+      DISCORD_GUILD_ID: "${DISCORD_GUILD_ID:-}"
       # Path overrides (these paths are inside the container)
       CONFIG_PATH: "/app/config/config.yaml"
       AGENTS_CONFIG_PATH: "/app/config/agents.yaml"
@@ -221,6 +318,10 @@ services:
       CACHE_DIR: "/cache"
       PROMPTS_DIR: "/config/prompts"
       GENERATED_DIR: "/cache/prompts"
+      # B6 Phoenix observability — uncomment to enable. Off by default; on means
+      # all LLM calls + tool dispatches send OpenInference spans to phoebe-phoenix:6006.
+      # PHOEBE_OBSERVABILITY_ENABLED: "1"
+      # PHOENIX_OTLP_ENDPOINT: "http://phoebe-phoenix:6006/v1/traces"
     volumes:
       # User-edited config: identity, skills, prompts, *.yaml
       - ./config:/config
@@ -258,6 +359,27 @@ services:
         condition: service_healthy
       phoebe-sandbox:
         condition: service_healthy
+
+  # B6 — Arize Phoenix self-hosted observability for OpenInference traces.
+  # File-backed by default (no Postgres / ClickHouse needed). Bound to
+  # localhost only — VPN-internal access, never exposed publicly.
+  # UI: http://localhost:6006
+  # OTLP: http://phoebe-phoenix:4317 (gRPC) / http://phoebe-phoenix:6006/v1/traces (HTTP)
+  phoebe-phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: phoebe-phoenix
+    ports:
+      - "127.0.0.1:6006:6006"   # web UI on host loopback only
+    environment:
+      PHOENIX_PORT: "6006"
+      PHOENIX_GRPC_PORT: "4317"
+      PHOENIX_WORKING_DIR: "/data"
+    volumes:
+      - ./state/phoenix:/data
+    networks:
+      - phoebe-net
+    restart: unless-stopped
+    logging: *logging
 
 networks:
   phoebe-net:

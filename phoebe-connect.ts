@@ -2,8 +2,10 @@
  * phoebe-connect — Pi extension to bridge Pi sessions to Phoebe + Discord.
  *
  * Usage in Pi:
- *   /connect-phoebe 123456789012345678          # connect to localhost:8090
- *   /connect-phoebe 123456789012345678 ws://phoebe:8090  # custom URL
+ *   /connect-phoebe                             # auto-create channel on localhost:8090
+ *   /connect-phoebe ws://phoebe:8090            # auto-create channel on custom URL
+ *   /connect-phoebe 1234567890                  # connect to existing channel
+ *   /connect-phoebe 1234567890 ws://phoebe:8090 # existing channel + custom URL
  *   /disconnect-phoebe                          # disconnect
  *   /phoebe-status                              # connection status
  *
@@ -329,11 +331,18 @@ export default function (piApi: ExtensionAPI) {
     // Session events
     pi.on("session_start", async (_event, extensionCtx) => {
         if (extensionCtx) ctx = extensionCtx;
+        // Auto-connect if PHOEBE_CHANNEL_ID is set (for RPC/headless mode)
+        const channelId = process.env.PHOEBE_CHANNEL_ID;
+        const phoebeUrl = process.env.PHOEBE_URL;
+        if (channelId) {
+            console.error(`[phoebe-connect] Auto-connecting to channel ${channelId}`);
+            connect(channelId, phoebeUrl);
+        }
     });
 
     // /connect-phoebe command
     pi.registerCommand("connect-phoebe", {
-        description: "Connect this Pi session to Phoebe + Discord",
+        description: "Connect this Pi session to Phoebe + Discord. No args = auto-create channel.",
         getArgumentCompletions: (prefix: string) => {
             // No completions for channel IDs
             return null;
@@ -341,21 +350,73 @@ export default function (piApi: ExtensionAPI) {
         handler: async (args, extensionCtx) => {
             ctx = extensionCtx;
 
-            const parts = args.trim().split(/\s+/);
-            const channelId = parts[0];
-            const phoebeUrl = parts[1] || undefined;
+            const trimmed = args.trim();
 
-            if (!channelId) {
-                extensionCtx.ui.notify(
-                    "Usage: /connect-phoebe <channel_id> [ws://phoebe:8090]",
-                    "error"
-                );
+            if (!trimmed) {
+                // No args: auto-create channel on localhost:8090
+                await autoCreateAndConnect("ws://localhost:8090", extensionCtx);
                 return;
             }
 
+            const parts = trimmed.split(/\s+/);
+            const firstArg = parts[0];
+            const secondArg = parts[1] || undefined;
+
+            // If first arg looks like a URL, treat it as phoebe_url and auto-create
+            if (firstArg.startsWith("ws://") || firstArg.startsWith("wss://")) {
+                await autoCreateAndConnect(firstArg, extensionCtx);
+                return;
+            }
+
+            // Otherwise: first arg is channel_id, second is optional phoebe_url
+            const channelId = firstArg;
+            const phoebeUrl = secondArg;
             connect(channelId, phoebeUrl);
         },
     });
+
+    // Helper: create a Discord channel via Phoebe API, then connect
+    async function autoCreateAndConnect(phoebeWsUrl: string, extensionCtx: ExtensionContext) {
+        // Convert ws:// to http:// for API call
+        const apiUrl = phoebeWsUrl.replace("ws://", "http://").replace("wss://", "https://");
+
+        try {
+            extensionCtx.ui.setStatus("phoebe", "Creating Discord channel...");
+            const response = await fetch(`${apiUrl}/v1/remote/create-channel`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+            });
+
+            if (!response.ok) {
+                const err = await response.text();
+                extensionCtx.ui.notify(`Failed to create channel: ${err}`, "error");
+                extensionCtx.ui.setStatus("phoebe", "");
+                return;
+            }
+
+            const data = await response.json();
+            if (!data.ok) {
+                extensionCtx.ui.notify(`Failed to create channel: ${data.error}`, "error");
+                extensionCtx.ui.setStatus("phoebe", "");
+                return;
+            }
+
+            extensionCtx.ui.notify(
+                `Created channel #${data.channel_name} (${data.channel_id})`,
+                "success"
+            );
+
+            // Connect to the new channel
+            connect(data.channel_id.toString(), phoebeWsUrl);
+
+        } catch (err) {
+            extensionCtx.ui.notify(
+                `Cannot reach Phoebe at ${apiUrl}. Is it running?`,
+                "error"
+            );
+            extensionCtx.ui.setStatus("phoebe", "");
+        }
+    }
 
     // /disconnect-phoebe command
     pi.registerCommand("disconnect-phoebe", {
