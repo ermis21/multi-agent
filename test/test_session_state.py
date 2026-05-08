@@ -70,7 +70,7 @@ def test_record_tool_detects_skill_file_read():
     acc = TurnAccumulator()
     acc.record_tool("file_read", {"path": "/config/skills/log-triage/SKILL.md"}, error=False)
     acc.record_tool("file_read", {"path": "config/skills/other/SKILL.md"}, error=False)
-    acc.record_tool("file_read", {"path": "/project/app/main.py"}, error=False)
+    acc.record_tool("file_read", {"path": "/Phebe/app/main.py"}, error=False)
     assert acc.skills_invoked == ["log-triage", "other"]
 
 

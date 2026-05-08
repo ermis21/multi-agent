@@ -50,7 +50,7 @@ def test_missing_end_marker_surfaces_status_event(client):
 
     result = stream_chat(
         client,
-        "read /project/README.md, then summarize it in one paragraph",
+        "read /Phebe/README.md, then summarize it in one paragraph",
         mode="build",
         timeout=120,
     )

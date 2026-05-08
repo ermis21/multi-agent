@@ -32,7 +32,7 @@ def test_normalize_rel_strips_leading_slash():
 
 def test_plan_mode_rejects_write_to_other_paths(monkeypatch):
     monkeypatch.setattr(
-        "app.mcp_client.get_config",
+        "app.config_loader.get_config",
         lambda: {"approval": {"plan": {"auto_allow": {"tools": [], "paths": []},
                                          "ask_user": [], "auto_fail": []}}},
     )
@@ -54,7 +54,7 @@ def test_plan_mode_rejects_write_to_other_paths(monkeypatch):
 def test_plan_mode_allows_write_to_session_plan_file(monkeypatch):
     """file_write to the session plan file auto-allows (no Discord hit, no ask_user)."""
     monkeypatch.setattr(
-        "app.mcp_client.get_config",
+        "app.config_loader.get_config",
         lambda: {"approval": {"plan": {"auto_allow": {"tools": [], "paths": []},
                                          "ask_user": ["file_write"], "auto_fail": []}}},
     )
@@ -83,7 +83,7 @@ def test_plan_mode_allows_write_to_session_plan_file(monkeypatch):
 def test_plan_mode_rejects_write_config(monkeypatch):
     """write_config has no `path` — auto-fails with the scoping message."""
     monkeypatch.setattr(
-        "app.mcp_client.get_config",
+        "app.config_loader.get_config",
         lambda: {"approval": {"plan": {"auto_allow": {"tools": [], "paths": []},
                                          "ask_user": ["write_config"], "auto_fail": []}}},
     )
@@ -104,7 +104,7 @@ def test_plan_mode_rejects_write_config(monkeypatch):
 def test_plan_mode_write_scope_does_not_affect_build_mode(monkeypatch):
     """Build mode is unaffected by the plan-mode gate (still uses ask_user / auto_allow)."""
     monkeypatch.setattr(
-        "app.mcp_client.get_config",
+        "app.config_loader.get_config",
         lambda: {"approval": {"build": {"auto_allow": {"tools": ["create_dir"], "paths": []},
                                           "ask_user": ["create_dir"], "auto_fail": []}}},
     )

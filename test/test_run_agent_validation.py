@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.mcp_client import _run_agent_tool
+from app.tools.run_agent import handle as _run_agent_tool
 
 
 def _run(coro):
@@ -16,7 +16,7 @@ def _run(coro):
 
 
 def test_missing_role_error_lists_available_agents():
-    result = _run(_run_agent_tool({"task": "x"}, "sid_x", ["skill_builder", "coding_agent"]))
+    result = _run(_run_agent_tool({"task": "x", "spawnable_agents": ["skill_builder", "coding_agent"]}, "sid_x", "build", None))
     assert "error" in result
     err = result["error"]
     assert "role" in err
@@ -27,13 +27,13 @@ def test_missing_role_error_lists_available_agents():
 
 
 def test_missing_task_error_lists_available_agents():
-    result = _run(_run_agent_tool({"role": "skill_builder"}, "sid_x", ["skill_builder"]))
+    result = _run(_run_agent_tool({"role": "skill_builder", "spawnable_agents": ["skill_builder"]}, "sid_x", "build", None))
     assert "error" in result
     assert "task" in result["error"]
 
 
 def test_unknown_role_error_lists_alternatives():
-    result = _run(_run_agent_tool({"role": "skill_author", "task": "x"}, "sid_x", ["skill_builder"]))
+    result = _run(_run_agent_tool({"role": "skill_author", "task": "x", "spawnable_agents": ["skill_builder"]}, "sid_x", "build", None))
     assert "error" in result
     assert "skill_builder" in result["error"]
 
@@ -51,8 +51,8 @@ def test_agent_name_alias_coerces_to_role(monkeypatch):
     monkeypatch.setattr(agents_mod, "run_agent_role", _fake_run_agent_role, raising=False)
 
     result = _run(_run_agent_tool(
-        {"agent_name": "skill_builder", "task": "draft a skill"},
-        "sid_coerce", ["skill_builder"],
+        {"agent_name": "skill_builder", "task": "draft a skill", "spawnable_agents": ["skill_builder"]},
+        "sid_coerce", "build", None,
     ))
     assert "error" not in result, result
     assert captured["role"] == "skill_builder"
@@ -69,6 +69,6 @@ def test_other_aliases_also_coerce(monkeypatch):
 
     for alias in ("agent", "sub_agent", "name"):
         result = _run(_run_agent_tool(
-            {alias: "coding_agent", "task": "x"}, "sid", ["coding_agent"],
+            {alias: "coding_agent", "task": "x", "spawnable_agents": ["coding_agent"]}, "sid", "build", None,
         ))
         assert "error" not in result, f"alias {alias!r} failed: {result}"
