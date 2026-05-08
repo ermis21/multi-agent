@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from app.config_loader import get_config
 from app.sessions.state import SESSIONS_DIR, SessionState
 
 
@@ -200,14 +201,19 @@ def _relative_active_path(sid: str) -> str:
 
 
 async def run_compaction(session_id: str) -> dict[str, Any]:
-    """Spawn a session_compactor sub-run over the uncompacted tail.
+    """Compact the uncompacted tail using whichever engine cfg selects.
 
     Returns a small telemetry dict for tests and diagnostics; never raises.
     Held under _lock_for(session_id) so concurrent triggers coalesce.
+
+    Engines (cfg.context.compactor_engine):
+      "agent"  → spawn `session_compactor` sub-agent (legacy, default).
+      "lingua" → LongLLMLingua compresses the tail in-process (B2). Falls
+                 back to "agent" if the package isn't installed so the
+                 toggle never silently breaks compaction.
     """
     # Lazy imports — avoid circular (entrypoints -> compactor would loop).
     from app.sessions.logger import get_session
-    from app.entrypoints import run_agent_role
 
     lock = _lock_for(session_id)
     if lock.locked():
@@ -215,6 +221,9 @@ async def run_compaction(session_id: str) -> dict[str, Any]:
         return {"session_id": session_id, "skipped": "already_locked"}
 
     async with lock:
+        cfg = get_config()
+        engine = (cfg.get("context") or {}).get("compactor_engine", "agent")
+
         state = SessionState.load_or_create(session_id)
         turns = get_session(session_id)
         finals = [t for t in turns if t.get("role") == "final"]
@@ -225,35 +234,112 @@ async def run_compaction(session_id: str) -> dict[str, Any]:
             return {"session_id": session_id, "skipped": "nothing_to_compact"}
 
         scope = _format_scope_for_prompt(session_id, turns, covers, turn_count)
-        sub_sid = f"{session_id}_compactor"
-        try:
-            result = await run_agent_role(
-                "session_compactor",
-                {
-                    "messages": [{"role": "user", "content": "Compact the session transcript below into the two-section contract."}],
-                    "plan_context": scope,
-                    "_source_trigger": {"type": "sub_agent", "ref": session_id},
-                },
-                sub_sid,
-            )
-        except Exception as e:
-            return {"session_id": session_id, "error": f"role_run_failed: {e}"}
 
-        body = _extract_body(result)
+        if engine == "lingua":
+            body, lingua_meta = _compact_with_lingua(scope, cfg)
+            if body is None:
+                # Fallback: lingua not installed or failed → agent path.
+                print(f"[compactor] lingua engine fell back to agent: {lingua_meta.get('error')}",
+                      flush=True)
+                body = await _compact_with_agent(scope, session_id)
+                engine_used = "agent_fallback"
+            else:
+                engine_used = "lingua"
+        else:
+            body = await _compact_with_agent(scope, session_id)
+            engine_used = "agent"
+
         if not body or "## RUNNING_SUMMARY" not in body:
-            return {"session_id": session_id, "error": "malformed_output"}
+            return {"session_id": session_id, "error": "malformed_output", "engine": engine_used}
 
         active = _write_active_line(session_id, body)
-        # Reload state in case the sub-run touched the same cache entry.
         state = SessionState.load_or_create(session_id)
         state.record_compaction(turn_count, _relative_active_path(session_id))
         state.save()
         return {
-            "session_id": session_id,
-            "covers_up_to_turn": turn_count,
-            "active_path": str(active),
-            "body_chars": len(body),
+            "session_id":         session_id,
+            "covers_up_to_turn":  turn_count,
+            "active_path":        str(active),
+            "body_chars":         len(body),
+            "engine":             engine_used,
         }
+
+
+async def _compact_with_agent(scope: str, session_id: str) -> str:
+    """Legacy agent-based compaction. Spawns session_compactor sub-run."""
+    from app.entrypoints import run_agent_role
+    sub_sid = f"{session_id}_compactor"
+    try:
+        result = await run_agent_role(
+            "session_compactor",
+            {
+                "messages": [{"role": "user", "content": "Compact the session transcript below into the two-section contract."}],
+                "plan_context": scope,
+                "_source_trigger": {"type": "sub_agent", "ref": session_id},
+            },
+            sub_sid,
+        )
+    except Exception as e:
+        return ""
+    return _extract_body(result)
+
+
+def _compact_with_lingua(scope: str, cfg: dict) -> tuple[str | None, dict]:
+    """LongLLMLingua compression of the uncompacted tail.
+
+    Returns (compressed_body, meta). On any failure (package missing, model
+    download blocked, runtime error), returns (None, {"error": ...}) and the
+    caller falls back to the agent engine. The compressed body is wrapped
+    with `## RUNNING_SUMMARY` so it satisfies the existing invariant that
+    `app.loop._rebuild_session_context` reads.
+    """
+    try:
+        # llmlingua's import is heavy (loads transformers); guard so a
+        # missing/optional install doesn't break the api startup.
+        from llmlingua import PromptCompressor  # type: ignore
+    except ImportError as e:
+        return None, {"error": f"llmlingua not installed: {e}"}
+
+    ctx = cfg.get("context") or {}
+    target_token = int(ctx.get("lingua_target_token", 1500))
+    rate = float(ctx.get("lingua_rate", 0.5))
+
+    try:
+        # Cache the compressor on the module so we don't reload weights per
+        # compaction (model is ~350MB).
+        global _lingua_compressor
+        if "_lingua_compressor" not in globals() or _lingua_compressor is None:
+            _lingua_compressor = PromptCompressor(
+                model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+                use_llmlingua2=True,
+                device_map="cpu",
+            )
+        compressed = _lingua_compressor.compress_prompt(
+            scope,
+            target_token=target_token,
+            rate=rate,
+        )
+        # PromptCompressor returns dict with `compressed_prompt` key
+        text = compressed.get("compressed_prompt", "") if isinstance(compressed, dict) else str(compressed)
+    except Exception as e:
+        return None, {"error": f"lingua compression failed: {e}"}
+
+    if not text.strip():
+        return None, {"error": "empty compression output"}
+
+    # Wrap to satisfy the `## RUNNING_SUMMARY` invariant that the agent
+    # path's prompt forces. _rebuild_session_context only requires the
+    # marker is present somewhere in the body.
+    body = (
+        "## RUNNING_SUMMARY\n"
+        "_(LongLLMLingua compression of the uncompacted tail — token-level reduction, "
+        "no LLM call. Originals preserved in turns.jsonl.)_\n\n"
+        f"{text}\n"
+    )
+    return body, {"engine": "lingua", "input_chars": len(scope), "output_chars": len(body)}
+
+
+_lingua_compressor = None  # cached PromptCompressor instance
 
 
 def _extract_body(result: dict | None) -> str:
