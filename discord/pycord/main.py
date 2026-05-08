@@ -326,10 +326,14 @@ async def create_channel(req: CreateChannelRequest):
         ch = await guild.create_text_channel(req.name, topic=req.topic, category=category)
         # Register channel with worker bot so on_message routes messages here
         ch_id = ch.id
+        print(f"[create_channel] Adding channel {ch_id} to WORKER_CHANNEL_IDS", flush=True)
         if ch_id not in bot_worker.WORKER_CHANNEL_IDS:
             bot_worker.WORKER_CHANNEL_IDS.add(ch_id)
             bot_worker._channel_sessions[ch_id] = f"discord_{ch_id}_{int(time.time())}"
             bot_worker._save_state()
+            print(f"[create_channel] Added {ch_id} to WORKER_CHANNEL_IDS: {bot_worker.WORKER_CHANNEL_IDS}", flush=True)
+        else:
+            print(f"[create_channel] Channel {ch_id} already in WORKER_CHANNEL_IDS", flush=True)
         return {"ok": True, "channel_id": str(ch.id), "name": ch.name}
     except Exception as e:
         return {"ok": False, "error": str(e)}

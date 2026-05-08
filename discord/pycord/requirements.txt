@@ -1,0 +1,32 @@
+# Pycord migration — see ../INVENTORY.md for the legacy contract this image
+# must preserve. Differences from ../requirements.txt: discord.py → py-cord.
+#
+# 2.8.0rc2 (release candidate, not yet stable) is the FIRST py-cord version
+# with built-in DAVE/E2EE voice support — see discord/voice/utils/dependencies.py
+# in the wheel. It also rewrites the voice subsystem under discord/voice/* and
+# adds native voice-receive (we no longer need discord-ext-voice-recv for STT).
+# The optional `davey` import enables the DAVE protocol; without it, py-cord
+# silently degrades and Discord rejects the bot's voice connect (since the
+# March 2026 enforcement). With davey, the library handles DAVE handshake.
+# py-cord 2.8.0rc2 — the first version with built-in DAVE/E2EE voice support
+# (see discord/voice/utils/dependencies.py in the wheel). It rewrites the voice
+# subsystem under discord/voice/* and adds native voice-receive (no longer
+# need discord-ext-voice-recv for STT). The optional `davey` import enables
+# the DAVE protocol; without it, py-cord silently degrades and Discord
+# rejects the bot's voice connect (since the March 2026 enforcement). With
+# davey, the library handles DAVE handshake.
+#
+# Earlier rollback was due to a docker netns-sharing issue caused by too
+# many container recreates — NOT a py-cord regression. Procedure if 2.8.0rc2
+# ever looks unresponsive: docker compose restart phoebe-vpn phoebe-api
+# phoebe-sandbox (refreshes the shared netns).
+py-cord==2.8.0rc2
+davey>=0.1.5
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+piper-tts
+kokoro-onnx
+kokoro
+PyNaCl
+numpy
