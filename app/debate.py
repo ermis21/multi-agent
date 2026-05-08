@@ -60,6 +60,12 @@ async def run_debate(
     """
     Run or continue a structured debate with judge verdict.
 
+    Engine routing (B1) — `cfg.debate.engine` ∈ {"current", "mad"}:
+      * "current" (default) → original 2-advocate + judge logic in this file
+      * "mad" → MAD-style affirmative/negative/moderator/judge in app/debate_mad.py
+
+    Both engines return the same dict shape so callers don't change.
+
     New debate (debate_id=""):
       1. Both advocates present opening statements (parallel)
       2. Then alternate for checkpoint_messages exchanges
@@ -72,6 +78,18 @@ async def run_debate(
       3. Judge re-evaluates
       4. Return updated transcript + verdict
     """
+    cfg_engine = (get_config().get("debate", {}) or {}).get("engine", "current")
+    if cfg_engine == "mad":
+        from app.debate_mad import run_debate_mad
+        return await run_debate_mad(
+            question=question,
+            context=context,
+            position_a=position_a,
+            position_b=position_b,
+            session_id=session_id,
+            debate_id=debate_id,
+            max_exchanges=max_exchanges,
+        )
     from app.agents import _llm_call
 
     cfg = get_config()
