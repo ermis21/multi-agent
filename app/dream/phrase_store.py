@@ -667,3 +667,43 @@ def phrase_locate_by_text(path: str | Path, search_text: str) -> dict[str, Any]:
                 "section_path": rec.get("section_path", ""),
             }
     return {"unknown": True}
+
+
+# ── Tool registry export ─────────────────────────────────────────────────────
+
+from app.tools.registry import ToolDef
+
+
+async def _phrase_history_recall_handler(params, session_id, mode, state):
+    pid = str(params.get("phrase_id") or "").strip()
+    if not pid:
+        return {"error": "phrase_history_recall requires 'phrase_id'"}
+    try:
+        k = int(params.get("k") or 3)
+    except (TypeError, ValueError):
+        k = 3
+    try:
+        rec = _read_index(pid)
+        excerpt = get_history_excerpt(pid, k=k)
+        return {
+            "phrase_id": pid,
+            "current_text": rec.get("current_text", ""),
+            "rev": rec.get("rev", 0),
+            "section_path": rec.get("section_path", ""),
+            "path": rec.get("path", ""),
+            "history": excerpt,
+            "history_total": len(get_history(pid)),
+        }
+    except LocateFailure as e:
+        return {"error": str(e), "unknown_phrase_id": True}
+    except Exception as e:
+        return {"error": f"phrase_history_recall failed: {e}"}
+
+
+TOOL_PHRASE_HISTORY = ToolDef(
+    name="phrase_history_recall",
+    category="dream",
+    description="Recall the edit history for a tracked phrase.",
+    slow=False,
+    handler=_phrase_history_recall_handler,
+)

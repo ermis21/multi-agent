@@ -24,6 +24,7 @@ from typing import Any
 
 from app.dream import diff as dream_diff
 from app.dream import dream_state, loop_guard, narrator, phrase_store
+from app.tools.registry import ToolDef
 
 # Excerpt sizes referenced by the plan: conflict uses history[-2:] (two newest);
 # loop uses first K + last K of the trailing window.
@@ -600,3 +601,112 @@ async def recal_historical_prompt(timestamp: str, prompt_name: str) -> dict:
     dispatch with the other three dreamer tools.
     """
     return phrase_store.reconstruct_prompt_at(timestamp, prompt_name)
+
+
+# ── Tool registry exports ────────────────────────────────────────────────────
+
+def _conv_sid_from_state(session_id: str) -> str:
+    """Resolve the dream conversation sid from the dreamer's session state."""
+    try:
+        from app.sessions.state import SessionState
+        st = SessionState.load_or_create(session_id)
+        conv = st.get("_dream_conversation_sid")
+        if conv:
+            return str(conv)
+    except Exception:
+        pass
+    return session_id
+
+
+async def _dream_submit_handler(params, session_id, mode, state):
+    from app.config_loader import get_config
+    targets = params.get("targets")
+    rationale = str(params.get("rationale") or "").strip()
+    if targets is None:
+        path = str(params.get("path") or "").strip()
+        new_full_text = params.get("new_full_text")
+        if not path or not isinstance(new_full_text, str):
+            return {"error": "dream_submit requires `targets=[{path, new_full_text}, ...]` (or legacy `path` + `new_full_text`)"}
+        targets = [{"path": path, "new_full_text": new_full_text}]
+    return await dream_submit(
+        targets=targets,
+        rationale=rationale,
+        conversation_sid=_conv_sid_from_state(session_id),
+        session_id=session_id,
+        cfg=get_config(),
+    )
+
+
+async def _edit_revise_handler(params, session_id, mode, state):
+    from app.config_loader import get_config
+    pid = str(params.get("phrase_id") or "").strip()
+    new_text = params.get("new_text")
+    rationale = str(params.get("rationale") or "").strip()
+    if not pid or not isinstance(new_text, str):
+        return {"error": "edit_revise requires 'phrase_id' and 'new_text' (str)"}
+    return await edit_revise(
+        phrase_id=pid,
+        new_text=new_text,
+        rationale=rationale,
+        conversation_sid=_conv_sid_from_state(session_id),
+        session_id=session_id,
+        cfg=get_config(),
+    )
+
+
+async def _dream_finalize_handler(params, session_id, mode, state):
+    from app.config_loader import get_config
+    keep = params.get("keep") or []
+    drop = params.get("drop") or []
+    rationale = params.get("rationale")
+    if not isinstance(keep, list) or not isinstance(drop, list):
+        return {"error": "dream_finalize requires 'keep' and 'drop' as lists of phrase_ids"}
+    return await dream_finalize(
+        keep=[str(p) for p in keep],
+        drop=[str(p) for p in drop],
+        conversation_sid=_conv_sid_from_state(session_id),
+        session_id=session_id,
+        cfg=get_config(),
+        rationale=(str(rationale) if rationale is not None else None),
+    )
+
+
+async def _recal_historical_handler(params, session_id, mode, state):
+    ts = str(params.get("timestamp") or "").strip()
+    prompt_name = str(params.get("prompt_name") or "").strip()
+    if not ts or not prompt_name:
+        return {"error": "recal_historical_prompt requires 'timestamp' and 'prompt_name'"}
+    return await recal_historical_prompt(ts, prompt_name)
+
+
+TOOL_SUBMIT = ToolDef(
+    name="dream_submit",
+    category="dream",
+    description="Submit full rewritten prompts for one or more targets in one batch.",
+    slow=True,
+    handler=_dream_submit_handler,
+)
+
+TOOL_REVISE = ToolDef(
+    name="edit_revise",
+    category="dream",
+    description="Patch a single staged edit's new_text; re-classify that edit in place.",
+    slow=True,
+    handler=_edit_revise_handler,
+)
+
+TOOL_FINALIZE = ToolDef(
+    name="dream_finalize",
+    category="dream",
+    description="Commit kept edits to disk + history; drop the rest; delete pending batch.",
+    slow=True,
+    handler=_dream_finalize_handler,
+)
+
+TOOL_RECAL = ToolDef(
+    name="recal_historical_prompt",
+    category="dream",
+    description="Reconstruct a prompt file as it existed at a given timestamp.",
+    slow=False,
+    handler=_recal_historical_handler,
+)
