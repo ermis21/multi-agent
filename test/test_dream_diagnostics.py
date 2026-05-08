@@ -1,11 +1,11 @@
 """Tests for the 4 dream probes in sandbox/mcp_server.py::_diagnostic_check.
 
-These run inside `phoebe-sandbox` where `/project:ro` is the live repo, so we
+These run inside `phoebe-sandbox` where `/Phebe:ro` is the live repo, so we
 import the module and call `_diagnostic_check({})` directly (same pattern as
 existing diagnostic test coverage).
 
-Note: since the probe file reads `/project/config/model_ranks.yaml` and
-`/project/config/config.yaml` directly, the test can only assert the probe
+Note: since the probe file reads `/Phebe/config/model_ranks.yaml` and
+`/Phebe/config/config.yaml` directly, the test can only assert the probe
 keys exist, return pass/warn/fail status, and carry non-empty `detail` strings.
 """
 
@@ -16,15 +16,15 @@ from pathlib import Path
 
 import pytest
 
-# These probes read /project/config/*.yaml and call the live sandbox module.
-# Both phoebe-sandbox and phoebe-api mount /project:ro, but _diagnostic_check
+# These probes read /Phebe/config/*.yaml and call the live sandbox module.
+# Both phoebe-sandbox and phoebe-api mount /Phebe:ro, but _diagnostic_check
 # only emits dream probes in the sandbox env — gate on PROJECT_DIR, which is
 # set only in phoebe-sandbox. Run via `make test-dream-live`.
 pytestmark = [
     pytest.mark.live,
     pytest.mark.skipif(
-        os.environ.get("PROJECT_DIR") != "/project"
-        or not Path("/project/config/config.yaml").exists(),
+        os.environ.get("PROJECT_DIR") != "/Phebe"
+        or not Path("/Phebe/config/config.yaml").exists(),
         reason="not running inside phoebe-sandbox — use `make test-dream-live`",
     ),
 ]
@@ -72,7 +72,7 @@ def test_dream_cron_scheduled_graceful_when_disabled():
     from sandbox.mcp_server import _diagnostic_check
     import yaml
     from pathlib import Path
-    cfg = yaml.safe_load(Path("/project/config/config.yaml").read_text())
+    cfg = yaml.safe_load(Path("/Phebe/config/config.yaml").read_text())
     dream_enabled = bool((cfg.get("dream") or {}).get("enabled", False))
     if dream_enabled:
         pytest.skip("dream enabled — skipping 'disabled graceful' assertion")

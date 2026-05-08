@@ -103,7 +103,11 @@ class _FakeResult:
 
 def test_hook_fires_sim_when_not_revising(env, monkeypatch):
     """The dreamer did something other than submit/revise (ran a read-only
-    tool, or emitted prose) → auto-sim fires."""
+    tool, or emitted prose) → auto-sim fires.
+
+    Requires `cfg.dream.auto_sim_enabled=true` — default is false, which
+    routes through the DISABLED short-circuit tested separately.
+    """
     _seed_pending("conv-5")
     captured: dict = {}
 
@@ -118,7 +122,9 @@ def test_hook_fires_sim_when_not_revising(env, monkeypatch):
         })
 
     monkeypatch.setattr(dream_simulator, "run_simulation", fake_run_simulation)
-    hook = runner_hook.make_dream_hook("conv-5", cfg={"x": 1})
+    hook = runner_hook.make_dream_hook(
+        "conv-5", cfg={"x": 1, "dream": {"auto_sim_enabled": True}},
+    )
     out = asyncio.run(hook([], False))
     assert out is not None
     assert out.startswith("[tool_result: simulate_conversation] OK\n")
@@ -126,7 +132,51 @@ def test_hook_fires_sim_when_not_revising(env, monkeypatch):
     parsed = json.loads(body)
     assert parsed["session_id"] == "conv-5"
     assert parsed["model_match"] is True
-    assert captured == {"sid": "conv-5", "cfg": {"x": 1}}
+    assert captured["sid"] == "conv-5"
+
+
+def test_hook_short_circuits_when_auto_sim_disabled(env, monkeypatch):
+    """When cfg.dream.auto_sim_enabled is false (the default), the hook does
+    NOT call the simulator — it transitions the batch to finalize_only and
+    returns a DISABLED tool_result telling the dreamer to commit directly.
+
+    This is the safety valve for strong reasoning models (Opus, Claude 4.x)
+    that silently stall on large sim-result payloads."""
+    _seed_pending("conv-disabled")
+
+    sim_calls: list[str] = []
+
+    async def fake_run_simulation(sid, cfg):
+        sim_calls.append(sid)
+        raise AssertionError("simulator must NOT be called when auto_sim_enabled=false")
+
+    monkeypatch.setattr(dream_simulator, "run_simulation", fake_run_simulation)
+    hook = runner_hook.make_dream_hook(
+        "conv-disabled", cfg={"dream": {"auto_sim_enabled": False}},
+    )
+    out = asyncio.run(hook([], False))
+    assert out is not None
+    assert out.startswith("[tool_result: simulate_conversation] DISABLED\n")
+    assert "dream_finalize" in out
+    # Sim never invoked.
+    assert sim_calls == []
+    # Batch advanced to finalize_only so no further submit/revise allowed.
+    batch = dream_state.load_pending("conv-disabled")
+    assert batch.phase == dream_state.PHASE_FINALIZE_ONLY
+
+
+def test_hook_default_cfg_treats_auto_sim_as_disabled(env, monkeypatch):
+    """Missing cfg.dream.auto_sim_enabled defaults to disabled."""
+    _seed_pending("conv-default")
+
+    async def fake_run_simulation(sid, cfg):
+        raise AssertionError("simulator must NOT be called on default-disabled cfg")
+
+    monkeypatch.setattr(dream_simulator, "run_simulation", fake_run_simulation)
+    # Empty cfg — no dream block at all.
+    hook = runner_hook.make_dream_hook("conv-default", cfg={})
+    out = asyncio.run(hook([], False))
+    assert out is not None and "DISABLED" in out
 
 
 def test_hook_fires_sim_on_prose_without_end_branch(env, monkeypatch):
@@ -141,7 +191,9 @@ def test_hook_fires_sim_on_prose_without_end_branch(env, monkeypatch):
         return _FakeResult(payload={"session_id": sid, "model_match": False})
 
     monkeypatch.setattr(dream_simulator, "run_simulation", fake_run_simulation)
-    hook = runner_hook.make_dream_hook("conv-6", cfg={})
+    hook = runner_hook.make_dream_hook(
+        "conv-6", cfg={"dream": {"auto_sim_enabled": True}},
+    )
     # Message history still contains a stale `[tool_result: dream_submit]`
     # from the prior iteration — the old inference-based hook would've
     # skipped auto-sim here. The new flag-based API ignores history.
@@ -161,7 +213,9 @@ def test_hook_surfaces_simulator_error_as_tool_result(env, monkeypatch):
         raise dream_simulator.SimulatorError("cap exceeded")
 
     monkeypatch.setattr(dream_simulator, "run_simulation", boom)
-    hook = runner_hook.make_dream_hook("conv-7", cfg={})
+    hook = runner_hook.make_dream_hook(
+        "conv-7", cfg={"dream": {"auto_sim_enabled": True}},
+    )
     out = asyncio.run(hook([], False))
     assert out is not None
     assert out.startswith("[tool_result: simulate_conversation] ERROR")
@@ -176,7 +230,9 @@ def test_hook_catches_unexpected_exception(env, monkeypatch):
         raise RuntimeError("bad things")
 
     monkeypatch.setattr(dream_simulator, "run_simulation", kablooey)
-    hook = runner_hook.make_dream_hook("conv-8", cfg={})
+    hook = runner_hook.make_dream_hook(
+        "conv-8", cfg={"dream": {"auto_sim_enabled": True}},
+    )
     out = asyncio.run(hook([], False))
     assert out is not None
     assert "[tool_result: simulate_conversation] ERROR" in out

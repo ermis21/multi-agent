@@ -446,6 +446,18 @@ async def run_dream(
                 "dreamer_sid": sid,
                 "dreamer_model": dreamer_model,
             })
+            # Clean any stale pending batch for this conversation before the
+            # dreamer starts fresh. This matters because the original rollback
+            # keyed on the wrong sid for a while, leaking batches to disk —
+            # any such leftover would trap the dreamer in `finalize_only`
+            # state and make `dream_submit` error out silently. A new dream
+            # pass always starts from zero; nothing legitimate is pending for
+            # this conv when we're about to spawn a fresh dreamer on it.
+            try:
+                if dream_state.has_pending_batch(c.session_id):
+                    dream_state.delete_pending(c.session_id)
+            except Exception:
+                pass
             if review_required and trace_queue is not None:
                 review_bus.register(sid, trace_queue)
             try:

@@ -157,10 +157,22 @@ async def run_agent_role(
     tool_traces: list[dict] = []
 
     # Dream role: inject auto-sim hook + rollback unfinalized batches on exit.
+    # The hook keys on the CONVERSATION sid (stamped on state as
+    # `_dream_conversation_sid` a few lines above), NOT the dreamer's own
+    # session_id — dream_submit stores the pending batch under the
+    # conversation sid, so a hook looking at `session_id` would never find
+    # it and auto-sim would silently no-op.
     after_iteration_hook = None
     if role == "dreamer":
         from app.dream import runner_hook as _dream_hook
-        after_iteration_hook = _dream_hook.make_dream_hook(session_id, cfg)
+        try:
+            _rst_h = SessionState.load_or_create(session_id)
+            _conv_sid_for_hook = _rst_h.get("_dream_conversation_sid") or session_id
+        except Exception:
+            _conv_sid_for_hook = session_id
+        after_iteration_hook = _dream_hook.make_dream_hook(
+            str(_conv_sid_for_hook), cfg,
+        )
 
     worker_error: str | None = None
     try:
@@ -198,8 +210,12 @@ async def run_agent_role(
     finally:
         cleanup_generated(session_id)
         if role == "dreamer":
+            # rollback keys on the CONVERSATION sid (pending batches are
+            # stored under the conv sid in dream_state), not the dreamer's
+            # own session_id — same reason the hook needs the conv sid.
             try:
                 from app.dream import runner_hook as _dream_hook
-                _dream_hook.rollback_if_unfinalized(session_id)
+                _rb_conv_sid = _conv_sid_for_hook if "_conv_sid_for_hook" in locals() else session_id
+                _dream_hook.rollback_if_unfinalized(str(_rb_conv_sid))
             except Exception:
                 pass

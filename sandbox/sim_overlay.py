@@ -56,7 +56,7 @@ def overlay_root_of(marker: dict) -> Path:
 
 # Writable roots and their overlay prefix labels. Kept in one place so
 # handlers and overlay stay in sync. `project` is intentionally absent —
-# /project is read-only; the overlay cannot shadow it.
+# /Phebe is read-only; the overlay cannot shadow it.
 _WRITABLE_ROOT_NAMES = ("workspace", "config", "state", "cache")
 
 
@@ -88,7 +88,7 @@ def overlay_path_for(real_path: Path, overlay_root: Path) -> Path | None:
     """Map a resolved real path to its overlay twin.
 
     Returns None when the real path is not under any writable root (e.g.
-    /project reads). Callers should fall through to the real path in that case.
+    /Phebe reads). Callers should fall through to the real path in that case.
     """
     name, rel = classify_root(real_path)
     if name is None or rel is None:

@@ -24,7 +24,8 @@ DREAM_TOOLS = ("dream_submit", "edit_revise", "dream_finalize", "recal_historica
 def dispatch_env(monkeypatch):
     """Neutral cfg + network-free sandbox guard. Any leaked HTTP call to the
     sandbox raises loudly so we catch a routing regression immediately."""
-    monkeypatch.setattr(mcp_client, "get_config", lambda: {
+    import app.config_loader as config_loader
+    monkeypatch.setattr(config_loader, "get_config", lambda: {
         "approval": {"build": {"auto_fail": [], "ask_user": [], "auto_allow": {"paths": []}}},
     })
 
