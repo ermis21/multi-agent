@@ -220,14 +220,28 @@ async def _run_worker(
             turn_acc.token_usage["output"] += int(_usage.get("completion_tokens") or _usage.get("output_tokens") or 0)
 
         inflection_nudge = ""
+        # B3 — engine resolution. The new `cfg.inflection.engine` field
+        # supersedes the legacy `inflection_mode` and adds the uqlm_whitebox
+        # branch. Until B3 the import below was silently failing, so any
+        # nudging at all is net-new behavior — default config keeps engine='off'.
         if inflection_mode != "none" and nudge_count < max_nudges:
             try:
                 from app.inflection import (
                     detect_inflection_points, format_inflection_nudge,
                     detect_linguistic_markers, format_linguistic_nudge,
+                    detect_uqlm_whitebox, format_uqlm_nudge,
+                    resolve_engine,
                 )
 
-                if inflection_mode in ("logprobs", "both"):
+                # Re-resolve from full cfg so the new `engine` field wins
+                # over the legacy `inflection_mode` when both are set.
+                _full_cfg = get_config()
+                engine = resolve_engine(_full_cfg)
+                # Treat the legacy `inflection_mode` as a fallback if engine isn't set.
+                if engine == "off":
+                    engine = inflection_mode
+
+                if engine in ("logprobs", "both"):
                     logprobs_data = _extract_logprobs(resp)
                     if logprobs_data:
                         inflections = detect_inflection_points(
@@ -238,7 +252,7 @@ async def _run_worker(
                         if inflections:
                             inflection_nudge = format_inflection_nudge(inflections)
 
-                if inflection_mode in ("linguistic", "both"):
+                if engine in ("linguistic", "both"):
                     signals, should_nudge = detect_linguistic_markers(
                         content,
                         strong_threshold=inflection_cfg.get("strong_marker_threshold", 1),
@@ -248,6 +262,14 @@ async def _run_worker(
                         inflection_nudge = format_linguistic_nudge(signals)
                     elif should_nudge and inflection_nudge:
                         inflection_nudge += "\n(Confirmed by linguistic markers in your response.)"
+
+                if engine == "uqlm_whitebox":
+                    logprobs_data = _extract_logprobs(resp)
+                    should_nudge, scores = detect_uqlm_whitebox(
+                        content, logprobs_data, _full_cfg,
+                    )
+                    if should_nudge:
+                        inflection_nudge = format_uqlm_nudge(scores)
             except Exception:
                 pass  # inflection detection is non-fatal
 
