@@ -37,6 +37,7 @@ def _make_conn_id() -> str:
 # ── Discord gateway helpers ───────────────────────────────────────────────────
 
 import os as _os
+import socket as _socket
 
 # Try multiple Discord hostnames (phoebe-discord-pycord is the active service)
 _DISCORD_CANDIDATES = [
@@ -44,61 +45,78 @@ _DISCORD_CANDIDATES = [
     "http://phoebe-discord-pycord:4000",
 ]
 
+# Cache the resolved URL with a simple module-level variable
+_cached_discord_url: str | None = None
+
 
 def _resolve_discord_url() -> str:
     """Resolve Discord URL, trying multiple candidates."""
-    import socket
+    global _cached_discord_url
+    if _cached_discord_url is not None:
+        return _cached_discord_url
     for url in _DISCORD_CANDIDATES:
         host = url.replace("http://", "").replace("https://", "").split(":")[0]
         try:
-            socket.getaddrinfo(host, 4000)
+            _socket.getaddrinfo(host, 4000)
+            _cached_discord_url = url
             return url
-        except socket.gaierror:
+        except _socket.gaierror:
             continue
-    return _DISCORD_CANDIDATES[0]  # fallback to first
-
-
-_DISCORD_URL = _resolve_discord_url()
+    # Fallback to first candidate (will retry on next call)
+    return _DISCORD_CANDIDATES[0]
 
 
 async def _discord_send(channel_id: int, content: str) -> bool:
     """Send a message to a Discord channel via the phoebe-discord HTTP gateway."""
+    discord_url = _resolve_discord_url()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{_DISCORD_URL}/discord/send",
+                f"{discord_url}/discord/send",
                 json={"channel_id": str(channel_id), "content": content},
             )
             return resp.status_code == 200
     except Exception as e:
+        # If DNS fails, clear cache to force re-resolution next time
+        global _cached_discord_url
+        if "name resolution" in str(e).lower():
+            _cached_discord_url = None
         logger.warning(f"Discord send failed for channel {channel_id}: {e}")
         return False
 
 
 async def _discord_send_embed(channel_id: int, embed: dict) -> bool:
     """Send an embed message to a Discord channel."""
+    discord_url = _resolve_discord_url()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{_DISCORD_URL}/discord/send",
+                f"{discord_url}/discord/send",
                 json={"channel_id": str(channel_id), "embed": embed},
             )
             return resp.status_code == 200
     except Exception as e:
+        global _cached_discord_url
+        if "name resolution" in str(e).lower():
+            _cached_discord_url = None
         logger.warning(f"Discord embed send failed for channel {channel_id}: {e}")
         return False
 
 
 async def _rename_channel(channel_id: int, name: str) -> bool:
     """Rename a Discord channel."""
+    discord_url = _resolve_discord_url()
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{_DISCORD_URL}/discord/edit_channel",
+                f"{discord_url}/discord/edit_channel",
                 json={"channel_id": str(channel_id), "name": name[:100]},
             )
             return resp.status_code == 200
     except Exception as e:
+        global _cached_discord_url
+        if "name resolution" in str(e).lower():
+            _cached_discord_url = None
         logger.warning(f"Discord channel rename failed for channel {channel_id}: {e}")
         return False
 

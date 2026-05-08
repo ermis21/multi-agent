@@ -121,6 +121,7 @@ make doctor      # Full subsystem diagnostics
 | `GET` | `/v1/remote/status` | List all active Pi connections |
 | `GET` | `/v1/remote/channel/{id}` | Get Pi connection for a Discord channel |
 | `POST` | `/v1/remote/command` | Send RPC command to Pi (prompt/steer/bash/etc.) |
+| `POST` | `/v1/remote/create-channel` | Auto-create Discord channel for Pi |
 | `POST` | `/v1/remote/ui_response` | Respond to Pi extension UI dialogs |
 | `POST` | `/v1/remote/detach/{id}` | Detach Pi from a Discord channel |
 
@@ -249,11 +250,12 @@ Two cron jobs start automatically with `phoebe-api`:
 Attach active Pi.dev coding sessions to the Phoebe Discord UI for real-time monitoring and control. Pi connects **OUT** to Phoebe via WebSocket, Phoebe multiplexes multiple Pi instances on a single port, and renders events to Discord.
 
 ```bash
-# Connect Pi from your machine:
-node rpc-proxy.js --url ws://your-phoebe-host:8090/v1/remote/ws?channel_id=YOUR_CHANNEL_ID
+# Extension mode (recommended) - in Pi's TUI:
+/connect-phoebe                             # auto-creates Discord channel
+/connect-phoebe ws://phoebe:8090            # auto-create on custom URL
 
-# Or with a specific model:
-node rpc-proxy.js --url ws://your-phoebe-host:8090/v1/remote/ws?channel_id=YOUR_CHANNEL_ID --pi-args "--model anthropic/claude-sonnet-4-20250514"
+# RPC proxy mode (headless):
+node rpc-proxy.js --url ws://phoebe:8090/v1/remote/ws?channel_id=YOUR_CHANNEL_ID
 ```
 
 Once connected, messages in that Discord channel route to Pi as `prompt` (idle) or `steer` (streaming). Use `/remote` slash commands for status, abort, bash, model switch, compact, etc.
