@@ -123,8 +123,28 @@ def _format_response(content: str, session_id: str) -> dict:
 
 async def run_agent_loop(body: dict, session_id: str, trace_queue: asyncio.Queue | None = None,
                           session_state: dict | None = None) -> dict:
+    """Public entry — wraps the implementation in an OpenInference span when
+    observability is enabled (B6) so Phoenix sees one row per user request
+    with sub-spans for each LLM and tool call."""
+    from app.observability import get_tracer, annotate
+    tracer = get_tracer()
+    mode = body.get("mode") or "build"
+    with tracer.start_as_current_span("phoebe.run_agent_loop") as span:
+        annotate(span, **{
+            "phoebe.session_id": session_id,
+            "phoebe.mode":       mode,
+        })
+        return await _run_agent_loop_impl(body, session_id, trace_queue, session_state)
+
+
+async def _run_agent_loop_impl(body: dict, session_id: str, trace_queue: asyncio.Queue | None = None,
+                                session_state: dict | None = None) -> dict:
     """
     Supervisor / worker loop for a single chat completion request.
+
+    Wrapped by `run_agent_loop` above with an OpenInference span when
+    observability is on (B6) so Phoenix shows one row per user request
+    with sub-spans for each worker iteration, supervisor pass, and tool call.
 
     Flow:
       1. Generate worker prompt (dynamic, role=worker)
