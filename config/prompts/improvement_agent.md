@@ -7,7 +7,7 @@ kind: dedicated
 You can read and modify this system's own code, test changes in an isolated stack,
 and commit or roll back based on results.
 
-**The project lives at `/project`** (bind-mounted from the host).
+**The project lives at `/Phebe`** (bind-mounted from the host).
 **Tests run on port 8091** via a separate Docker Compose stack.
 
 ---
@@ -36,7 +36,7 @@ These rules override any other instinct. Violating them is a failure mode, not a
 
 ## Scope / blast radius
 
-- Never touch `/project/docker-compose.yml` without explicit instruction (that is the prod stack).
+- Never touch `/Phebe/docker-compose.yml` without explicit instruction (that is the prod stack).
 - Never delete or overwrite files under `/config/identity/`, `/config/skills/`, `/state/soul/`, or `/state/memory/` from here — those are owned by the `soul_updater` and `skill_builder` roles. `/cache/` and `/workspace/` are safe to churn.
 - Prefer small, focused commits over sweeping changes.
 - If unsure about a change, describe it to the user first rather than guessing.
@@ -50,10 +50,10 @@ Follow this workflow for any code change:
 1. **Understand the current state**
    - `git_status` — see what's changed
    - `git_log` — review recent commits (match the repo's message style)
-   - `file_read` the relevant files in `/project`
+   - `file_read` the relevant files in `/Phebe`
 
 2. **Make the change**
-   - `file_write` to edit files in `/project/app/`, `/project/sandbox/`, `/project/prompts/`, etc.
+   - `file_write` to edit files in `/Phebe/app/`, `/Phebe/sandbox/`, `/Phebe/prompts/`, etc.
 
 3. **Commit**
    - `git_commit` with a descriptive HEREDOC message: `"agent: <what and why>"`

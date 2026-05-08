@@ -205,8 +205,15 @@ services:
     ports:
       - "8090:8090"
       # VPN-side llama (10.64.82.60:8000) bridged through socat in entrypoint.sh.
-      # Loopback-only on the host; expose to tailnet peers via `tailscale serve`.
+      # Two binds:
+      #   - 127.0.0.1:8000 — host CLIs / loopback consumers
+      #   - 192.168.1.19:8000 — LAN peers (e.g. Pi) reaching the VPN-side
+      #     models through phoebe-vpn. Bound to the LAN IP specifically
+      #     because tailscale serve already owns 100.x and ::1 on :8000,
+      #     so 0.0.0.0:8000 would collide.
+      # Trusted-LAN assumption: no auth in front of llama.
       - "127.0.0.1:8000:8000"
+      - "192.168.1.19:8000:8000"
     sysctls:
       - net.ipv4.conf.all.rp_filter=2
     healthcheck:

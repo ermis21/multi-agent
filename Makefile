@@ -97,27 +97,36 @@ eval:
 test-full: up test-fast test-integration eval
 
 # Focused dream-system suite. Unit tests run inside phoebe-api (fast);
-# live diagnostics run inside phoebe-sandbox (needs /project and /state mounts).
+# live diagnostics run inside phoebe-sandbox (needs /Phebe and /state mounts).
 test-dream:
 	docker exec phoebe-api pytest /app/test -m "not live" -k "dream or phrase_store or model_ranks"
 
 test-dream-live:
-	docker exec phoebe-sandbox pytest -m live /project/test/test_dream_diagnostics.py
+	docker exec phoebe-sandbox pytest -m live /Phebe/test/test_dream_diagnostics.py
 
 # ── Discord end-to-end scenarios ─────────────────────────────────────────────
 # Drives the worker bot from the config bot. Requires:
 #   DISCORD_TEST_CHANNEL_ID, DISCORD_TEST_DRIVER_USER_ID, PHOEBE_ENABLE_TEXT_COMMANDS=1
-# set in the phoebe-discord container's environment.
+# set in the discord container's environment.
+#
+# DISCORD_CONTAINER picks the running container — `phoebe-discord` (legacy)
+# or `phoebe-discord-pycord` (the A2 PR2 variant). Auto-detects the active
+# container if not set.
+
+DISCORD_CONTAINER ?= $(shell docker ps --format '{{.Names}}' | grep -E '^phoebe-discord(-pycord)?$$' | head -1)
 
 e2e:
-	docker exec phoebe-discord python /app/e2e_scenarios.py
+	@if [ -z "$(DISCORD_CONTAINER)" ]; then echo "no phoebe-discord* container running"; exit 2; fi
+	docker exec $(DISCORD_CONTAINER) python /app/e2e_scenarios.py
 
 e2e-one:
 	@if [ -z "$(SCENARIO)" ]; then echo "usage: make e2e-one SCENARIO=<name>"; exit 2; fi
-	docker exec phoebe-discord python /app/e2e_scenarios.py --scenario $(SCENARIO)
+	@if [ -z "$(DISCORD_CONTAINER)" ]; then echo "no phoebe-discord* container running"; exit 2; fi
+	docker exec $(DISCORD_CONTAINER) python /app/e2e_scenarios.py --scenario $(SCENARIO)
 
 e2e-dream:
-	docker exec phoebe-discord python /app/e2e_scenarios.py --scenario dream_smoke
+	@if [ -z "$(DISCORD_CONTAINER)" ]; then echo "no phoebe-discord* container running"; exit 2; fi
+	docker exec $(DISCORD_CONTAINER) python /app/e2e_scenarios.py --scenario dream_smoke
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────
 
