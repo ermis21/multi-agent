@@ -107,6 +107,7 @@ def _default_state(session_id: str) -> dict[str, Any]:
             "prompt_overrides": {},
             "last_verdict": None,
             "fail_count": 0,
+            "parse_failures": 0,
         },
 
         "stats": {
@@ -115,7 +116,10 @@ def _default_state(session_id: str) -> dict[str, Any]:
             "token_usage": {"input": 0, "output": 0, "thinking": 0},
             "total_duration_ms": 0,
             "tool_error_count": 0,
+            "anthropic_native_fallbacks": 0,
         },
+
+        "playbook": {"entries_added": 0},
 
         # Telemetry populated by prompt_generator.generate(); used by diagnostics
         # and future cache-reuse heuristics.
