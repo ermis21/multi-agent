@@ -9,40 +9,164 @@ import discord
 
 
 class SpeakView(discord.ui.View):
-    """Single 🔊 button attached to agent text responses for on-demand TTS playback."""
+    """Pause/resume listen button (A3).
+
+    State machine:
+      idle (🔊 Listen) → playing (⏸ Pause) ⇄ paused (▶ Resume)
+                       ↓ natural end
+                       back to idle (🔊 Listen)
+
+    On click while idle:
+      - If user is in a voice channel: start non-blocking voice playback,
+        attach a polling task that flips the view back to idle when audio
+        ends naturally.
+      - If user is NOT in a VC: fall back to the file-attachment path
+        (legacy behavior; no pause/resume controls in that case).
+    """
+
+    _GATEWAY = "http://localhost:4000"
 
     def __init__(self, text: str, channel_id: int):
         super().__init__(timeout=900)
-        self.text       = text
-        self.channel_id = channel_id
+        self.text                = text
+        self.channel_id          = channel_id
+        self.voice_channel_id: int | None = None
+        self._poll_task: "asyncio.Task | None" = None
 
-    @discord.ui.button(emoji="🔊", label="Listen", style=discord.ButtonStyle.secondary)
-    async def speak_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    # ── Buttons ──────────────────────────────────────────────────────────
+    # Three buttons declared up-front; we hide all but the relevant one for
+    # each state by toggling .disabled. discord.ui.View doesn't support live
+    # add/remove of items from the inside cleanly.
+
+    @discord.ui.button(emoji="🔊", label="Listen", style=discord.ButtonStyle.secondary,
+                       custom_id="speak_listen")
+    async def listen_btn(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._on_listen(interaction)
+
+    @discord.ui.button(emoji="⏸", label="Pause", style=discord.ButtonStyle.primary,
+                       custom_id="speak_pause", disabled=True)
+    async def pause_btn(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._call_control(interaction, "pause")
+
+    @discord.ui.button(emoji="▶", label="Resume", style=discord.ButtonStyle.success,
+                       custom_id="speak_resume", disabled=True)
+    async def resume_btn(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._call_control(interaction, "resume")
+
+    # ── State helpers ────────────────────────────────────────────────────
+
+    def _set_state(self, *, listen: bool, pause: bool, resume: bool) -> None:
+        for child in self.children:
+            cid = getattr(child, "custom_id", None)
+            if cid == "speak_listen":
+                child.disabled = not listen
+            elif cid == "speak_pause":
+                child.disabled = not pause
+            elif cid == "speak_resume":
+                child.disabled = not resume
+
+    # ── Click handlers ───────────────────────────────────────────────────
+
+    async def _on_listen(self, interaction: discord.Interaction) -> None:
+        import asyncio
         import bot_worker as bw
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
 
         voice_state = interaction.user.voice if interaction.guild else None
         voice_ch    = voice_state.channel if voice_state else None
 
+        if voice_ch is None:
+            # No VC → fall back to file attachment, no pause controls.
+            await interaction.response.defer()
+            try:
+                r = await bw._http.post(
+                    f"{self._GATEWAY}/discord/speak",
+                    json={"channel_id": self.channel_id, "text": self.text},
+                )
+                r.raise_for_status()
+                if not r.json().get("ok"):
+                    await interaction.followup.send(
+                        f"Voice generation failed: {r.json().get('error', 'unknown')}",
+                        ephemeral=True,
+                    )
+            except Exception as e:
+                await interaction.followup.send(f"Voice generation failed: {e}", ephemeral=True)
+            return
+
+        # VC path — non-blocking start, switch to pause/resume controls.
+        self.voice_channel_id = voice_ch.id
+        self._set_state(listen=False, pause=True, resume=False)
+        await interaction.response.edit_message(view=self)
         try:
-            if voice_ch:
-                tts_resp = await bw._http.post("http://localhost:4000/discord/speak_voice", json={
-                    "voice_channel_id": voice_ch.id,
-                    "text":             self.text,
-                })
-            else:
-                tts_resp = await bw._http.post("http://localhost:4000/discord/speak", json={
-                    "channel_id": self.channel_id,
-                    "text":       self.text,
-                })
-            tts_resp.raise_for_status()
-            result = tts_resp.json()
-            if not result.get("ok"):
-                err = result.get("error", "unknown error")
+            r = await bw._http.post(
+                f"{self._GATEWAY}/discord/speak_voice",
+                json={"voice_channel_id": voice_ch.id, "text": self.text, "block": False},
+            )
+            r.raise_for_status()
+            if not r.json().get("ok"):
+                err = r.json().get("error", "unknown")
                 await interaction.followup.send(f"Voice generation failed: {err}", ephemeral=True)
+                self._set_state(listen=True, pause=False, resume=False)
+                if interaction.message:
+                    await interaction.message.edit(view=self)
+                return
         except Exception as e:
             await interaction.followup.send(f"Voice generation failed: {e}", ephemeral=True)
+            self._set_state(listen=True, pause=False, resume=False)
+            if interaction.message:
+                await interaction.message.edit(view=self)
+            return
+        # Spawn poller that flips the view back to idle when audio ends.
+        self._poll_task = asyncio.create_task(self._poll_finish(interaction))
+
+    async def _call_control(self, interaction: discord.Interaction, action: str) -> None:
+        """action ∈ {'pause', 'resume'}"""
+        import bot_worker as bw
+        if not self.voice_channel_id:
+            await interaction.response.send_message("No active playback.", ephemeral=True)
+            return
+        try:
+            r = await bw._http.post(
+                f"{self._GATEWAY}/discord/playback/{action}",
+                json={"voice_channel_id": self.voice_channel_id},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if not data.get("ok"):
+                await interaction.response.send_message(
+                    f"{action.title()} failed: {data.get('error', 'unknown')}", ephemeral=True,
+                )
+                return
+            paused = bool(data.get("paused"))
+            # paused → show Resume; playing → show Pause
+            self._set_state(listen=False, pause=not paused, resume=paused)
+            await interaction.response.edit_message(view=self)
+        except Exception as e:
+            await interaction.response.send_message(f"{action} failed: {e}", ephemeral=True)
+
+    async def _poll_finish(self, interaction: discord.Interaction) -> None:
+        """Poll status every 2s; reset to idle when playback ends."""
+        import asyncio
+        import bot_worker as bw
+        if not self.voice_channel_id:
+            return
+        for _ in range(300):  # 10 minutes max
+            await asyncio.sleep(2.0)
+            try:
+                r = await bw._http.get(
+                    f"{self._GATEWAY}/discord/playback/status",
+                    params={"voice_channel_id": self.voice_channel_id},
+                )
+                if r.status_code == 200 and not r.json().get("active"):
+                    break
+            except Exception:
+                continue
+        self._set_state(listen=True, pause=False, resume=False)
+        self.voice_channel_id = None
+        if interaction.message:
+            try:
+                await interaction.message.edit(view=self)
+            except Exception:
+                pass
 
 
 class CallbackApprovalView(discord.ui.View):

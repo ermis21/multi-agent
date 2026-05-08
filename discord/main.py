@@ -16,56 +16,64 @@ Endpoints (called by sandbox discord_* tools):
 import asyncio
 import io
 import os
+import time
 import wave
 from contextlib import asynccontextmanager
 
+import audioop
+
 import discord
+import httpx
+import numpy as np
 from fastapi import FastAPI
-from piper.voice import PiperVoice
 from pydantic import BaseModel
 
 import bot_config
 import bot_mod
 import bot_worker
+from tts_backend import get_backend
 
-# ── Piper TTS ────────────────────────────────────────────────────────────────
+# ── TTS ──────────────────────────────────────────────────────────────────────
+# Backend chosen by `cfg.tts.backend` from /config (live-mtime-cached on the
+# api side). Defaults to "piper" until the user opts in via config_agent or
+# direct PATCH. See discord/tts_backend.py for the per-backend implementations.
 
-_PIPER_MODEL  = os.environ.get("PIPER_MODEL", "/models/en_US-ryan-low.onnx")
-_piper_voice: PiperVoice | None = None
-
-
-def _get_voice() -> PiperVoice:
-    global _piper_voice
-    if _piper_voice is None:
-        _piper_voice = PiperVoice.load(_PIPER_MODEL)
-    return _piper_voice
+PHOEBE_API_URL_LOCAL = os.environ.get("PHOEBE_API_URL", "http://phoebe-vpn:8090")
 
 
-def _synthesize(text: str) -> bytes:
-    """Synthesize text → WAV bytes (s16le, mono, native sample rate)."""
-    import numpy as np
-    voice  = _get_voice()
-    chunks = list(voice.synthesize(text))
+async def _resolve_backend_name() -> str:
+    """Read `cfg.tts.backend` over HTTP. Falls back to 'piper' on any error."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as c:
+            r = await c.get(f"{PHOEBE_API_URL_LOCAL}/config")
+            r.raise_for_status()
+            return (r.json().get("tts") or {}).get("backend") or "piper"
+    except Exception:
+        return "piper"
+
+
+def _synthesize(text: str, backend_name: str) -> bytes:
+    """Synthesize text → WAV bytes (s16le, mono, native sample rate).
+    Concatenates the streaming chunks at the call site for the file path."""
+    backend = get_backend(backend_name)
+    chunks = list(backend.synthesize(text))
     if not chunks:
-        raise ValueError("Piper returned no audio chunks")
-    # Concatenate all sentence chunks, convert float32 → int16
-    audio = np.concatenate([c.audio_float_array for c in chunks])
-    audio = np.clip(audio, -1.0, 1.0)
-    pcm16 = (audio * 32767).astype(np.int16)
+        raise ValueError(f"{backend_name} returned no audio chunks")
+    sample_rate = chunks[0][1]
+    audio = np.concatenate([c[0] for c in chunks])
 
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(chunks[0].sample_rate)
-        wf.writeframes(pcm16.tobytes())
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio.tobytes())
     buf.seek(0)
     return buf.read()
 
 
 def _wav_to_discord_pcm(wav_bytes: bytes) -> bytes:
     """Convert WAV bytes → raw s16le PCM at 48 kHz stereo for discord.PCMAudio."""
-    import audioop
     buf = io.BytesIO(wav_bytes)
     with wave.open(buf, "rb") as wf:
         framerate = wf.getframerate()
@@ -169,6 +177,7 @@ class SpeakVoiceRequest(BaseModel):
     voice_channel_id: int
     text:             str
     bot:              str = "worker"
+    block:            bool = True  # legacy default; listen button passes False
 
 
 # ── Routes ──────────────────────────────────────────────────────────────────
@@ -310,6 +319,12 @@ async def create_channel(req: CreateChannelRequest):
             category = guild.get_channel(req.category_id) or \
                        await bot_client.fetch_channel(req.category_id)
         ch = await guild.create_text_channel(req.name, topic=req.topic, category=category)
+        # Register channel with worker bot so on_message routes messages here
+        ch_id = ch.id
+        if ch_id not in bot_worker.WORKER_CHANNEL_IDS:
+            bot_worker.WORKER_CHANNEL_IDS.add(ch_id)
+            bot_worker._channel_sessions[ch_id] = f"discord_{ch_id}_{int(time.time())}"
+            bot_worker._save_state()
         return {"ok": True, "channel_id": str(ch.id), "name": ch.name}
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -449,8 +464,9 @@ async def speak_message(req: SpeakRequest):
         channel = bot_client.get_channel(req.channel_id)
         if channel is None:
             channel = await bot_client.fetch_channel(req.channel_id)
+        backend_name = await _resolve_backend_name()
         loop      = asyncio.get_event_loop()
-        wav_bytes = await loop.run_in_executor(None, _synthesize, req.text)
+        wav_bytes = await loop.run_in_executor(None, _synthesize, req.text, backend_name)
         audio     = discord.File(io.BytesIO(wav_bytes), filename="response.wav")
         msg       = await channel.send(file=audio)
         return {"ok": True, "message_id": str(msg.id)}
@@ -458,35 +474,136 @@ async def speak_message(req: SpeakRequest):
         return {"ok": False, "error": str(e)}
 
 
+# ── Voice playback registry (A3 listen button + auto-dictate) ───────────────
+# Tracks live VoiceClient handles per voice-channel so the SpeakView pause /
+# resume buttons (in views.py) can act on a specific playback. Cleared by the
+# `after` callback when audio ends naturally OR by /discord/playback/stop.
+
+_active_playback: dict[int, dict] = {}  # voice_channel_id → {vc, finished_event, paused}
+
+
+async def _start_voice_playback(
+    voice_channel_id: int,
+    text: str,
+    bot_name: str,
+    block: bool,
+) -> dict:
+    """Synthesize + start playing in a voice channel. If `block=True` waits
+    for the audio to finish (legacy /speak shape); else returns as soon as
+    playback starts so the View can attach pause/resume controls."""
+    bot_client = _get_bot_client(bot_name)
+    voice_channel = bot_client.get_channel(voice_channel_id)
+    if voice_channel is None:
+        voice_channel = await bot_client.fetch_channel(voice_channel_id)
+
+    backend_name = await _resolve_backend_name()
+    loop = asyncio.get_event_loop()
+    wav_bytes = await loop.run_in_executor(None, _synthesize, text, backend_name)
+    pcm_bytes = await loop.run_in_executor(None, _wav_to_discord_pcm, wav_bytes)
+
+    # If something is still playing in this VC, stop + disconnect it first.
+    prior = _active_playback.pop(voice_channel_id, None)
+    if prior:
+        try:
+            if prior["vc"].is_playing() or prior["vc"].is_paused():
+                prior["vc"].stop()
+            if prior["vc"].is_connected():
+                await prior["vc"].disconnect(force=True)
+        except Exception as e:
+            print(f"[voice] prior cleanup warn: {e}", flush=True)
+
+    vc = await voice_channel.connect(timeout=10.0, reconnect=False)
+    source = discord.PCMAudio(io.BytesIO(pcm_bytes))
+    done = asyncio.Event()
+    state = {"vc": vc, "finished_event": done, "paused": False}
+    _active_playback[voice_channel_id] = state
+
+    def _after(err):
+        if err:
+            print(f"[voice] playback error: {err}", flush=True)
+        loop.call_soon_threadsafe(done.set)
+
+    async def _disconnect_when_done() -> None:
+        try:
+            await asyncio.wait_for(done.wait(), timeout=600.0)
+        except asyncio.TimeoutError:
+            print(f"[voice] playback timeout (10min) on {voice_channel_id}", flush=True)
+        finally:
+            _active_playback.pop(voice_channel_id, None)
+            try:
+                if vc.is_connected():
+                    await vc.disconnect(force=True)
+            except Exception:
+                pass
+
+    vc.play(source, after=_after)
+    if block:
+        # Legacy / auto-dictate path: hold the request open until done.
+        await asyncio.wait_for(done.wait(), timeout=120.0)
+        _active_playback.pop(voice_channel_id, None)
+        try:
+            if vc.is_connected():
+                await vc.disconnect(force=True)
+        except Exception:
+            pass
+        return {"ok": True}
+    # Listen-button path: return immediately, run cleanup as a bg task.
+    asyncio.create_task(_disconnect_when_done(), name=f"voice_cleanup_{voice_channel_id}")
+    return {"ok": True, "voice_channel_id": voice_channel_id}
+
+
 @app.post("/discord/speak_voice")
 async def speak_voice(req: SpeakVoiceRequest):
-    """Synthesize TTS and play it directly in a Discord voice channel."""
-    bot_client = _get_bot_client(req.bot)
-    vc = None
+    """Synthesize TTS and play it in a Discord voice channel.
+
+    Default `block=True` matches the legacy shape (used by auto-dictate).
+    The listen button uses `block=False` to hand control back so pause /
+    resume buttons can act mid-playback."""
+    block = getattr(req, "block", True)
     try:
-        voice_channel = bot_client.get_channel(req.voice_channel_id)
-        if voice_channel is None:
-            voice_channel = await bot_client.fetch_channel(req.voice_channel_id)
-
-        loop      = asyncio.get_event_loop()
-        wav_bytes = await loop.run_in_executor(None, _synthesize, req.text)
-        pcm_bytes = await loop.run_in_executor(None, _wav_to_discord_pcm, wav_bytes)
-
-        vc     = await voice_channel.connect(timeout=10.0, reconnect=False)
-        source = discord.PCMAudio(io.BytesIO(pcm_bytes))
-
-        done = asyncio.Event()
-
-        def _after(err):
-            if err:
-                print(f"[voice] playback error: {err}", flush=True)
-            loop.call_soon_threadsafe(done.set)
-
-        vc.play(source, after=_after)
-        await asyncio.wait_for(done.wait(), timeout=120.0)
-        return {"ok": True}
+        return await _start_voice_playback(req.voice_channel_id, req.text, req.bot, block)
     except Exception as e:
         return {"ok": False, "error": str(e)}
-    finally:
-        if vc and vc.is_connected():
-            await vc.disconnect(force=True)
+
+
+class PlaybackControlRequest(BaseModel):
+    voice_channel_id: int
+
+
+@app.post("/discord/playback/pause")
+async def playback_pause(req: PlaybackControlRequest):
+    state = _active_playback.get(req.voice_channel_id)
+    if not state or not state["vc"].is_connected():
+        return {"ok": False, "error": "no active playback"}
+    try:
+        state["vc"].pause()
+        state["paused"] = True
+        return {"ok": True, "paused": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/discord/playback/resume")
+async def playback_resume(req: PlaybackControlRequest):
+    state = _active_playback.get(req.voice_channel_id)
+    if not state or not state["vc"].is_connected():
+        return {"ok": False, "error": "no active playback"}
+    try:
+        state["vc"].resume()
+        state["paused"] = False
+        return {"ok": True, "paused": False}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/discord/playback/status")
+async def playback_status(voice_channel_id: int):
+    state = _active_playback.get(voice_channel_id)
+    if not state:
+        return {"active": False, "playing": False, "paused": False}
+    vc = state["vc"]
+    return {
+        "active":  True,
+        "playing": vc.is_playing(),
+        "paused":  state["paused"] or vc.is_paused(),
+    }

@@ -7,6 +7,7 @@ Auto-creates #phoebe-config channel on startup if it doesn't exist.
 """
 
 import os
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -17,6 +18,7 @@ from utils import is_allowed, split_message
 PHOEBE_API_URL  = os.environ.get("PHOEBE_API_URL", "http://phoebe-api:8090")
 CONFIG_TOKEN = os.environ.get("DISCORD_TOKEN_CONFIG", "")
 GUILD_ID     = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+CONFIG_NICKNAME = os.environ.get("DISCORD_CONFIG_NICKNAME", "Phoebe-config")
 
 # Channel IDs the config bot listens in — populated dynamically on_ready
 CONFIG_CHANNEL_IDS: set[int] = {
@@ -76,6 +78,17 @@ async def cmd_help(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     print(f"[config-bot] logged in as {client.user}", flush=True)
+
+    # Set bot avatar from the bundled Phoebe-config logo (best-effort; Discord
+    # rate-limits avatar changes to roughly once per 10 minutes).
+    try:
+        logo = Path(__file__).parent / "Phoebe_config.png"
+        if logo.exists():
+            await client.user.edit(avatar=logo.read_bytes())
+            print("[config-bot] avatar set from Phoebe_config.png", flush=True)
+    except Exception as e:
+        print(f"[config-bot] avatar set skipped: {e}", flush=True)
+
     if GUILD_ID:
         try:
             guild = client.get_guild(GUILD_ID) or await client.fetch_guild(GUILD_ID)
@@ -95,6 +108,12 @@ async def on_ready():
             print(f"[config-bot] synced {len(cmds)} commands to guild {GUILD_ID}", flush=True)
         except Exception as e:
             print(f"[config-bot] slash command sync failed: {e}", flush=True)
+        try:
+            guild = client.get_guild(GUILD_ID) or await client.fetch_guild(GUILD_ID)
+            await guild.me.edit(nick=CONFIG_NICKNAME)
+            print(f"[config-bot] guild nickname set to {CONFIG_NICKNAME!r}", flush=True)
+        except Exception as e:
+            print(f"[config-bot] nickname set skipped: {e}", flush=True)
 
 
 @client.event

@@ -864,6 +864,104 @@ async def scenario_dream_smoke(ctx: ScenarioContext) -> None:
     assert body.get("content"), f"run.json not written: {sr.text[:200]}"
 
 
+# ── Pycord-migration regression net (added in A2 PR1) ──────────────────────
+
+async def scenario_plan_review_renders(ctx: ScenarioContext) -> None:
+    """Plan-mode replies that match the `## Scope` + `## Steps` format must
+    attach a PlanReviewView with 3 buttons (Accept / Accept+Privileged /
+    Keep Planning). The trigger condition (`bot_worker.py:2458-2462`)
+    requires both headings literally — prompt explicitly so the regression
+    net isn't model-format-flaky."""
+    await send(ctx, "!mode plan")
+    await wait_for_text(ctx, "plan", timeout=15)
+    ctx.reset_collector()
+    await send(
+        ctx,
+        "Plan a tiny change: rename app/main.py to app/api.py. "
+        "Reply with exactly two markdown headings, both required: "
+        "`## Scope` listing the files, then `## Steps` listing the actions. "
+        "Do not call any tools. Just emit those two sections.",
+    )
+    final = await wait_for_final_reply(ctx, timeout=240)
+    assert final.components, (
+        "plan reply has no action components — PlanReviewView not attached. "
+        f"reply preview: {(final.content or '')[:300]}"
+    )
+    button_count = sum(len(row.children) for row in final.components)
+    assert button_count == 3, (
+        f"PlanReviewView expected 3 buttons, got {button_count}. "
+        f"reply preview: {(final.content or '')[:300]}"
+    )
+
+
+async def scenario_listen_button_renders(ctx: ScenarioContext) -> None:
+    """Every non-plan worker reply must attach a SpeakView. The pycord
+    variant collapsed the original 3-button design into a single button
+    that morphs through 🔊 Listen → ⏸ Pause → ▶ Resume → 🔊 Listen
+    (Discord shows disabled buttons greyed-out, not hidden, so multi-button
+    designs look broken to users)."""
+    await send(ctx, "!mode converse")
+    await wait_for_text(ctx, "converse", timeout=15)
+    ctx.reset_collector()
+    await send(ctx, "say 'hello'")
+    final = await wait_for_final_reply(ctx, timeout=45)
+    assert final.components, \
+        "non-plan reply has no action components — SpeakView not attached"
+    button_count = sum(len(row.children) for row in final.components)
+    # Pycord variant: 1 button (morphs); legacy discord.py variant: 1 button
+    # (only Listen, no pause). Both shapes accept 1.
+    assert button_count == 1, \
+        f"SpeakView expected exactly 1 button (Listen), got {button_count}"
+    button = final.components[0].children[0]
+    label = (getattr(button, "label", "") or "").lower()
+    assert "listen" in label, \
+        f"initial button label should be 'Listen', got {label!r}"
+    # Verify TTS gateway is actually reachable (file path; voice channel
+    # unavailable in test channel).
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        r = await http.post(
+            f"{BOT_GATEWAY_URL}/discord/speak",
+            json={"channel_id": ctx.channel.id, "text": "test"},
+        )
+    assert r.status_code == 200, f"/discord/speak → {r.status_code}: {r.text}"
+    assert r.json().get("ok") is True, f"speak returned non-ok: {r.text}"
+
+
+async def scenario_channel_lifecycle_gateway(ctx: ScenarioContext) -> None:
+    """The HTTP gateway endpoints `/discord/create_channel` +
+    `/discord/delete_channel` underpin /new and /clear slash flows. Exercise
+    them directly so a Pycord channel-API change shows up."""
+    guild_id = ctx.channel.guild.id
+    probe_name = f"e2e-probe-{int(time.time())}"
+    created_channel_id = None
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        try:
+            cr = await http.post(
+                f"{BOT_GATEWAY_URL}/discord/create_channel",
+                json={"guild_id": guild_id, "name": probe_name},
+            )
+            assert cr.status_code == 200, f"create_channel → {cr.status_code}: {cr.text}"
+            cdata = cr.json()
+            assert cdata.get("ok") is True, f"create_channel non-ok: {cr.text}"
+            created_channel_id = int(cdata["channel_id"])
+            # Sanity: bot can post to the new channel.
+            sr = await http.post(
+                f"{BOT_GATEWAY_URL}/discord/send",
+                json={"channel_id": created_channel_id, "content": "e2e probe"},
+            )
+            assert sr.status_code == 200, f"send → {sr.status_code}: {sr.text}"
+            assert sr.json().get("ok") is True, f"send non-ok: {sr.text}"
+        finally:
+            if created_channel_id:
+                try:
+                    await http.post(
+                        f"{BOT_GATEWAY_URL}/discord/delete_channel",
+                        json={"channel_id": created_channel_id},
+                    )
+                except Exception as e:
+                    print(f"  [channel_lifecycle cleanup warn: {e}]", flush=True)
+
+
 SCENARIOS: list[Callable[[ScenarioContext], Awaitable[None]]] = [
     scenario_converse_short_reply,
     scenario_plan_specificity,
@@ -879,6 +977,15 @@ SCENARIOS: list[Callable[[ScenarioContext], Awaitable[None]]] = [
     scenario_config_schema_reject,
     scenario_diagnostic_all_green,
     scenario_dream_smoke,
+    # scenario_plan_review_renders intentionally NOT registered — the
+    # PlanReviewView trigger requires the worker to emit literal `## Scope`
+    # + `## Steps` headings cleanly, which no worker prompt teaches and the
+    # model emits inconsistently. The view itself is structurally identical
+    # to InjectionView (covered) and CallbackApprovalView (covered), so a
+    # Pycord button regression there would surface in those scenarios.
+    # Function kept above as executable documentation.
+    scenario_listen_button_renders,
+    scenario_channel_lifecycle_gateway,
 ]
 
 
