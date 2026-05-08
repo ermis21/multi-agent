@@ -4,7 +4,7 @@ These tests import ``sandbox.mcp_server`` directly. The api container's image
 ships a baked-in copy of the sandbox module that may lag the working tree
 (sandbox isn't live-reloaded there), so we skip the whole file when the new
 ``_skill_install`` symbol is absent. Run inside ``phoebe-sandbox`` (where
-``/project`` is bind-mounted) to exercise this suite against current code.
+``/Phebe`` is bind-mounted) to exercise this suite against current code.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from sandbox import mcp_server
 if not hasattr(mcp_server, "_skill_install"):
     pytest.skip(
         "sandbox.mcp_server._skill_install not present in this container's image "
-        "(run inside phoebe-sandbox where /project is live-mounted)",
+        "(run inside phoebe-sandbox where /Phebe is live-mounted)",
         allow_module_level=True,
     )
 

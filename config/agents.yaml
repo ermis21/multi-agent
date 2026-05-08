@@ -96,7 +96,7 @@ config_agent:
 # ── Improvement Agent ─────────────────────────────────────────────────────────
 # Has access to the full project repo, git tools, and Docker test stack.
 # Use this role to self-improve the service code:
-#   1. Edit files in /project via file_read / file_write
+#   1. Edit files in /Phebe via file_read / file_write
 #   2. git_commit to save changes
 #   3. docker_test_up → docker_test_health to verify
 #   4. If broken: git_rollback + docker_test_down
@@ -269,11 +269,14 @@ tool_builder:
 # ── Skill Builder ─────────────────────────────────────────────────────────────
 # Authors SKILL.md files with frontmatter + trigger conditions.
 skill_builder:
-  description: "Authors SKILL.md files with trigger conditions."
+  description: "Authors SKILL.md files with trigger conditions; can also install skills from upstream repos."
   allowed_tools:
     - file_read
     - file_write
     - file_list
+    - skill_install
+    - web_search
+    - web_fetch
   max_tool_iterations: 8
 
 
